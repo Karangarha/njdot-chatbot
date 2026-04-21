@@ -333,6 +333,12 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
                 </div>
               )}
               <button
+                onClick={() => { setUserDropdownOpen(false); router.push('/update-password') }}
+                className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-50"
+              >
+                Change Password
+              </button>
+              <button
                 onClick={handleSignOut}
                 className="w-full px-4 py-2 text-left text-sm text-gray-700 hover:bg-gray-50 rounded-b-lg"
               >

@@ -12,7 +12,7 @@ const inputCls =
   'focus:border-[#1B3A6B] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1B3A6B]/10 ' +
   'disabled:cursor-not-allowed disabled:opacity-50'
 
-export default function LoginForm() {
+export default function LoginForm({ resetSuccess }: { resetSuccess?: boolean }) {
   const [email, setEmail]         = useState('')
   const [password, setPassword]   = useState('')
   const [error, setError]         = useState<string | null>(null)
@@ -46,6 +46,16 @@ export default function LoginForm() {
         <Link href="/" className="mb-5 block text-[13px] text-gray-400 hover:text-gray-600">
           ← Back to home
         </Link>
+
+        {/* Password-reset success banner */}
+        {resetSuccess && (
+          <div className="mb-5 rounded-lg bg-green-50 px-3 py-2.5 text-xs text-green-700 ring-1 ring-green-200 flex items-center gap-2">
+            <svg className="h-4 w-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+            </svg>
+            Password updated successfully. Sign in with your new password.
+          </div>
+        )}
 
         {/* Logo */}
         <div className="mb-5 flex justify-center">

@@ -3,88 +3,97 @@
 import { useState } from 'react'
 import Image from 'next/image'
 import Link from 'next/link'
-import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import { requestPasswordReset, resetPassword } from '@/lib/api'
+
+type Stage = 'email' | 'password'
+
+const inputCls =
+  'w-full rounded-lg border border-[#E8E8E8] bg-[#F5F5F5] px-3 text-sm text-gray-800 ' +
+  'placeholder:text-gray-400 transition-colors ' +
+  'focus:border-[#1B3A6B] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1B3A6B]/10 ' +
+  'disabled:cursor-not-allowed disabled:opacity-50'
 
 export default function ForgotPasswordForm() {
-  const [email, setEmail]         = useState('')
-  const [error, setError]         = useState<string | null>(null)
-  const [success, setSuccess]     = useState(false)
-  const [isLoading, setIsLoading] = useState(false)
+  const [stage, setStage]           = useState<Stage>('email')
+  const [email, setEmail]           = useState('')
+  const [resetToken, setResetToken] = useState('')
+  const [password, setPassword]     = useState('')
+  const [confirm, setConfirm]       = useState('')
+  const [error, setError]           = useState<string | null>(null)
+  const [isLoading, setIsLoading]   = useState(false)
+  const router = useRouter()
 
-  const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+  // ── Step 1: submit email ────────────────────────────────────────────────────
+  const handleEmailSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault()
     setError(null)
     setIsLoading(true)
-
-    const supabase = createClient()
-    const { error: authError } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: `${window.location.origin}/update-password`,
-    })
-
-    if (authError) {
-      setError(authError.message)
+    try {
+      const { reset_token } = await requestPasswordReset(email)
+      setResetToken(reset_token)
+      setStage('password')
+    } catch {
+      // Generic message — never reveal whether the email exists
+      setError('Something went wrong. Please try again.')
+    } finally {
       setIsLoading(false)
+    }
+  }
+
+  // ── Step 2: set new password ────────────────────────────────────────────────
+  const handlePasswordSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault()
+    setError(null)
+
+    if (password.length < 8) {
+      setError('Password must be at least 8 characters.')
+      return
+    }
+    if (password !== confirm) {
+      setError('Passwords do not match.')
       return
     }
 
-    setSuccess(true)
-    setIsLoading(false)
+    setIsLoading(true)
+    try {
+      await resetPassword(resetToken, password)
+      router.push('/login?reset=success')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Reset failed. Please start over.')
+    } finally {
+      setIsLoading(false)
+    }
   }
 
-  // ── Success state — no logo, just icon + message ──────────────────────────
-  if (success) {
-    return (
-      <div className="w-full" style={{ maxWidth: '480px' }}>
-        <div className="rounded-2xl bg-white shadow-xl ring-1 ring-black/5" style={{ padding: '44px' }}>
-          <Link href="/" className="mb-5 block text-[13px] text-gray-400 hover:text-gray-600">
-            ← Back to home
-          </Link>
-          <div className="flex flex-col items-center text-center">
-            <div className="mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-blue-50">
-              <svg className="h-7 w-7 text-[#1B3A6B]" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
-                  d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z"
-                />
-              </svg>
-            </div>
-            <h2 className="mb-2 text-lg font-bold text-[#1B3A6B]">Check your email</h2>
-            <p className="text-sm text-gray-500">
-              If an account exists for{' '}
-              <span className="font-medium text-gray-700">{email}</span>,
-              we sent a password reset link. Click it to set a new password.
-            </p>
-            <Link
-              href="/login"
-              className="mt-6 text-sm font-semibold text-[#1B3A6B] hover:underline"
-            >
-              ← Back to sign in
-            </Link>
-          </div>
-        </div>
+  // ── Shared card shell ───────────────────────────────────────────────────────
+  const card = (children: React.ReactNode) => (
+    <div className="w-full sm:max-w-[480px]">
+      <div className="rounded-2xl bg-white shadow-xl ring-1 ring-black/5 px-5 py-8 sm:p-[44px]">
+        {children}
       </div>
-    )
-  }
+    </div>
+  )
 
-  // ── Form ─────────────────────────────────────────────────────────────────────
-  return (
-    <div className="w-full" style={{ maxWidth: '480px' }}>
-      {/* Card */}
-      <div className="rounded-2xl bg-white shadow-xl ring-1 ring-black/5" style={{ padding: '44px' }}>
+  const header = (subtitle: string) => (
+    <>
+      <Link href="/" className="mb-5 block text-[13px] text-gray-400 hover:text-gray-600">
+        ← Back to home
+      </Link>
+      <div className="mb-5 flex justify-center">
+        <Image src="/njdot_logo.png" alt="NJDOT" width={64} height={64} priority />
+      </div>
+      <h1 className="mb-1 text-center text-xl font-bold text-[#1B3A6B]">Smart Assistant</h1>
+      <p className="mb-6 text-center text-sm text-gray-400">{subtitle}</p>
+    </>
+  )
 
-        {/* Back to home — inside card, top */}
-        <Link href="/" className="mb-5 block text-[13px] text-gray-400 hover:text-gray-600">
-          ← Back to home
-        </Link>
-
-        {/* Logo */}
-        <div className="mb-5 flex justify-center">
-          <Image src="/njdot_logo.png" alt="NJDOT" width={64} height={64} priority />
-        </div>
-
-        <h1 className="mb-1 text-center text-xl font-bold text-[#1B3A6B]">Smart Assistant</h1>
-        <p className="mb-6 text-center text-sm text-gray-400">Reset your password</p>
-
-        <form onSubmit={handleSubmit} className="space-y-4">
+  // ── Stage: email ────────────────────────────────────────────────────────────
+  if (stage === 'email') {
+    return card(
+      <>
+        {header('Reset your password')}
+        <form onSubmit={handleEmailSubmit} className="space-y-4">
           <div>
             <label htmlFor="email" className="mb-1.5 block text-xs font-medium text-gray-700">
               Email address
@@ -99,7 +108,7 @@ export default function ForgotPasswordForm() {
               disabled={isLoading}
               placeholder="you@example.com"
               style={{ height: '44px' }}
-              className="w-full rounded-lg border border-[#E8E8E8] bg-[#F5F5F5] px-3 text-sm text-gray-800 placeholder:text-gray-400 transition-colors focus:border-[#1B3A6B] focus:bg-white focus:outline-none focus:ring-2 focus:ring-[#1B3A6B]/10 disabled:cursor-not-allowed disabled:opacity-50"
+              className={inputCls}
             />
           </div>
 
@@ -115,7 +124,7 @@ export default function ForgotPasswordForm() {
             style={{ height: '44px' }}
             className="w-full rounded-lg bg-[#CC2529] text-sm font-semibold text-white transition-colors hover:bg-[#a81e21] focus:outline-none focus:ring-2 focus:ring-[#CC2529]/30 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {isLoading ? 'Sending…' : 'Send Reset Link'}
+            {isLoading ? 'Verifying…' : 'Continue'}
           </button>
         </form>
 
@@ -124,7 +133,78 @@ export default function ForgotPasswordForm() {
             ← Back to sign in
           </Link>
         </p>
-      </div>
-    </div>
+      </>
+    )
+  }
+
+  // ── Stage: password ─────────────────────────────────────────────────────────
+  return card(
+    <>
+      {header('Set your new password')}
+      <form onSubmit={handlePasswordSubmit} className="space-y-4">
+        <div>
+          <label htmlFor="password" className="mb-1.5 block text-xs font-medium text-gray-700">
+            New password{' '}
+            <span className="font-normal text-gray-400">(min. 8 characters)</span>
+          </label>
+          <input
+            id="password"
+            type="password"
+            autoComplete="new-password"
+            required
+            minLength={8}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            disabled={isLoading}
+            placeholder="••••••••"
+            style={{ height: '44px' }}
+            className={inputCls}
+          />
+        </div>
+
+        <div>
+          <label htmlFor="confirm" className="mb-1.5 block text-xs font-medium text-gray-700">
+            Confirm new password
+          </label>
+          <input
+            id="confirm"
+            type="password"
+            autoComplete="new-password"
+            required
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+            disabled={isLoading}
+            placeholder="••••••••"
+            style={{ height: '44px' }}
+            className={inputCls}
+          />
+        </div>
+
+        {error && (
+          <div className="rounded-lg bg-red-50 px-3 py-2.5 text-xs text-red-700 ring-1 ring-red-200">
+            {error}
+          </div>
+        )}
+
+        <button
+          type="submit"
+          disabled={isLoading}
+          style={{ height: '44px' }}
+          className="w-full rounded-lg bg-[#CC2529] text-sm font-semibold text-white transition-colors hover:bg-[#a81e21] focus:outline-none focus:ring-2 focus:ring-[#CC2529]/30 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {isLoading ? 'Updating…' : 'Update Password'}
+        </button>
+      </form>
+
+      <p className="mt-5 text-center text-xs text-gray-500">
+        Wrong email?{' '}
+        <button
+          onClick={() => { setStage('email'); setError(null); setPassword(''); setConfirm('') }}
+          className="font-semibold text-[#1B3A6B] hover:underline"
+        >
+          Start over
+        </button>
+      </p>
+    </>
   )
 }

@@ -1,6 +1,6 @@
 import type { QueryResponse } from './types'
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
 /**
  * POST /api/query — run a RAG query against the NJDOT backend.
@@ -35,4 +35,37 @@ export async function askQuestion(
   }
 
   return res.json() as Promise<QueryResponse>
+}
+
+async function _authPost(path: string, body: object, accessToken?: string): Promise<void> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}))
+    throw new Error(typeof data.detail === 'string' ? data.detail : 'Request failed.')
+  }
+}
+
+export async function requestPasswordReset(email: string): Promise<{ reset_token: string }> {
+  const res = await fetch(`${API_BASE}/api/auth/request-reset`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email }),
+  })
+  if (!res.ok) throw new Error('Request failed.')
+  return res.json()
+}
+
+export async function resetPassword(resetToken: string, newPassword: string): Promise<void> {
+  await _authPost('/api/auth/reset-password', { reset_token: resetToken, new_password: newPassword })
+}
+
+export async function changePassword(newPassword: string, accessToken: string): Promise<void> {
+  await _authPost('/api/auth/change-password', { new_password: newPassword }, accessToken)
 }

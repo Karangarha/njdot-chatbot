@@ -25,6 +25,7 @@ import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.pdf import router as pdf_router
 from app.api.query import router as query_router
@@ -70,6 +71,7 @@ app.add_middleware(
 )
 
 # ── Routers ───────────────────────────────────────────────────────────────────
+app.include_router(auth_router)
 app.include_router(query_router)
 app.include_router(pdf_router)
 app.include_router(conversations_router)
