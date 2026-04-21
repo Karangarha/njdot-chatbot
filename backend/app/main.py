@@ -53,18 +53,17 @@ app = FastAPI(
 _allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://cm-chatbot-corral.vercel.app",
     "https://cm-smart-assistant.vercel.app",
-    "https://cm-smart-assistant-git-main-dsanmars-projects.vercel.app",
 ]
 
-# add FRONTEND_URL too if it exists
 if config.FRONTEND_URL and config.FRONTEND_URL not in _allowed_origins:
     _allowed_origins.append(config.FRONTEND_URL)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
-    allow_origin_regex=r"https://cm-smart-assistant.*\.vercel\.app",
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
