@@ -38,9 +38,9 @@ export default function LoginForm() {
   }
 
   return (
-    <div className="w-full" style={{ maxWidth: '480px' }}>
+    <div className="w-full sm:max-w-[480px]">
       {/* Card */}
-      <div className="rounded-2xl bg-white shadow-xl ring-1 ring-black/5" style={{ padding: '44px' }}>
+      <div className="rounded-2xl bg-white shadow-xl ring-1 ring-black/5 px-5 py-8 sm:p-[44px]">
 
         {/* Back to home — inside card, top */}
         <Link href="/" className="mb-5 block text-[13px] text-gray-400 hover:text-gray-600">

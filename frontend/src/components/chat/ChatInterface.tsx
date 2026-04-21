@@ -367,7 +367,7 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
         {/* ── SIDEBAR ─────────────────────────────────────────────────────────── */}
         <aside
           className={`
-            flex w-[280px] flex-col border-r border-[#E8E8E8] bg-white
+            flex w-[85vw] max-w-[280px] flex-col border-r border-[#E8E8E8] bg-white
             fixed top-14 bottom-0 left-0 z-30 shadow-xl transition-transform duration-200 ease-out
             ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
           `}
@@ -853,7 +853,7 @@ function PDFViewerModal({ citation, onClose }: { citation: CitationItem; onClose
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
       onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
-      <div className="flex flex-col bg-white rounded-2xl shadow-2xl w-[92vw] h-[90vh] max-w-5xl">
+      <div className="flex flex-col bg-white rounded-2xl shadow-2xl w-[96vw] h-[92vh] max-w-5xl sm:w-[92vw] sm:h-[90vh]">
         {/* Header */}
         <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#E8E8E8] shrink-0">
           <div className="flex items-center gap-3 min-w-0">

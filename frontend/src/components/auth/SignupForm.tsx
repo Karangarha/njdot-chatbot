@@ -68,9 +68,9 @@ export default function SignupForm() {
   }
 
   return (
-    <div className="w-full" style={{ maxWidth: '480px' }}>
+    <div className="w-full sm:max-w-[480px]">
       {/* Card */}
-      <div className="rounded-2xl bg-white shadow-xl ring-1 ring-black/5" style={{ padding: '44px' }}>
+      <div className="rounded-2xl bg-white shadow-xl ring-1 ring-black/5 px-5 py-8 sm:p-[44px]">
 
         {/* Back to home — inside card, top */}
         <Link href="/" className="mb-5 block text-[13px] text-gray-400 hover:text-gray-600">
@@ -87,7 +87,7 @@ export default function SignupForm() {
 
         <form onSubmit={handleSubmit} className="space-y-4">
           {/* Name row */}
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div>
               <label htmlFor="first-name" className="mb-1.5 block text-xs font-medium text-gray-700">
                 First name

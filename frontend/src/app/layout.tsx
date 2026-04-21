@@ -10,6 +10,11 @@ export const metadata: Metadata = {
     'AI-powered assistant for NJDOT workflows — specifications, manuals, and material procedures.',
 }
 
+export const viewport = {
+  width: 'device-width',
+  initialScale: 1,
+}
+
 export default function RootLayout({
   children,
 }: Readonly<{ children: React.ReactNode }>) {
