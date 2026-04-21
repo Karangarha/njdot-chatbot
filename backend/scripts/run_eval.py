@@ -38,8 +38,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-import openai
-
 # ── Ensure backend/ package root is on sys.path ──────────────────────────────
 _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
@@ -60,9 +58,7 @@ from app.generation.citation_serializer import CitationSerializer
 _EVAL_JSON   = _BACKEND / "data" / "eval" / "njdot_eval_set_100_questions.json"
 _RESULTS_OUT = _BACKEND / "data" / "eval" / "results_latest.json"
 
-_RETRIEVE_K:    int = 8   # must be ≥ PromptBuilder.MAX_CHUNKS (= 8)
-_PIPELINE_MODEL     = "gpt-4o-mini"
-_JUDGE_MODEL        = "gpt-4o-mini"
+_RETRIEVE_K: int = 8   # must be ≥ PromptBuilder.MAX_CHUNKS (= 8)
 
 # The exact phrase the system prompt instructs the LLM to use when it cannot answer.
 _INSUF_MARKER = "Insufficient evidence"
@@ -355,13 +351,23 @@ def main() -> None:
     skipped_count = 0   # no automatic skips; callers control inclusion via --ids
 
     # ── Header ────────────────────────────────────────────────────────────────
+    # ── Build shared pipeline objects ─────────────────────────────────────────
+    db_client    = get_db()
+    vector       = VectorSearcher(db_client=db_client)
+    keyword      = KeywordSearcher(db_client=db_client)
+    hybrid       = HybridRanker(vector_searcher=vector, keyword_searcher=keyword)
+    builder      = PromptBuilder()
+    pipeline_llm = LLMClient()
+    judge_llm    = LLMClient()
+    serializer   = CitationSerializer()
+
     print()
     print(_SEP)
     print("NJDOT RAG Pipeline Evaluation")
     print(_SEP)
     print(f"Eval file        : {_EVAL_JSON.name}")
-    print(f"Pipeline model   : {_PIPELINE_MODEL}")
-    print(f"Judge model      : {_JUDGE_MODEL}")
+    print(f"Pipeline model   : {pipeline_llm.model}")
+    print(f"Judge model      : {judge_llm.model}")
     print(f"Collection       : {args.collection or '(all)'}")
     print(f"Questions to run : {total}")
     if ids_filter is not None:
@@ -373,22 +379,6 @@ def main() -> None:
             print(f"Category filter  : {args.category}")
     print(_SEP)
     print()
-
-    # ── Build shared pipeline objects ─────────────────────────────────────────
-    # One Supabase client; one OpenAI chat client shared between the pipeline
-    # LLM and the judge LLM.  VectorSearcher builds its own OAI client
-    # internally for embeddings (it doesn't accept an external oai_client).
-    db_client  = get_db()
-    oai_client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
-
-    vector     = VectorSearcher(db_client=db_client)       # own OAI client for embeddings
-    keyword    = KeywordSearcher(db_client=db_client)
-    hybrid     = HybridRanker(vector_searcher=vector, keyword_searcher=keyword)
-    builder    = PromptBuilder()
-    # Pipeline LLM and judge LLM share one OpenAI chat client.
-    pipeline_llm = LLMClient(model=_PIPELINE_MODEL, oai_client=oai_client)
-    judge_llm    = LLMClient(model=_JUDGE_MODEL,    oai_client=oai_client)
-    serializer   = CitationSerializer()
 
     # ── Evaluate ──────────────────────────────────────────────────────────────
     results:  List[Dict[str, Any]] = []
@@ -455,8 +445,8 @@ def main() -> None:
     n_correct = sum(1 for r in results if r["correct"])
     output: Dict[str, Any] = {
         "run_at":          datetime.now(timezone.utc).isoformat(),
-        "pipeline_model":  _PIPELINE_MODEL,
-        "judge_model":     _JUDGE_MODEL,
+        "pipeline_model":  pipeline_llm.model,
+        "judge_model":     judge_llm.model,
         "total_run":       len(results),
         "correct":         n_correct,
         "accuracy":        round(n_correct / len(results) * 100, 2) if results else 0.0,

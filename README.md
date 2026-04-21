@@ -79,3 +79,9 @@ python scripts/test_retrieval.py
 python scripts/insert_iri_table_chunk.py
 
 ```
+
+## Testing
+```bash
+cd backend
+python scripts/run_eval.py
+```

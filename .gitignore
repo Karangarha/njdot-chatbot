@@ -11,6 +11,10 @@ ENV/
 .env.local
 .env.*.local
 
+__pycache__/
+*.pyc
+backend/data/eval/results_latest.json
+
 # frontend app
 frontend/node_modules/
 frontend/.next/

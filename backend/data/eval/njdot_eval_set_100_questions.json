@@ -197,7 +197,7 @@
       "category": "table_lookup",
       "difficulty": "medium",
       "query": "Required density range at N_des for Levels L and M?",
-      "gold_answer": "96.0% of theoretical maximum specific gravity at N_des, and not more than 98.0% at N_max",
+      "gold_answer": "For both Levels L and M, the required density at N_des is 96.0% of theoretical maximum specific gravity, and must not exceed 98.0% at N_max.",
       "required_citations": ["Standard Specifications", "Table 902.02.03-3", "Page 407"],
       "requires_footnote": false,
       "source_section": "902.02.03",
