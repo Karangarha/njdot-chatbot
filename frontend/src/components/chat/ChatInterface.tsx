@@ -305,7 +305,7 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
             Smart Assistant
           </button>
           <button
-            onClick={() => setActiveTab('review')}
+            onClick={() => { setActiveTab('review'); setSidebarOpen(false) }}
             className={`rounded-lg px-4 py-1.5 text-xs font-semibold transition-all ${
               activeTab === 'review'
                 ? 'bg-white text-[#1B3A6B] shadow-sm'
@@ -352,32 +352,35 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
       {/* ══ BODY ═════════════════════════════════════════════════════════════════ */}
       <div className="flex min-h-0 flex-1 overflow-hidden relative">
 
-        {/* ── Left-edge sidebar tab (visible only when sidebar is closed) ──────── */}
-        {!sidebarOpen && (
-          <button
-            onClick={() => setSidebarOpen(true)}
-            aria-label="Open sidebar"
-            className="fixed left-0 z-40 flex items-center justify-center rounded-r-lg border border-l-0 border-[#E8E8E8] bg-white shadow-sm transition-colors hover:bg-gray-50"
-            style={{ top: '50%', transform: 'translateY(-50%)', width: '22px', height: '48px' }}
-          >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1B3A6B"
-                 strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-              <rect width="18" height="18" x="3" y="3" rx="2" />
-              <path d="M9 3v18" />
-            </svg>
-          </button>
-        )}
+        {/* ── Chat-only sidebar UI (hidden entirely in Document Review mode) ───── */}
+        {activeTab === 'spec' && (
+          <>
+            {/* Left-edge tab (visible only when sidebar is closed) */}
+            {!sidebarOpen && (
+              <button
+                onClick={() => setSidebarOpen(true)}
+                aria-label="Open sidebar"
+                className="fixed left-0 z-40 flex items-center justify-center rounded-r-lg border border-l-0 border-[#E8E8E8] bg-white shadow-sm transition-colors hover:bg-gray-50"
+                style={{ top: '50%', transform: 'translateY(-50%)', width: '22px', height: '48px' }}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1B3A6B"
+                     strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                  <rect width="18" height="18" x="3" y="3" rx="2" />
+                  <path d="M9 3v18" />
+                </svg>
+              </button>
+            )}
 
-        {/* Sidebar backdrop */}
-        {sidebarOpen && (
-          <div
-            className="fixed inset-0 z-20 bg-black/30"
-            onClick={() => setSidebarOpen(false)}
-          />
-        )}
+            {/* Backdrop */}
+            {sidebarOpen && (
+              <div
+                className="fixed inset-0 z-20 bg-black/30"
+                onClick={() => setSidebarOpen(false)}
+              />
+            )}
 
-        {/* ── SIDEBAR ─────────────────────────────────────────────────────────── */}
-        <aside
+            {/* Sidebar */}
+            <aside
           className={`
             flex w-[85vw] max-w-[280px] flex-col border-r border-[#E8E8E8] bg-white
             fixed top-14 bottom-0 left-0 z-30 shadow-xl transition-transform duration-200 ease-out
@@ -464,7 +467,9 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
               </nav>
             </>
           )}
-        </aside>
+            </aside>
+          </>
+        )}
 
         {/* ── MAIN CONTENT ──────────────────────────────────────────────────── */}
         <main className="min-w-0 flex-1 overflow-hidden">
