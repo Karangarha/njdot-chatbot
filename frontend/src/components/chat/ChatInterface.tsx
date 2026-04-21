@@ -163,7 +163,13 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
   const handleNewChat = () => {
     setMessages([])
     setCurrentConvId(null)
-    // sidebar stays open so user can pick another conversation
+    setInput('')
+    setIsLoading(false)
+    setPdfModal(null)
+    setSidebarOpen(false)
+    setUserDropdownOpen(false)
+    setConfirmDeleteId(null)
+    setActiveTab('spec')
   }
 
   const handleDeleteConversation = async (convId: string) => {
