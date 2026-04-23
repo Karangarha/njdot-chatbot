@@ -173,23 +173,41 @@ export default function Home() {
         <div className="mx-auto flex max-w-5xl flex-col items-center gap-3 sm:flex-row sm:gap-0">
 
           {/* Left: logos */}
-          <div className="flex items-center gap-3 sm:flex-1">
-            <div className="rounded-full bg-white p-1">
+          <div className="flex items-center gap-4 sm:flex-1">
+            <div className="rounded-md bg-white px-3 py-1.5">
               <Image
-                src="/njdot_logo.png"
+                src="/njdot_long_logo.png"
                 alt="NJDOT"
-                width={28}
-                height={28}
-                style={{ height: '28px', width: '28px' }}
+                width={110}
+                height={36}
+                style={{ height: '36px', width: 'auto' }}
               />
             </div>
-            <div className="rounded-full bg-white px-2 py-1">
+            <div className="rounded-full bg-white p-1.5">
+              <Image
+                src="/rutgers.png"
+                alt="Rutgers University"
+                width={36}
+                height={36}
+                style={{ height: '36px', width: '36px', objectFit: 'contain' }}
+              />
+            </div>
+            <div className="rounded-full bg-white p-1.5">
               <Image
                 src="/Kean_smallLogo.png"
                 alt="Kean University"
-                width={56}
-                height={28}
-                style={{ height: '28px', width: 'auto' }}
+                width={36}
+                height={36}
+                style={{ height: '36px', width: '36px', objectFit: 'contain' }}
+              />
+            </div>
+            <div className="rounded-full bg-white p-1.5">
+              <Image
+                src="/john-hopkin.png"
+                alt="Johns Hopkins University"
+                width={36}
+                height={36}
+                style={{ height: '36px', width: '36px', objectFit: 'contain' }}
               />
             </div>
           </div>
