@@ -76,8 +76,6 @@ python scripts/deploy_sql.py
 # Smoke-test retrieval against the live database
 python scripts/test_retrieval.py
 
-python scripts/insert_iri_table_chunk.py
-
 ```
 
 ## Testing
