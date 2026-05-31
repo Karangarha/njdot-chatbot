@@ -79,12 +79,16 @@ function UploadZone({
   label,
   file,
   inputRef,
+  accept,
+  acceptValidationText,
   onSelect,
   onRemove,
 }: {
   label: string
   file: File | null
   inputRef: React.RefObject<HTMLInputElement | null>
+  accept: string
+  acceptValidationText: string
   onSelect: (f: File) => void
   onRemove: () => void
 }) {
@@ -94,7 +98,13 @@ function UploadZone({
     e.preventDefault()
     setDragging(false)
     const f = e.dataTransfer.files[0]
-    if (f && f.type === 'application/pdf') onSelect(f)
+    if (!f) return
+    
+    if (accept === '.xer') {
+      if (f.name.toLowerCase().endsWith('.xer')) onSelect(f)
+    } else {
+      if (f.type === accept) onSelect(f)
+    }
   }
 
   return (
@@ -146,15 +156,15 @@ function UploadZone({
                 d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
             </svg>
           </div>
-          <p className="mb-0.5 text-xs font-semibold text-gray-600">Click or drop PDF here</p>
-          <p className="text-[11px] text-gray-400">PDF only · max 50 MB</p>
+          <p className="mb-0.5 text-xs font-semibold text-gray-600">Click or drop file here</p>
+          <p className="text-[11px] text-gray-400">{acceptValidationText} · max 50 MB</p>
         </button>
       )}
 
       <input
         ref={inputRef}
         type="file"
-        accept="application/pdf"
+        accept={accept}
         className="hidden"
         onChange={e => {
           const f = e.target.files?.[0]
@@ -314,7 +324,7 @@ export default function DocumentReview() {
       const { data: { session } } = await sb.auth.getSession()
 
       const formData = new FormData()
-      formData.append('schedule_pdf', scheduleFile)
+      formData.append('schedule_file', scheduleFile)
       formData.append('narrative_pdf', narrativeFile)
 
       const headers: HeadersInit = {}
@@ -466,16 +476,18 @@ export default function DocumentReview() {
           </span>
         </div>
         <p className="mb-8 text-sm text-gray-500">
-          Upload the CPM schedule and designer narrative PDFs to run an automated
+          Upload the CPM schedule (.xer) and designer narrative (PDF) to run an automated
           NJDOT compliance review.
         </p>
 
         {/* ── Upload zones ── */}
         <div className="mb-6 flex flex-col gap-4 sm:flex-row">
           <UploadZone
-            label="Construction Schedule PDF"
+            label="Construction Schedule (.xer)"
             file={scheduleFile}
             inputRef={scheduleRef}
+            accept=".xer"
+            acceptValidationText=".XER only"
             onSelect={setScheduleFile}
             onRemove={() => setScheduleFile(null)}
           />
@@ -483,6 +495,8 @@ export default function DocumentReview() {
             label="Designer Narrative PDF"
             file={narrativeFile}
             inputRef={narrativeRef}
+            accept="application/pdf"
+            acceptValidationText="PDF only"
             onSelect={setNarrativeFile}
             onRemove={() => setNarrativeFile(null)}
           />

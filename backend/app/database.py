@@ -1,4 +1,10 @@
-"""Supabase database client for NJDOT Chatbot."""
+'''import sys
+from pathlib import Path
+
+# Add backend directory to sys.path if run directly as a script
+_BACKEND = Path(__file__).resolve().parent.parent
+if str(_BACKEND) not in sys.path:
+    sys.path.insert(0, str(_BACKEND))'''
 
 from supabase import create_client, Client
 from typing import Optional

@@ -31,3 +31,5 @@ frontend/.pnpm-debug.log*
 __pycache__/
 *.pyc
 *.pyo
+
+test
