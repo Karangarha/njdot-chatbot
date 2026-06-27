@@ -447,6 +447,76 @@ def _build_table_chunks(
     return chunks
 
 
+def _load_precomputed_table_chunks(
+    jsonl_path: Path,
+    doc_name: str,
+) -> List[Dict[str, Any]]:
+    """
+    Load pre-computed row-level table chunks from table_chunks.jsonl
+    (produced by scripts/table_chunker.py) and convert to the standard
+    chunk dict format expected by the embedder.
+
+    These chunks contain richer natural-language sentences than the
+    pipe-delimited markdown rows produced by _build_table_row_chunks().
+    """
+    if not jsonl_path.exists():
+        print(f"  -- table_chunks.jsonl not found at {jsonl_path} — skipping")
+        return []
+
+    _DIV_MAP = {
+        "1": "DIVISION 100", "100": "DIVISION 100",
+        "2": "DIVISION 200", "200": "DIVISION 200",
+        "3": "DIVISION 300", "300": "DIVISION 300",
+        "4": "DIVISION 400", "400": "DIVISION 400",
+        "5": "DIVISION 500", "500": "DIVISION 500",
+        "6": "DIVISION 600", "600": "DIVISION 600",
+        "7": "DIVISION 700", "700": "DIVISION 700",
+        "8": "DIVISION 800", "800": "DIVISION 800",
+        "9": "DIVISION 900", "900": "DIVISION 900",
+        "10": "DIVISION 1000", "1000": "DIVISION 1000",
+    }
+
+    import json as _json
+    chunks: List[Dict[str, Any]] = []
+    with jsonl_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = _json.loads(line)
+            except Exception:
+                continue
+
+            text = row.get("text", "").strip()
+            if not text:
+                continue
+
+            div_key = str(row.get("division", "")).split(".")[0]
+            division = _DIV_MAP.get(div_key, f"DIVISION {div_key}")
+
+            chunks.append({
+                "content": text,
+                "metadata": {
+                    "doc":           doc_name,
+                    "section_id":    row.get("section", ""),
+                    "section_title": row.get("table_name", ""),
+                    "division":      division,
+                    "page_pdf":      row.get("page"),
+                    "page_printed":  row.get("page"),
+                    "kind":          "table_row",
+                    "table_id":      row.get("table_id", ""),
+                    "table_type":    row.get("table_type", "simple"),
+                    "footnotes":     row.get("footnotes") or [],
+                    "row_key":       row.get("row_key", ""),
+                    "col_key":       row.get("col_key"),
+                    "chunk_id":      row.get("chunk_id", ""),
+                },
+            })
+
+    return chunks
+
+
 def _build_table_row_chunks(
     tbl:        Dict[str, Any],
     section_id: str,
@@ -593,7 +663,13 @@ def _ingest_one(
         if row_chunks:
             print(f"  📝 Produced {len(row_chunks)} table_row chunks")
 
-        chunks = text_chunks + table_chunks + row_chunks
+        # ── Pre-computed natural-language row chunks (table_chunker.py) ───────
+        tbl_jsonl = _BACKEND / "data" / "table_chunks.jsonl"
+        nl_row_chunks = _load_precomputed_table_chunks(tbl_jsonl, doc_name)
+        if nl_row_chunks:
+            print(f"  📊 Loaded {len(nl_row_chunks)} pre-computed table_row chunks from table_chunks.jsonl")
+
+        chunks = text_chunks + table_chunks + row_chunks + nl_row_chunks
 
     # ── All other doc types: existing PDFParser → Chunker pipeline ────────────
     else:
