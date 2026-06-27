@@ -1,10 +1,20 @@
 """Configuration management for NJDOT Chatbot."""
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Load base config from .env first.
+# If .env.local exists in the same directory, load it afterwards with
+# override=True so its values take precedence. This lets you point the
+# backend at a test Supabase project just by creating .env.local, and
+# switch back to production by deleting it.
+_BASE_DIR = Path(__file__).resolve().parent.parent
+load_dotenv(_BASE_DIR / ".env")
+_local_env = _BASE_DIR / ".env.local"
+if _local_env.exists():
+    load_dotenv(_local_env, override=True)
+    print("[LOCAL] Using local database (.env.local)")
 
 
 class Config:
@@ -62,20 +72,20 @@ class Config:
         missing = [key for key, value in required.items() if not value]
 
         if missing:
-            print(f"❌ Missing required environment variables: {', '.join(missing)}")
+            print(f"FAIL Missing required environment variables: {', '.join(missing)}")
             return False
 
-        print("✅ Configuration validated")
+        print("OK Configuration validated")
         return True
 
     @classmethod
     def print_config(cls) -> None:
         """Print current configuration (for debugging)."""
-        print("\n📋 Current Configuration:")
+        print("\nCurrent Configuration:")
         print(f"   Environment: {cls.ENVIRONMENT}")
         print(f"   Supabase URL: {cls.SUPABASE_URL}")
-        print(f"   Local LLM: {'✅ Enabled' if cls.USE_LOCAL_LLM else '❌ Disabled'}")
-        print(f"   OpenAI Key: {'✅ Set' if cls.OPENAI_API_KEY else '❌ Not set'}")
+        print(f"   Local LLM: {'Enabled' if cls.USE_LOCAL_LLM else 'Disabled'}")
+        print(f"   OpenAI Key: {'Set' if cls.OPENAI_API_KEY else 'Not set'}")
         print(f"   Ollama URL: {cls.OLLAMA_BASE_URL}")
         print(f"   Ollama Model: {cls.OLLAMA_MODEL}")
         print(f"   Data Directory: {cls.DATA_DIR}")

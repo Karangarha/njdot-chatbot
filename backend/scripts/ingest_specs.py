@@ -200,7 +200,7 @@ def _delete_collection(db_client: Any, collection_name: str) -> None:
         .execute()
     )
     deleted = len(result.data) if result.data else 0
-    print(f"  🗑️  Deleted {deleted} existing rows from collection={collection_name!r}")
+    print(f"  Deleted {deleted} existing rows from collection={collection_name!r}")
 
 
 def _build_rows(
@@ -254,7 +254,7 @@ def _insert_in_batches(
         end   = min(start + batch_size, total)
         batch = rows[start:end]
         db_client.table("chunks").insert(batch).execute()
-        print(f"  💾 Inserted rows {start + 1}–{end} / {total}")
+        print(f"  Inserted rows {start + 1}-{end} / {total}")
 
 
 # ── Table extraction helpers ──────────────────────────────────────────────────

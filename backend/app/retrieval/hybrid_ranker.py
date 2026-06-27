@@ -122,20 +122,57 @@ _KEYWORD_TERMS_RE = re.compile(
     r'|'
     r'\bT\s*\d{2,3}\b'            # AASHTO T numbers: T 176, T99
     r'|'
-    r'\bM\s*\d{2,3}\b',           # AASHTO M numbers: M 85, M182
+    r'\bM\s*\d{2,3}\b'            # AASHTO M numbers: M 85, M182
+    r'|'
+    r'\bNJDOT\s+[A-Z]-\d'         # NJDOT test methods: NJDOT B-10, NJDOT R-1
+    r'|'
+    r'\bR\s*\d{2,3}\b',           # AASHTO R numbers: R 30, R62
+    re.IGNORECASE,
+)
+
+# NJDOT-domain acronyms and codes that appear verbatim in specs.
+# These give keyword search an edge over pure semantic embedding but are not
+# as pinpoint as section numbers or AASHTO/ASTM codes, so they get a middle
+# weight tier rather than the full keyword-heavy split.
+_NJDOT_DOMAIN_RE = re.compile(
+    r'\bHMA\b'                    # Hot Mix Asphalt
+    r'|'
+    r'\bIRI\b'                    # International Roughness Index
+    r'|'
+    r'\bJMF\b'                    # Job Mix Formula
+    r'|'
+    r'\bRAP\b'                    # Reclaimed Asphalt Pavement
+    r'|'
+    r'\bRAS\b'                    # Reclaimed Asphalt Shingles
+    r'|'
+    r'\bQPL\b'                    # Qualified Products List
+    r'|'
+    r'\bPPA\b'                    # Percent Pay Adjustment
+    r'|'
+    r'\bMUTCD\b'                  # Manual on Uniform Traffic Control Devices
+    r'|'
+    r'\bCPM\b'                    # Critical Path Method (scheduling)
+    r'|'
+    r'\bDBE\b'                    # Disadvantaged Business Enterprise
+    r'|'
+    r'\bPG\s+\d{2}'               # Performance Grade binder: PG 64-22, PG 76-22
+    r'|'
+    r'\bQC/QA\b|\bQC\b|\bQA\b',   # Quality Control / Quality Assurance
     re.IGNORECASE,
 )
 
 # Weight tuples: (vector_weight, keyword_weight)
 _WEIGHTS_KEYWORD_HEAVY: Tuple[float, float] = (0.3, 0.7)
+_WEIGHTS_MIXED:         Tuple[float, float] = (0.45, 0.55)
 _WEIGHTS_SEMANTIC:      Tuple[float, float] = (0.6, 0.4)
 
 # RRF smoothing constant (standard value from Cormack et al. 2009)
 _RRF_K: int = 60
 
 # How many candidates to gather from each sub-searcher before merging.
-# Larger pool → better recall at the cost of slightly more RPC data.
-_POOL_MULTIPLIER: int = 3
+# 5× gives enough breadth for section deduplication to work — after removing
+# continuation chunks from the same section_id we still have ample candidates.
+_POOL_MULTIPLIER: int = 5
 
 
 # ── Public helper ─────────────────────────────────────────────────────────────
@@ -147,20 +184,25 @@ def classify_query(query: str) -> Tuple[float, float, str]:
     Returns
     -------
     (vector_weight, keyword_weight, label)
-        ``label`` is ``"keyword-heavy"`` or ``"semantic"``.
+        ``label`` is ``"keyword-heavy"``, ``"mixed"``, or ``"semantic"``.
 
     Examples
     --------
     >>> classify_query("section 105.03")
     (0.3, 0.7, 'keyword-heavy')
-    >>> classify_query("What are the requirements for proposal bond?")
-    (0.6, 0.4, 'semantic')
     >>> classify_query("AASHTO T 176 requirements")
     (0.3, 0.7, 'keyword-heavy')
+    >>> classify_query("What are the HMA pay adjustment requirements?")
+    (0.45, 0.55, 'mixed')
+    >>> classify_query("What are the requirements for proposal bond?")
+    (0.6, 0.4, 'semantic')
     """
     if _SECTION_NUM_RE.search(query) or _KEYWORD_TERMS_RE.search(query):
         v, k = _WEIGHTS_KEYWORD_HEAVY
         return v, k, "keyword-heavy"
+    if _NJDOT_DOMAIN_RE.search(query):
+        v, k = _WEIGHTS_MIXED
+        return v, k, "mixed"
     v, k = _WEIGHTS_SEMANTIC
     return v, k, "semantic"
 
@@ -330,12 +372,22 @@ class HybridRanker:
                 data[rid] = result
             k_ranks[rid] = rank
 
-        # Sort by descending RRF score and take top match_count
+        # Sort by descending RRF score, then deduplicate by section_id so that
+        # continuation chunks from the same subpart don't consume multiple slots.
+        # The highest-ranked chunk per section_id is kept; lower-ranked siblings
+        # are skipped unless we run out of unique sections before match_count.
         sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
 
         merged: List[Dict[str, Any]] = []
-        for rid in sorted_ids[:match_count]:
-            result = dict(data[rid])
+        seen_sections: set = set()
+        for rid in sorted_ids:
+            if len(merged) >= match_count:
+                break
+            result   = dict(data[rid])
+            section  = result.get("metadata", {}).get("section_id") or rid
+            if section in seen_sections:
+                continue
+            seen_sections.add(section)
             result["similarity"] = round(scores[rid], 6)
             if debug:
                 result["_vector_rank"]  = v_ranks.get(rid)
