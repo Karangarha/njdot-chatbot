@@ -59,7 +59,7 @@ from app.generation.citation_serializer import CitationSerializer
 _EVAL_JSON   = _BACKEND / "data" / "eval" / "njdot_eval_set_100_questions.json"
 _RESULTS_OUT = _BACKEND / "data" / "eval" / "results_latest.json"
 
-_RETRIEVE_K: int = 15  # raised for better recall
+_RETRIEVE_K: int = 12  # raised to match query.py
 
 # The exact phrase the system prompt instructs the LLM to use when it cannot answer.
 _INSUF_MARKER = "Insufficient evidence"

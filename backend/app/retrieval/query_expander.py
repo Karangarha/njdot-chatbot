@@ -184,12 +184,7 @@ class QueryExpander:
 
         try:
             raw = self._llm.complete(_EXPANSION_SYSTEM, user_message)
-            text = raw.strip()
-            # Strip markdown code fences (```json ... ``` or ``` ... ```)
-            if text.startswith("```"):
-                text = re.sub(r"^```(?:json)?\s*", "", text)
-                text = re.sub(r"\s*```$", "", text.strip())
-            parsed = json.loads(text)
+            parsed = json.loads(raw.strip())
             spec_style = parsed.get("spec_style", "").strip()
             keywords   = parsed.get("keywords", "").strip()
 
