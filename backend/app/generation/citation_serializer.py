@@ -119,7 +119,7 @@ class CitationSerializer:
         chunks: List[Dict[str, Any]],
     ) -> Dict[str, Dict[str, Any]]:
         """Map chunk UUID → chunk dict."""
-        return {c["id"]: c for c in chunks if c.get("id")}
+        return {c["id"]: c for c in chunks if isinstance(c, dict) and c.get("id")}
 
     @staticmethod
     def _index_by_section(
@@ -128,6 +128,8 @@ class CitationSerializer:
         """Map section_id (case-insensitive) → chunk dict (first match wins)."""
         idx: Dict[str, Dict[str, Any]] = {}
         for chunk in chunks:
+            if not isinstance(chunk, dict):
+                continue
             sid = (chunk.get("metadata") or {}).get("section_id")
             if sid and sid.lower() not in idx:
                 idx[sid.lower()] = chunk

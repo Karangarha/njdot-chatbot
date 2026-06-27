@@ -48,6 +48,7 @@ from app.database                       import get_db
 from app.retrieval.vector_search        import VectorSearcher
 from app.retrieval.bm25_search          import KeywordSearcher
 from app.retrieval.hybrid_ranker        import HybridRanker
+from app.retrieval.query_expander       import QueryExpander
 from app.generation.llm_client          import LLMClient
 from app.generation.prompt_builder      import PromptBuilder
 from app.generation.citation_serializer import CitationSerializer
@@ -58,7 +59,7 @@ from app.generation.citation_serializer import CitationSerializer
 _EVAL_JSON   = _BACKEND / "data" / "eval" / "njdot_eval_set_100_questions.json"
 _RESULTS_OUT = _BACKEND / "data" / "eval" / "results_latest.json"
 
-_RETRIEVE_K: int = 8   # must be ≥ PromptBuilder.MAX_CHUNKS (= 8)
+_RETRIEVE_K: int = 15  # raised for better recall
 
 # The exact phrase the system prompt instructs the LLM to use when it cannot answer.
 _INSUF_MARKER = "Insufficient evidence"
@@ -81,14 +82,38 @@ _SEP = "=" * 60
 
 def run_pipeline(
     query:      str,
-    hybrid:     HybridRanker,
+    expander:   "QueryExpander",
     builder:    PromptBuilder,
     llm:        LLMClient,
     serializer: CitationSerializer,
     collection: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Run the full RAG pipeline and return the serialized result dict."""
-    chunks = hybrid.search(query, collection=collection, match_count=_RETRIEVE_K)
+    """Run the full improved pipeline (multi-query expansion + cross-ref)."""
+    import re as _re
+    _XREF_RE = _re.compile(r'\b(\d{3}\.\d{2}(?:\.\d{2})?)\b')
+
+    # Step 1: Multi-query expansion
+    chunks = expander.expand_and_search(query, collection=collection, match_count=_RETRIEVE_K)
+
+    # Step 1.5: Cross-reference follow-up
+    already = {c.get("metadata", {}).get("section_id") for c in chunks}
+    xref_ids = []
+    for c in chunks:
+        text = c.get("content", "")
+        for sec in _XREF_RE.findall(text):
+            if sec not in already and sec not in xref_ids:
+                xref_ids.append(sec)
+    hybrid_inst = expander._ranker
+    for sec in xref_ids[:3]:
+        xref_q = f"Section {sec} specifications requirements"
+        xref_chunks = hybrid_inst.search(xref_q, collection=collection, match_count=3)
+        for xc in xref_chunks:
+            if xc.get("metadata", {}).get("section_id") == sec:
+                chunks.append(xc)
+                already.add(sec)
+                break
+
+    chunks = chunks[:_RETRIEVE_K]
     system_prompt, user_message = builder.build(query, chunks)
     raw_response = llm.complete(system_prompt, user_message)
     return serializer.serialize(raw_response, chunks)
@@ -356,6 +381,7 @@ def main() -> None:
     vector       = VectorSearcher(db_client=db_client)
     keyword      = KeywordSearcher(db_client=db_client)
     hybrid       = HybridRanker(vector_searcher=vector, keyword_searcher=keyword)
+    expander     = QueryExpander(llm_client=LLMClient(), hybrid_ranker=hybrid)
     builder      = PromptBuilder()
     pipeline_llm = LLMClient()
     judge_llm    = LLMClient()
@@ -396,7 +422,7 @@ def main() -> None:
 
         # ── Run pipeline ──────────────────────────────────────────────────
         try:
-            result        = run_pipeline(question, hybrid, builder, pipeline_llm, serializer,
+            result        = run_pipeline(question, expander, builder, pipeline_llm, serializer,
                                          collection=args.collection)
             system_answer = result.get("answer", "")
         except Exception as exc:
