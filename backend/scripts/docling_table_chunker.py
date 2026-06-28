@@ -705,10 +705,17 @@ def main() -> None:
     # Process each table
     all_chunks: List[Dict[str, Any]] = []
     found_ids: List[str] = []
-    matched_ids: set = set()  # prevent duplicate assignments
 
     def _process_doc_batch(doc: Any) -> None:
-        """Extract chunks from one Docling document (one page-range batch)."""
+        """Extract chunks from one Docling document (one page-range batch).
+
+        No dedup by table_id: Docling often splits one physical NJDOT table into
+        multiple TableItem objects (e.g. the Compaction Effort portion and the
+        Volumetric Requirements portion of Table 902.02.03-2 become two items on
+        the same page).  We want chunks from ALL of them so downstream retrieval
+        sees the complete data.  Duplicate chunk_ids are prevented by the
+        unique (table_id, row_idx, col_key) tuple baked into each chunk_id.
+        """
         if args.debug_table:
             print(f"\n=== {len(doc.tables)} Docling tables in this batch ===")
             for i, tbl in enumerate(doc.tables):
@@ -723,9 +730,8 @@ def main() -> None:
 
         for tbl in doc.tables:
             table_id = find_table_id_by_position(tbl, caption_map, doc, target_ids)
-            if not table_id or table_id in matched_ids:
+            if not table_id:
                 continue
-            matched_ids.add(table_id)
 
             _, chunks = generate_chunks_from_docling_table(
                 tbl, target_ids, doc=doc,
@@ -734,8 +740,9 @@ def main() -> None:
             )
             if chunks:
                 all_chunks.extend(chunks)
-                found_ids.append(table_id)
-                print(f"  Table {table_id}: {len(chunks)} chunks")
+                if table_id not in found_ids:
+                    found_ids.append(table_id)
+                print(f"  Table {table_id}: +{len(chunks)} chunks")
 
     # Convert and process in two batches to avoid std::bad_alloc.
     # pdfium accumulates rendered page images in memory; splitting into
