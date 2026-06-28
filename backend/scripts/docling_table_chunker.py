@@ -306,8 +306,14 @@ def find_table_id_by_position(
     # Find the caption that is ABOVE the table and closest to it.
     # y-coordinates increase downward (TOPLEFT origin).
     # "Above" means y_cap < bbox_t (caption appears before table on page).
-    # MAX_GAP: caption must be within 150 pts of table top (~2 inches).
-    MAX_GAP = 150
+    # Volumetric tables in Section 902 (902.xx.xx-2) get a larger window because
+    # their PDF layout often has multi-line sub-headers between the caption and
+    # the first Docling-detected boundary (e.g. 902.03.03-2 caption at y=78,
+    # table at y=252, gap=174 pts). Section 901 gradation tables keep a tighter
+    # window to avoid false matches with nearby small composition tables.
+    MAX_GAP = 300 if any(
+        t.startswith("902.") and t.endswith("-2") for _, t in candidates
+    ) else 150
     best_tid = ""
     best_dist = float("inf")
     for y_cap, t_id in candidates:
@@ -701,6 +707,10 @@ def main() -> None:
     if caption_map:
         total_found = sum(len(v) for v in caption_map.values())
         print(f"  pdfplumber found {total_found} target captions across {len(caption_map)} pages")
+        if args.debug_table:
+            for pg, entries in sorted(caption_map.items()):
+                for y, tid in entries:
+                    print(f"    caption '{tid}' on page {pg} at y={y:.1f}")
 
     # Process each table
     all_chunks: List[Dict[str, Any]] = []
@@ -725,7 +735,8 @@ def main() -> None:
                     cap = ""
                 tid = find_table_id_by_position(tbl, caption_map, doc, target_ids)
                 pg = tbl.prov[0].page_no if tbl.prov else "?"
-                print(f"  [{i}] page={pg} cap={repr(cap[:50])} -> matched={tid!r}")
+                bt = tbl.prov[0].bbox.t if tbl.prov else "?"
+                print(f"  [{i}] page={pg} bbox_t={bt:.1f} cap={repr(cap[:50])} -> matched={tid!r}")
             print("===\n")
 
         for tbl in doc.tables:
