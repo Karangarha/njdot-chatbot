@@ -154,29 +154,159 @@ def _make_chunk(
 
 # ── Docling conversion ────────────────────────────────────────────────────────
 
-def convert_pdf_with_docling(pdf_path: Path) -> Any:
-    """Run Docling on the PDF and return the DoclingDocument."""
+def convert_pdf_with_docling(
+    pdf_path: Path,
+    page_range: tuple[int, int] | None = None,
+) -> Any:
+    """Run Docling on the PDF and return the DoclingDocument.
+
+    page_range: 1-indexed (start, end) inclusive.  Limits which pages are
+    rendered — use this to avoid OOM on large PDFs.
+    """
     try:
-        from docling.document_converter import DocumentConverter
+        from docling.document_converter import DocumentConverter, PdfFormatOption
         from docling.datamodel.base_models import InputFormat
         from docling.datamodel.pipeline_options import PdfPipelineOptions
     except ImportError:
         print("ERROR: docling is not installed. Run: pip install docling")
         sys.exit(1)
 
-    print(f"Converting PDF with Docling: {pdf_path}")
-    print("  (First run downloads TableFormer model weights — ~200MB, takes a few minutes)")
+    if page_range:
+        print(f"Converting PDF with Docling (pages {page_range[0]}–{page_range[1]}): {pdf_path}")
+    else:
+        print(f"Converting PDF with Docling (all pages): {pdf_path}")
+    print("  (First run may download model weights — takes a few minutes)")
 
+    # do_ocr=False prevents OCR model init; must be passed via PdfFormatOption
+    # (DocumentConverter() with no args uses its own default options, ignoring
+    # any PdfPipelineOptions we created separately — hence the format_options arg).
+    # Reduce queue/batch sizes from defaults (100/4/4) to avoid std::bad_alloc
+    # when pdfium accumulates rendered page images across many pages.
     pipeline_options = PdfPipelineOptions(
         do_table_structure=True,
-        do_ocr=False,          # PDF has embedded text — no need for OCR
+        do_ocr=False,
+        queue_max_size=8,
+        layout_batch_size=2,
+        table_batch_size=2,
     )
 
-    converter = DocumentConverter()
-    result = converter.convert(str(pdf_path))
+    converter = DocumentConverter(
+        format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)}
+    )
+
+    convert_kwargs: dict[str, Any] = {"source": str(pdf_path)}
+    if page_range:
+        convert_kwargs["page_range"] = page_range
+
+    result = converter.convert(**convert_kwargs)
     doc = result.document
     print(f"  Docling conversion complete. Found {len(doc.tables)} table objects.")
     return doc
+
+
+# ── pdfplumber caption location scan ─────────────────────────────────────────
+
+def build_caption_position_map(
+    pdf_path: Path,
+    target_ids: set,
+    page_range: tuple[int, int],
+) -> dict[int, list[tuple[float, str]]]:
+    """
+    Scan pages in page_range with pdfplumber, find all 'Table XXX.XX.XX-X'
+    caption lines for target_ids, and record their page + y-coordinate (top
+    of the line in PDF points from page top).
+
+    Returns {page_num: [(y_top, table_id), ...]} sorted ascending by y_top.
+    The y-coordinates use the same TOPLEFT origin as Docling's BoundingBox.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        print("  WARNING: pdfplumber not found — caption matching will rely only on Docling detection.")
+        return {}
+
+    result: dict[int, list[tuple[float, str]]] = {}
+    with pdfplumber.open(str(pdf_path)) as pdf:
+        for pg_num in range(page_range[0], min(page_range[1] + 1, len(pdf.pages) + 1)):
+            page = pdf.pages[pg_num - 1]
+            words = page.extract_words(extra_attrs=["top"])
+            if not words:
+                continue
+            # Reconstruct text line-by-line, tracking y-top of each line
+            lines: list[tuple[float, str]] = []
+            cur_line_words: list[str] = []
+            cur_y: float = words[0]["top"]
+            for w in words:
+                if abs(w["top"] - cur_y) > 4:  # new line
+                    lines.append((cur_y, " ".join(cur_line_words)))
+                    cur_line_words = [w["text"]]
+                    cur_y = w["top"]
+                else:
+                    cur_line_words.append(w["text"])
+            if cur_line_words:
+                lines.append((cur_y, " ".join(cur_line_words)))
+            # Find lines that match a target table caption
+            for y, line_text in lines:
+                m = _CAPTION_RE.search(line_text)
+                if m:
+                    tid = m.group(1).strip()
+                    if tid in target_ids:
+                        result.setdefault(pg_num, []).append((y, tid))
+        # Sort each page's entries top-to-bottom
+        for pg in result:
+            result[pg].sort(key=lambda x: x[0])
+    return result
+
+
+def find_table_id_by_position(
+    docling_table: Any,
+    caption_map: dict[int, list[tuple[float, str]]],
+    doc: Any,
+    target_ids: set,
+) -> str:
+    """
+    Identify a Docling table's table_id using:
+    1. Docling caption_text(doc) if non-empty
+    2. Position-based match: find caption on same page whose y is just above
+       the table's top bbox (y_caption < bbox.t + some tolerance).
+    """
+    # 1. Try Docling's own caption detection
+    caption = ""
+    if doc is not None:
+        try:
+            caption = docling_table.caption_text(doc).strip()
+        except Exception:
+            pass
+    tid = extract_table_id_from_caption(caption)
+    if tid and tid in target_ids:
+        return tid
+
+    # 2. Fall back to position-based match
+    page_num = 0
+    bbox_t = 0.0
+    try:
+        prov = docling_table.prov[0]
+        page_num = prov.page_no
+        bbox_t = prov.bbox.t
+    except Exception:
+        return ""
+
+    candidates = caption_map.get(page_num, [])
+    if not candidates:
+        return ""
+
+    # Find the caption whose y_top is closest to (and above) the table top.
+    # A caption line is "above" the table when y_caption < bbox.t + tolerance.
+    TOLERANCE = 50  # pts — one line height ~12pt, but tables can start close
+    best_tid = ""
+    best_dist = float("inf")
+    for y_cap, t_id in candidates:
+        if y_cap <= bbox_t + TOLERANCE:
+            dist = bbox_t - y_cap
+            if dist < best_dist:
+                best_dist = dist
+                best_tid = t_id
+    return best_tid
 
 
 # ── Table caption → ID extraction ─────────────────────────────────────────────
@@ -466,29 +596,28 @@ def _detect_table_type(table_id: str, headers: List[str]) -> str:
 def generate_chunks_from_docling_table(
     docling_table: Any,
     target_ids: set,
+    doc: Any = None,
+    table_id_override: str = "",
     debug_table_id: Optional[str] = None,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
     Process one Docling table object. Returns (table_id, chunks).
-    Returns ("", []) if the table is not in target_ids.
+    table_id_override: pre-resolved table ID (from position-based matching) —
+                       skips caption parsing when provided.
+    doc: the DoclingDocument — required for caption_text() resolution.
     """
-    # Get caption
     caption = ""
-    try:
-        cap_obj = docling_table.caption_text(docling_table._parent)
-        caption = str(cap_obj).strip()
-    except Exception:
-        pass
+    if table_id_override:
+        table_id = table_id_override
+    else:
+        # Get caption — caption_text(doc) resolves RefItem pointers to text
+        if doc is not None:
+            try:
+                caption = docling_table.caption_text(doc).strip()
+            except Exception:
+                pass
+        table_id = extract_table_id_from_caption(caption)
 
-    if not caption:
-        try:
-            for item in (docling_table.captions or []):
-                caption += str(item).strip() + " "
-            caption = caption.strip()
-        except Exception:
-            pass
-
-    table_id   = extract_table_id_from_caption(caption)
     table_name = _TABLE_NAMES.get(table_id, extract_table_name_from_caption(caption))
 
     if not table_id or (table_id not in target_ids and debug_table_id != table_id):
@@ -500,7 +629,7 @@ def generate_chunks_from_docling_table(
 
     if debug_table_id == table_id:
         print(f"\n=== DEBUG TABLE {table_id} ===")
-        print(f"  Caption: {caption}")
+        print(f"  Caption: {caption or '(matched by position)'}")
         print(f"  Page: {page_num}")
         print(f"  Grid ({len(grid)} rows × {len(grid[0]) if grid else 0} cols):")
         for i, row in enumerate(grid[:8]):
@@ -531,6 +660,9 @@ def main() -> None:
     parser.add_argument("--output",       default=str(_OUTPUT_PATH), help="Output JSONL path")
     parser.add_argument("--tables",       default="",                help="Comma-separated table IDs to extract (default: all high-risk)")
     parser.add_argument("--debug-table",  default="",                help="Print raw Docling grid for this table ID and exit")
+    parser.add_argument("--page-start",   type=int, default=425,     help="First PDF page to convert (1-indexed, default 425)")
+    parser.add_argument("--page-end",     type=int, default=485,     help="Last PDF page to convert (1-indexed, default 485)")
+    parser.add_argument("--all-pages",    action="store_true",        help="Convert all pages (slow, high memory)")
     args = parser.parse_args()
 
     pdf_path    = Path(args.pdf)
@@ -550,21 +682,70 @@ def main() -> None:
 
     print(f"Target table IDs ({len(target_ids)}): {sorted(target_ids)}")
 
-    # Convert PDF
-    doc = convert_pdf_with_docling(pdf_path)
+    # Build pdfplumber caption position map before conversion.
+    # The NJDOT spec uses plain-text captions not linked in the PDF structure,
+    # so Docling's caption_text() works for only ~1/55 tables.
+    page_range = None if args.all_pages else (args.page_start, args.page_end)
+    effective_range = page_range or (1, 9999)
+    caption_map = build_caption_position_map(pdf_path, target_ids, effective_range)
+    if caption_map:
+        total_found = sum(len(v) for v in caption_map.values())
+        print(f"  pdfplumber found {total_found} target captions across {len(caption_map)} pages")
 
     # Process each table
     all_chunks: List[Dict[str, Any]] = []
     found_ids: List[str] = []
+    matched_ids: set = set()  # prevent duplicate assignments
 
-    for tbl in doc.tables:
-        table_id, chunks = generate_chunks_from_docling_table(
-            tbl, target_ids, debug_table_id=args.debug_table or None
-        )
-        if table_id and chunks:
-            all_chunks.extend(chunks)
-            found_ids.append(table_id)
-            print(f"  Table {table_id}: {len(chunks)} chunks")
+    def _process_doc_batch(doc: Any) -> None:
+        """Extract chunks from one Docling document (one page-range batch)."""
+        if args.debug_table:
+            print(f"\n=== {len(doc.tables)} Docling tables in this batch ===")
+            for i, tbl in enumerate(doc.tables):
+                try:
+                    cap = tbl.caption_text(doc)
+                except Exception:
+                    cap = ""
+                tid = find_table_id_by_position(tbl, caption_map, doc, target_ids)
+                pg = tbl.prov[0].page_no if tbl.prov else "?"
+                print(f"  [{i}] page={pg} cap={repr(cap[:50])} -> matched={tid!r}")
+            print("===\n")
+
+        for tbl in doc.tables:
+            table_id = find_table_id_by_position(tbl, caption_map, doc, target_ids)
+            if not table_id or table_id in matched_ids:
+                continue
+            matched_ids.add(table_id)
+
+            _, chunks = generate_chunks_from_docling_table(
+                tbl, target_ids, doc=doc,
+                table_id_override=table_id,
+                debug_table_id=args.debug_table or None,
+            )
+            if chunks:
+                all_chunks.extend(chunks)
+                found_ids.append(table_id)
+                print(f"  Table {table_id}: {len(chunks)} chunks")
+
+    # Convert and process in two batches to avoid std::bad_alloc.
+    # pdfium accumulates rendered page images in memory; splitting into
+    # batches of ~40 pages lets each batch start with a fresh allocator.
+    _BATCH_SPLIT = 465  # pages 425-465 succeed; 466-485 fail in one shot
+    if args.all_pages or page_range is None:
+        doc = convert_pdf_with_docling(pdf_path, page_range=None)
+        _process_doc_batch(doc)
+    else:
+        start, end = page_range
+        if start <= _BATCH_SPLIT:
+            batch1_end = min(_BATCH_SPLIT, end)
+            print(f"\n--- Batch 1: pages {start}–{batch1_end} ---")
+            doc1 = convert_pdf_with_docling(pdf_path, page_range=(start, batch1_end))
+            _process_doc_batch(doc1)
+        if end > _BATCH_SPLIT:
+            batch2_start = max(_BATCH_SPLIT + 1, start)
+            print(f"\n--- Batch 2: pages {batch2_start}–{end} ---")
+            doc2 = convert_pdf_with_docling(pdf_path, page_range=(batch2_start, end))
+            _process_doc_batch(doc2)
 
     # Report missing
     missing = sorted(target_ids - set(found_ids))
