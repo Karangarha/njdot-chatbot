@@ -49,6 +49,11 @@ import json
 import re
 import sys
 from pathlib import Path
+
+# Reconfigure stdout to UTF-8 so PDF special chars (≥, ≤, ×, …) don't crash
+# print() on Windows consoles that default to cp1252.
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from typing import Any, Dict, List, Optional, Tuple
 
 _BACKEND_DIR  = Path(__file__).resolve().parent.parent
