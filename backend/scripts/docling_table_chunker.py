@@ -245,9 +245,12 @@ def build_caption_position_map(
                     cur_line_words.append(w["text"])
             if cur_line_words:
                 lines.append((cur_y, " ".join(cur_line_words)))
-            # Find lines that match a target table caption
+            # Find lines that ARE a table caption (line starts with "Table …").
+            # Cross-references like "…see Table 902.02.03-2…" are excluded
+            # because _CAPTION_RE.match() (not .search()) requires the match
+            # to start at the beginning of the string.
             for y, line_text in lines:
-                m = _CAPTION_RE.search(line_text)
+                m = _CAPTION_RE.match(line_text.lstrip())
                 if m:
                     tid = m.group(1).strip()
                     if tid in target_ids:
@@ -295,14 +298,16 @@ def find_table_id_by_position(
     if not candidates:
         return ""
 
-    # Find the caption whose y_top is closest to (and above) the table top.
-    # A caption line is "above" the table when y_caption < bbox.t + tolerance.
-    TOLERANCE = 50  # pts — one line height ~12pt, but tables can start close
+    # Find the caption that is ABOVE the table and closest to it.
+    # y-coordinates increase downward (TOPLEFT origin).
+    # "Above" means y_cap < bbox_t (caption appears before table on page).
+    # MAX_GAP: caption must be within 150 pts of table top (~2 inches).
+    MAX_GAP = 150
     best_tid = ""
     best_dist = float("inf")
     for y_cap, t_id in candidates:
-        if y_cap <= bbox_t + TOLERANCE:
-            dist = bbox_t - y_cap
+        dist = bbox_t - y_cap  # positive = caption is above table
+        if 0 <= dist <= MAX_GAP:
             if dist < best_dist:
                 best_dist = dist
                 best_tid = t_id
@@ -331,7 +336,7 @@ def extract_table_name_from_caption(caption: str) -> str:
 
 # ── Convert a Docling table to a pandas-like grid ────────────────────────────
 
-def table_to_grid(docling_table: Any) -> Tuple[List[List[str]], int]:
+def table_to_grid(docling_table: Any, doc: Any = None) -> Tuple[List[List[str]], int]:
     """
     Extract a Docling TableItem into a 2D list of strings and page number.
 
@@ -340,7 +345,7 @@ def table_to_grid(docling_table: Any) -> Tuple[List[List[str]], int]:
     """
     try:
         # Docling TableItem.export_to_dataframe() returns a pandas DataFrame
-        df = docling_table.export_to_dataframe()
+        df = docling_table.export_to_dataframe(doc) if doc is not None else docling_table.export_to_dataframe()
         grid = [list(df.columns)] + df.values.tolist()
         grid = [[str(c) if c is not None else "" for c in row] for row in grid]
         # Get page number
@@ -623,7 +628,7 @@ def generate_chunks_from_docling_table(
     if not table_id or (table_id not in target_ids and debug_table_id != table_id):
         return "", []
 
-    grid, page_num = table_to_grid(docling_table)
+    grid, page_num = table_to_grid(docling_table, doc=doc)
     if not grid:
         return table_id, []
 
