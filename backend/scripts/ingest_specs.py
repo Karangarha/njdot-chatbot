@@ -85,6 +85,7 @@ from app.ingestion.pdf_parser      import PDFParser           # noqa: E402
 from app.ingestion.chunker         import Chunker, FRONT_MATTER_PAGES  # noqa: E402
 from app.ingestion.embedder        import Embedder             # noqa: E402
 from app.ingestion.table_extractor import TableExtractor       # noqa: E402
+from app.ingestion.contextualizer  import Contextualizer       # noqa: E402
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -229,8 +230,8 @@ def _build_rows(
             "page_printed":  chunk["metadata"]["page_printed"],
             "kind":          chunk["metadata"]["kind"],
         }
-        # Optional table-specific fields
-        for key in ("table_id", "table_type", "footnotes"):
+        # Optional fields passed through when present
+        for key in ("table_id", "table_type", "footnotes", "context_summary"):
             if key in chunk["metadata"]:
                 meta[key] = chunk["metadata"][key]
 
@@ -587,10 +588,11 @@ def _build_table_row_chunks(
 # ── Per-document pipeline ─────────────────────────────────────────────────────
 
 def _ingest_one(
-    db_client: Any,
-    embedder:  Embedder,
-    doc_cfg:   Dict[str, str],
-    raw_pdfs_dir: Path,
+    db_client:     Any,
+    embedder:      Embedder,
+    contextualizer: Contextualizer,
+    doc_cfg:       Dict[str, str],
+    raw_pdfs_dir:  Path,
 ) -> tuple[int, List[Dict[str, Any]]]:
     """
     Run the full pipeline for one document.
@@ -694,6 +696,12 @@ def _ingest_one(
         print("  ⚠️  No chunks produced — skipping insert.")
         return 0, []
 
+    # ── Contextualize ─────────────────────────────────────────────────────────
+    # Generates a context_summary sentence per chunk and sets embed_text so
+    # the embedder uses (context_summary + content) as the embedding input.
+    # The stored content field is left unchanged for display/citation purposes.
+    contextualizer.contextualize(chunks, doc_name=doc_name)
+
     # ── Embed ──────────────────────────────────────────────────────────────────
     embedder.embed(chunks)
 
@@ -741,9 +749,10 @@ def main(
     if not config.validate():
         sys.exit(1)
 
-    db_client   = get_db()
-    embedder    = Embedder()
-    doc_configs = _build_doc_configs(raw_pdfs_dir)
+    db_client      = get_db()
+    embedder       = Embedder()
+    contextualizer = Contextualizer()
+    doc_configs    = _build_doc_configs(raw_pdfs_dir)
 
     # Filter to a single collection if requested
     if collection:
@@ -784,7 +793,7 @@ def main(
     mp_sample_chunks: List[Dict[str, Any]] = []
 
     for doc_cfg in doc_configs:
-        n, chunks = _ingest_one(db_client, embedder, doc_cfg, raw_pdfs_dir)
+        n, chunks = _ingest_one(db_client, embedder, contextualizer, doc_cfg, raw_pdfs_dir)
         col = doc_cfg["collection"]
         stats[col] = stats.get(col, 0) + n
         total_inserted += n
@@ -849,8 +858,10 @@ def _dry_run(raw_pdfs_dir: Path) -> None:
     chunks = Chunker(doc_type="scheduling").chunk(pages)
     print(f"  ✂️  Produced {len(chunks)} chunks total")
 
-    # Embed only first 3 to keep API cost minimal
+    # Contextualize + embed only first 3 to keep API cost minimal
     sample = chunks[:3]
+    print(f"  🔤 Contextualizing {len(sample)} sample chunks…")
+    Contextualizer().contextualize(sample, doc_name=doc_name)
     print(f"  🔢 Embedding {len(sample)} sample chunks…\n")
     embedder = Embedder()
     embedder.embed(sample)
@@ -876,6 +887,7 @@ def _dry_run(raw_pdfs_dir: Path) -> None:
         print(f"    page_pdf      : {meta['page_pdf']}")
         print(f"    page_printed  : {meta['page_printed']}")
         print(f"    kind          : {meta['kind']!r}")
+        print(f"    context       : {meta.get('context_summary', '(none)')!r}")
         print(f"    embedding dim : {len(emb)}  ✅")
         preview = " ".join(chunk["content"][:200].split())
         print(f"    content       : {preview!r}…")

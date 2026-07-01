@@ -106,8 +106,12 @@ class Embedder:
         Parameters
         ----------
         chunks : list[dict]
-            Output of ``Chunker.chunk()``.  Each dict must contain a
-            ``"content"`` key.
+            Output of ``Chunker.chunk()`` (optionally post-processed by
+            ``Contextualizer``).  Each dict must contain ``"content"``.
+            If ``"embed_text"`` is present (set by ``Contextualizer``),
+            it is used as the embedding input instead of ``"content"``
+            so the vector carries contextual signal without altering the
+            stored content.
 
         Returns
         -------
@@ -131,7 +135,8 @@ class Embedder:
                 flush=True,
             )
 
-            texts      = [c["content"] for c in batch]
+            # Use embed_text (context + content) when present; else raw content.
+            texts      = [c.get("embed_text") or c["content"] for c in batch]
             embeddings = self._embed_batch_with_retry(texts)
 
             for chunk, embedding in zip(batch, embeddings):
