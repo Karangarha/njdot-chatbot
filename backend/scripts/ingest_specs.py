@@ -671,17 +671,6 @@ def _ingest_one(
         if nl_row_chunks:
             print(f"  📊 Loaded {len(nl_row_chunks)} pre-computed table_row chunks from table_chunks.jsonl")
 
-        # ── Docling-extracted chunks override regex chunks for high-risk tables ─
-        docling_jsonl = _BACKEND / "data" / "docling_table_chunks.jsonl"
-        docling_chunks = _load_precomputed_table_chunks(docling_jsonl, doc_name)
-        if docling_chunks:
-            # Remove any regex-chunker rows for table IDs covered by Docling
-            docling_ids = {c["metadata"].get("table_id") for c in docling_chunks}
-            nl_row_chunks = [c for c in nl_row_chunks
-                             if c["metadata"].get("table_id") not in docling_ids]
-            nl_row_chunks.extend(docling_chunks)
-            print(f"  🔬 Merged {len(docling_chunks)} Docling chunks (overriding {len(docling_ids)} table IDs)")
-
         chunks = text_chunks + table_chunks + row_chunks + nl_row_chunks
 
     # ── All other doc types: existing PDFParser → Chunker pipeline ────────────
