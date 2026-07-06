@@ -9,6 +9,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# ── Force UTF-8 output so box-drawing / emoji chars work on Windows ───────────
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Put backend/ on sys.path so "app.*" imports resolve ──────────────────────
 _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
