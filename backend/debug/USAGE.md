@@ -15,14 +15,17 @@ Scripts/python.exe -m debug.<script> [args]
 
 ```
 Scripts/python.exe -m debug.review schedule.xer narrative.pdf
-Scripts/python.exe -m debug.review schedule.xer narrative.pdf --show-prompt
+Scripts/python.exe -m debug.review schedule.xer narrative.pdf --sp special_provision.pdf
+Scripts/python.exe -m debug.review schedule.xer narrative.pdf --sp sp.pdf --show-prompt
 ```
+
+The `--sp` flag is optional. If provided, the special provision PDF is chunked and added to the session alongside the narrative and XER data.
 
 **What you see:**
 
 | Stage | Output |
 |-------|--------|
-| 1 — File reading | XER and PDF file sizes, decoded text length |
+| 1 — File reading | XER, narrative, and SP file sizes; SP shown as "not provided" if omitted |
 | 2 — XER parsing | Activity counts, WBS phases, negative-float list, first 5 activities (full JSON), all milestones (full JSON) |
 | 3 — Prompt assembly | JSON string length, PDF base64 length; full system + user prompts with `--show-prompt` |
 | 4 — LLM call | Model used (GPT-4o or Claude fallback), elapsed time |
@@ -31,13 +34,19 @@ Scripts/python.exe -m debug.review schedule.xer narrative.pdf --show-prompt
 | 7 — Summary | Passed / Warnings / Failed / Manual review counts |
 | 8a — Narrative chunking | Page count, each chunk with heading + full content |
 | 8b — XER chunking | Each milestone chunk and phase-summary chunk with full content |
-| 8c — Embedding | Per-batch progress, model name, dimensions |
-| 8d — Supabase insert | Row insert progress, final `session_id` saved to `debug/sessions.json` |
+| 8c — SP chunking | Page count, each sliding-window chunk with page number + full content; skipped if `--sp` not given |
+| 8d — Embedding | Per-batch progress, model name, dimensions |
+| 8e — Supabase insert | Row insert progress |
 
-After running, the script prints:
+After the insert, the session ID is printed in a prominent banner **twice** — once at the start of Stage 8 and again at the end — so it's easy to copy:
+
 ```
+████████████████████████████████████████████████████████████████████████████████
+SESSION ID:  a1b2c3d4-e5f6-7890-abcd-ef1234567890
+████████████████████████████████████████████████████████████████████████████████
+
 To query this session:
-  Scripts/python.exe -m debug.session_query <SESSION_ID> "your question"
+  Scripts/python.exe -m debug.session_query a1b2c3d4-... "your question"
 ```
 
 ---
@@ -133,14 +142,17 @@ Scripts/python.exe -m debug.query "your question" --show-prompt
 
 ```bash
 # 1. Run a compliance review — also creates a RAG session
+#    (add --sp special_provision.pdf if you have one)
 Scripts/python.exe -m debug.review path/to/schedule.xer path/to/narrative.pdf
+Scripts/python.exe -m debug.review path/to/schedule.xer path/to/narrative.pdf --sp path/to/sp.pdf
 
-# 2. List sessions to get the session_id
+# 2. Copy the SESSION ID printed in the banner, or list sessions
 Scripts/python.exe -m debug.review --list
 
 # 3. Ask questions against that session with full debug output
 Scripts/python.exe -m debug.session_query <SESSION_ID> "what is the bid date?"
 Scripts/python.exe -m debug.session_query <SESSION_ID> "are there any winter paving conflicts?"
+Scripts/python.exe -m debug.session_query <SESSION_ID> "what does the SP say about traffic control?" --match-count 12
 
 # 4. Query the main NJDOT RAG for spec questions
 Scripts/python.exe -m debug.query "what is the HMA surface course specification?"
@@ -162,9 +174,10 @@ Sessions are saved to `backend/debug/sessions.json`. Each entry records:
   "created_at": "2026-07-06T12:34:56",
   "xer_file": "schedule.xer",
   "narrative_file": "narrative.pdf",
+  "sp_file": "special_provision.pdf",
   "project_name": "I-95 Interchange",
-  "chunk_count": 47
+  "chunk_count": 89
 }
 ```
 
-Sessions persist in Supabase (`session_chunks` table) until explicitly deleted with `--delete`.
+`sp_file` is `null` if no special provision was provided. Sessions persist in Supabase (`session_chunks` table) until explicitly deleted with `--delete`.

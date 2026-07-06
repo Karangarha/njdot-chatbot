@@ -4,7 +4,7 @@ Modes
 -----
 Run compliance review AND ingest documents into a persistent RAG session:
 
-    python -m debug.review schedule.xer narrative.pdf [--show-prompt]
+    python -m debug.review schedule.xer narrative.pdf [--sp special_provision.pdf] [--show-prompt]
 
 List saved sessions:
 
@@ -49,7 +49,7 @@ from app.api.review import (
 from app.database import get_db
 from app.ingestion.embedder import Embedder
 from app.ingestion.pdf_parser import PDFParser
-from app.ingestion.session_chunker import chunk_narrative, xer_to_chunks
+from app.ingestion.session_chunker import chunk_narrative, chunk_special_provision, xer_to_chunks
 
 # ── Session state file ────────────────────────────────────────────────────────
 _SESSIONS_FILE = Path(__file__).parent / "sessions.json"
@@ -166,18 +166,23 @@ def _insert_session_chunks(db: Any, session_id: str, chunks: List[Dict[str, Any]
 
 # ── Modes ─────────────────────────────────────────────────────────────────────
 
-def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool) -> None:
+def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool, sp_path: Optional[Path] = None) -> None:
     """Stage 1-8: full review + session ingestion."""
 
     # ── STAGE 1: File reading ─────────────────────────────────────────────────
     section("STAGE 1 — FILE READING")
     xer_bytes       = xer_path.read_bytes()
     narrative_bytes = narrative_path.read_bytes()
+    sp_bytes        = sp_path.read_bytes() if sp_path else None
     xer_text        = xer_bytes.decode("utf-8", errors="ignore")
 
-    print(f"  XER file:      {xer_path}  ({len(xer_bytes):,} bytes)")
-    print(f"  Narrative PDF: {narrative_path}  ({len(narrative_bytes):,} bytes)")
-    print(f"  XER text length: {len(xer_text):,} characters")
+    print(f"  XER file:           {xer_path}  ({len(xer_bytes):,} bytes)")
+    print(f"  Narrative PDF:      {narrative_path}  ({len(narrative_bytes):,} bytes)")
+    if sp_path:
+        print(f"  Special Provision:  {sp_path}  ({len(sp_bytes):,} bytes)")
+    else:
+        print(f"  Special Provision:  {dim('(not provided)')}")
+    print(f"  XER text length:    {len(xer_text):,} characters")
 
     # ── STAGE 2: XER parsing ──────────────────────────────────────────────────
     section("STAGE 2 — XER PARSING")
@@ -307,7 +312,10 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool) -> None:
     section("STAGE 8 — SESSION INGESTION")
 
     session_id = str(uuid.uuid4())
-    print(f"  Session ID: {bold(session_id)}")
+    bar = "█" * 80
+    print(f"\n  {bar}")
+    print(f"  SESSION ID:  {bold(cyan(session_id))}")
+    print(f"  {bar}\n")
     db = get_db()
     all_chunks: List[Dict[str, Any]] = []
 
@@ -350,8 +358,36 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool) -> None:
         hr()
     all_chunks.extend(xer_ch)
 
-    # 8c — Embedding
-    subsection("8c — Embedding")
+    # 8c — Special Provision PDF chunking (optional)
+    subsection("8c — Special Provision PDF chunking")
+    if sp_bytes:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(sp_bytes)
+            tmp_path_sp = tmp.name
+        try:
+            sp_pages = PDFParser(tmp_path_sp).extract_text()
+        finally:
+            os.unlink(tmp_path_sp)
+
+        sp_gantt = sum(1 for p in sp_pages if not p.get("text", "").strip())
+        sp_text_pages = [p for p in sp_pages if p.get("text", "").strip()]
+        print(f"  SP PDF pages total: {len(sp_pages)}  |  with text: {len(sp_text_pages)}  |  blank/filtered: {sp_gantt}")
+
+        sp_chunks = chunk_special_provision(sp_pages)
+        print(f"  SP chunks produced: {len(sp_chunks)}\n")
+        for j, chunk in enumerate(sp_chunks):
+            meta = chunk.get("metadata", {})
+            print(f"  {cyan(f'[SP-{j+1}]')}  doc_type={meta.get('doc_type','')}  "
+                  f"page_pdf={meta.get('page_pdf','—')}  chunk_index={meta.get('chunk_index','—')}")
+            for line in chunk["content"].splitlines():
+                print(f"    {line}")
+            hr()
+        all_chunks.extend(sp_chunks)
+    else:
+        print(f"  {dim('No special provision PDF provided — skipping.')}")
+
+    # 8d — Embedding
+    subsection("8d — Embedding")
     print(f"  Total chunks to embed: {len(all_chunks)}")
     print(f"  Embedding model: {config.EMBEDDING_MODEL}  (dim=1536)")
 
@@ -366,12 +402,9 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool) -> None:
     embedder.embed_parallel(all_chunks, max_workers=3, on_progress=_progress)
     print(f"  Embedding complete — {len(all_chunks)} chunks, 1536 dims each")
 
-    # 8d — Supabase insert
-    subsection("8d — Supabase insert")
+    # 8e — Supabase insert
+    subsection("8e — Supabase insert")
     _insert_session_chunks(db, session_id, all_chunks)
-    print(f"\n  {green('Session created successfully')}")
-    print(f"  session_id:   {bold(session_id)}")
-    print(f"  chunk_count:  {len(all_chunks)}")
 
     # Save to sessions.json
     sessions = _load_sessions()
@@ -380,13 +413,24 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool) -> None:
         "created_at":    datetime.utcnow().isoformat(),
         "xer_file":      str(xer_path),
         "narrative_file": str(narrative_path),
+        "sp_file":        str(sp_path) if sp_path else None,
         "project_name":  project_name,
         "chunk_count":   len(all_chunks),
     })
     _save_sessions(sessions)
-    print(f"\n  Saved to: {_SESSIONS_FILE}")
+
+    # ── Final banner ─────────────────────────────────────────────────────────
+    bar = "█" * 80
+    print(f"\n  {bar}")
+    print(f"  {green('SESSION CREATED SUCCESSFULLY')}")
+    print(f"  SESSION ID:   {bold(cyan(session_id))}")
+    print(f"  chunk_count:  {len(all_chunks)}  "
+          f"(narrative: {len(nar_chunks)}  xer: {len(xer_ch)}"
+          + (f"  sp: {len(sp_chunks)}" if sp_bytes else "") + ")")
+    print(f"  Saved to:     {_SESSIONS_FILE}")
+    print(f"  {bar}")
     print(f"\n  To query this session:")
-    print(f"    {cyan(f'python -m debug.session_query {session_id} \"your question\"')}")
+    print(f"    {cyan(f'Scripts/python.exe -m debug.session_query {session_id} \"your question\"')}")
 
 
 def list_sessions() -> None:
@@ -459,6 +503,7 @@ def main() -> None:
     )
     parser.add_argument("xer_file",        nargs="?", help="Primavera P6 .xer schedule file")
     parser.add_argument("narrative_pdf",   nargs="?", help="Designer narrative PDF")
+    parser.add_argument("--sp",            metavar="SP_PDF", help="Special provision PDF (optional)")
     parser.add_argument("--show-prompt",   action="store_true", help="Print full system + user prompts")
     parser.add_argument("--list",          action="store_true", help="List saved debug sessions")
     parser.add_argument("--delete",        metavar="SESSION_ID", help="Delete a session and its chunks")
@@ -472,13 +517,17 @@ def main() -> None:
     elif args.xer_file and args.narrative_pdf:
         xer_path       = Path(args.xer_file)
         narrative_path = Path(args.narrative_pdf)
+        sp_path        = Path(args.sp) if args.sp else None
         if not xer_path.exists():
             print(red(f"Error: XER file not found: {xer_path}"))
             sys.exit(1)
         if not narrative_path.exists():
             print(red(f"Error: Narrative PDF not found: {narrative_path}"))
             sys.exit(1)
-        run_review(xer_path, narrative_path, show_prompt=args.show_prompt)
+        if sp_path and not sp_path.exists():
+            print(red(f"Error: Special provision PDF not found: {sp_path}"))
+            sys.exit(1)
+        run_review(xer_path, narrative_path, show_prompt=args.show_prompt, sp_path=sp_path)
     else:
         parser.print_help()
         sys.exit(1)

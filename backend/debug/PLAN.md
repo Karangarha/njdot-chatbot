@@ -29,10 +29,12 @@ No changes to any existing production files.
 
 **Usage:**
 ```
-python -m debug.review schedule.xer narrative.pdf [--show-prompt]
+python -m debug.review schedule.xer narrative.pdf [--sp special_provision.pdf] [--show-prompt]
 python -m debug.review --delete SESSION_ID
 python -m debug.review --list
 ```
+
+`--sp` is optional. If provided, the special provision PDF is chunked with `chunk_special_provision()` and added to the session alongside the narrative and XER chunks.
 
 ### Mode 1 — Run review + ingest session
 
@@ -41,6 +43,7 @@ Print every intermediate in order:
 **STAGE 1 — FILE READING**
 - XER file path + size in bytes
 - Narrative PDF path + size in bytes
+- SP PDF path + size in bytes (or "not provided" if `--sp` omitted)
 - XER decoded text length (characters)
 
 **STAGE 2 — XER PARSING** (calls `parse_xer_to_json()`)
@@ -103,16 +106,32 @@ Sub-stage 8b — XER chunking:
   - Chunk index, doc_type, phase/activity_id
   - Full content text
 
-Sub-stage 8c — Embedding:
+Sub-stage 8c — SP chunking (new):
+- Only runs if `--sp` was provided; prints "skipped" otherwise
+- Calls `PDFParser(tmp_sp_path).extract_text()` → prints page count
+- Calls `chunk_special_provision(pages)` → prints each sliding-window chunk with:
+  - Chunk index, page_pdf, chunk_index
+  - Full content text
+
+**Session ID banner** — before the chunking sub-stages begin and again after insert:
+```
+████████████████████████████████████████████████████████████████████████████████
+SESSION ID:  a1b2c3d4-e5f6-7890-abcd-ef1234567890
+████████████████████████████████████████████████████████████████████████████████
+```
+The ID is printed twice so it's easy to find at the top and bottom of the Stage 8 output.
+
+Sub-stage 8d — Embedding (formerly 8c in original plan):
 - Total chunk count going to embedder
 - Per-batch progress (batch N/M, chunk range)
 - Embedding model used, output dimensions
 
-Sub-stage 8d — Supabase insert:
+Sub-stage 8e — Supabase insert (formerly 8d):
 - session_id (UUID) assigned
 - Per-batch insert confirmation (rows N-M / total)
-- Final: "Session {session_id} created — {total} chunks stored"
-- Saves to `debug/sessions.json`
+- Final session ID banner (same `█` style as above)
+- Chunk count breakdown: narrative / xer / sp
+- Saves `sp_file` field to `debug/sessions.json` (null if not provided)
 
 ---
 
