@@ -19,6 +19,8 @@ import openai
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from xerparser import Xer
 
+from app.ingestion.session_chunker import xer_to_markdown
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["review"])
@@ -30,14 +32,20 @@ _ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
 _SYSTEM_PROMPT = """\
 You are an expert Construction Schedule Compliance Agent. Your objective is to evaluate Critical Path Method (CPM) project schedules against Department of Transportation (DOT) compliance rules.
 
-### 1. DATA CONTEXT: THE SCHEDULE JSON
-You are evaluating a JSON array containing pre-processed data from a Primavera P6 (.xer) file. Each element represents a unique project activity with these fields:
-- `activity_id` & `activity_name`: Unique identifiers.
-- `start_date` & `finish_date`: Standardized date strings. If they include a weekday name, e.g., "07/25/2024 (Thursday)", use that explicitly for weekday checks.
-- `duration_days`: Integer task duration.
-- `total_float`: Days of available float (identifies slippage or negative float).
-- `predecessors` & `successors`: Lists of related activity IDs mapping schedule logic.
-- `wbs_path`: Array of strings indicating the phase hierarchy (e.g., ["Construction", "Pre-Stage 1A"]).
+### 1. DATA CONTEXT: THE SCHEDULE MARKDOWN
+You are evaluating a Markdown document derived from a Primavera P6 (.xer) file. It is organized into these sections:
+
+**## Calendar** — project calendar name, working days (e.g., Mon–Fri), and holiday exception dates. Use this for all working-day and business-day calculations. If absent, assume a standard Mon–Fri calendar with US federal holidays.
+
+**## Milestones** — table of zero-duration activities (ID | Name | Date | Float | Predecessors). Includes key dates: Advertisement (M100), Bid Opening, Award, Construction Start, Substantial Completion, Contract Completion.
+
+**## Activities with Negative Float** — all activities where float < 0, sorted ascending. Includes WBS phase path.
+
+**## Activities with Mandatory Constraints** — activities with date constraints applied (constraint type and date shown).
+
+**## Phase: [WBS Path]** — one section per WBS phase, containing a table of all activities: ID | Name | Start | Finish | Duration (days) | Float | Predecessors.
+
+Use activity IDs and names verbatim in your evidence. Every activity in the schedule appears in exactly one Phase section.
 
 ### 2. EXECUTION CONSTRAINTS & WORKFLOW
 For EVERY rule specified under "CHECKS TO RUN", you must perform a strict sequential analysis in your internal scratchpad:
@@ -203,6 +211,58 @@ def parse_xer_to_json(xer_text: str) -> list:
     return list(activities_data.values())
 
 
+def parse_xer_calendars(xer_text: str) -> list:
+    """Extract calendar definitions (name, working days, holidays) from an XER file."""
+    _DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+    try:
+        xer = Xer(xer_text)
+    except Exception:
+        return []
+
+    cal_store = getattr(xer, "calendars", None) or {}
+    if not cal_store:
+        return []
+
+    calendars = []
+    for cal_obj in cal_store.values():
+        name = (
+            getattr(cal_obj, "clndr_name", None)
+            or getattr(cal_obj, "name", None)
+            or "Project Calendar"
+        )
+
+        # Working days — xerparser stores as comma-sep string or list
+        work_days: list = []
+        day_hr = getattr(cal_obj, "day_hr_cnt", None)
+        if day_hr:
+            parts = day_hr.split(",") if isinstance(day_hr, str) else list(day_hr)
+            for i, val in enumerate(parts[:7]):
+                try:
+                    if float(val) > 0:
+                        work_days.append(_DAY_NAMES[i])
+                except (ValueError, TypeError):
+                    pass
+
+        # Holiday exceptions
+        exceptions: list = []
+        exc_list = getattr(cal_obj, "exceptions", None) or getattr(cal_obj, "holiday_list", None) or []
+        for exc in exc_list:
+            exc_date = getattr(exc, "exception_date", None) or getattr(exc, "date", None)
+            if exc_date:
+                date_str = exc_date.strftime("%Y-%m-%d") if hasattr(exc_date, "strftime") else str(exc_date)
+                exc_name = getattr(exc, "exception_name", "") or getattr(exc, "name", "") or ""
+                exceptions.append({"date": date_str, "name": exc_name})
+
+        calendars.append({
+            "id":         str(getattr(cal_obj, "clndr_id", "") or ""),
+            "name":       name,
+            "work_days":  work_days,
+            "exceptions": sorted(exceptions, key=lambda e: e["date"]),
+        })
+
+    return calendars
+
+
 def _parse_json(raw_text: str, model_label: str) -> dict:
     """Parse JSON from a model response, stripping markdown fences if needed."""
     try:
@@ -222,7 +282,7 @@ def _parse_json(raw_text: str, model_label: str) -> dict:
             ) from exc
 
 
-def _call_openai(schedule_json_str: str, narrative_b64: str) -> dict:
+def _call_openai(schedule_md: str, narrative_b64: str) -> dict:
     """Send both documents to GPT-4o and return the parsed compliance report."""
     api_key = os.getenv("OPENAI_API_KEY", "")
     if not api_key:
@@ -241,7 +301,7 @@ def _call_openai(schedule_json_str: str, narrative_b64: str) -> dict:
                 "content": [
                     {
                         "type": "text",
-                        "text": f"Here is the parsed schedule data in JSON format:\n{schedule_json_str}",
+                        "text": f"Here is the schedule data in Markdown format:\n{schedule_md}",
                     },
                     {
                         "type": "file",
@@ -260,7 +320,7 @@ def _call_openai(schedule_json_str: str, narrative_b64: str) -> dict:
     return _parse_json(raw_text, "GPT-4o")
 
 
-def _call_anthropic(schedule_json_str: str, narrative_b64: str) -> dict:
+def _call_anthropic(schedule_md: str, narrative_b64: str) -> dict:
     """Send both documents to claude-sonnet-4-20250514 and return the parsed compliance report."""
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -278,7 +338,7 @@ def _call_anthropic(schedule_json_str: str, narrative_b64: str) -> dict:
                 "content": [
                     {
                         "type": "text",
-                        "text": f"Here is the parsed schedule data in JSON format:\n{schedule_json_str}",
+                        "text": f"Here is the schedule data in Markdown format:\n{schedule_md}",
                     },
                     {
                         "type": "document",
@@ -320,10 +380,11 @@ async def review_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to read uploaded files: {exc}") from exc
 
-    # Parse XER file to JSON
-    xer_text = schedule_bytes.decode("utf-8", errors="ignore")
+    # Parse XER → Markdown (used by both LLM calls)
+    xer_text      = schedule_bytes.decode("utf-8", errors="ignore")
     schedule_json = parse_xer_to_json(xer_text)
-    schedule_json_str = json.dumps(schedule_json)
+    calendars     = parse_xer_calendars(xer_text)
+    schedule_md   = xer_to_markdown(schedule_json, calendars)
 
     # Encode PDF
     narrative_b64 = base64.standard_b64encode(narrative_bytes).decode("utf-8")
@@ -331,7 +392,7 @@ async def review_endpoint(
     # ── Primary: GPT-4o ───────────────────────────────────────────────────────
     model_used = _OPENAI_MODEL
     try:
-        result = _call_openai(schedule_json_str, narrative_b64)
+        result = _call_openai(schedule_md, narrative_b64)
         logger.info("Review completed via %s", _OPENAI_MODEL)
     except HTTPException:
         # JSON parse failure from OpenAI — propagate immediately, no fallback needed
@@ -346,7 +407,7 @@ async def review_endpoint(
         # ── Fallback: Claude ──────────────────────────────────────────────────
         model_used = _ANTHROPIC_MODEL
         try:
-            result = _call_anthropic(schedule_json_str, narrative_b64)
+            result = _call_anthropic(schedule_md, narrative_b64)
             logger.info("Review completed via %s (fallback)", _ANTHROPIC_MODEL)
         except HTTPException:
             raise

@@ -45,11 +45,14 @@ from app.api.review import (
     _SYSTEM_PROMPT,
     _USER_TEXT,
     parse_xer_to_json,
+    parse_xer_calendars,
 )
 from app.database import get_db
 from app.ingestion.embedder import Embedder
 from app.ingestion.pdf_parser import PDFParser
-from app.ingestion.session_chunker import chunk_narrative, chunk_special_provision, xer_to_chunks
+from app.ingestion.session_chunker import (
+    chunk_narrative, chunk_special_provision, xer_to_chunks, xer_to_markdown,
+)
 
 # ── Session state file ────────────────────────────────────────────────────────
 _SESSIONS_FILE = Path(__file__).parent / "sessions.json"
@@ -77,7 +80,7 @@ def _save_sessions(sessions: List[Dict[str, Any]]) -> None:
 
 # ── Review LLM call (with raw-text capture) ───────────────────────────────────
 
-def _call_openai_debug(schedule_json_str: str, narrative_b64: str) -> tuple[str, dict]:
+def _call_openai_debug(schedule_md: str, narrative_b64: str) -> tuple[str, dict]:
     """Call GPT-4o and return (raw_text, parsed_dict)."""
     client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
     response = client.chat.completions.create(
@@ -91,7 +94,7 @@ def _call_openai_debug(schedule_json_str: str, narrative_b64: str) -> tuple[str,
                 "content": [
                     {
                         "type": "text",
-                        "text": f"Here is the parsed schedule data in JSON format:\n{schedule_json_str}",
+                        "text": f"Here is the schedule data in Markdown format:\n{schedule_md}",
                     },
                     {
                         "type": "file",
@@ -110,7 +113,7 @@ def _call_openai_debug(schedule_json_str: str, narrative_b64: str) -> tuple[str,
     return raw_text, parsed
 
 
-def _call_anthropic_debug(schedule_json_str: str, narrative_b64: str) -> tuple[str, dict]:
+def _call_anthropic_debug(schedule_md: str, narrative_b64: str) -> tuple[str, dict]:
     """Call Claude and return (raw_text, parsed_dict)."""
     import anthropic as anthropic_sdk
     client = anthropic_sdk.Anthropic(api_key=config.ANTHROPIC_API_KEY)
@@ -124,7 +127,7 @@ def _call_anthropic_debug(schedule_json_str: str, narrative_b64: str) -> tuple[s
                 "content": [
                     {
                         "type": "text",
-                        "text": f"Here is the parsed schedule data in JSON format:\n{schedule_json_str}",
+                        "text": f"Here is the schedule data in Markdown format:\n{schedule_md}",
                     },
                     {
                         "type": "document",
@@ -187,25 +190,39 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool, sp_path:
     # ── STAGE 2: XER parsing ──────────────────────────────────────────────────
     section("STAGE 2 — XER PARSING")
     activities = parse_xer_to_json(xer_text)
+    calendars  = parse_xer_calendars(xer_text)
 
-    milestones = [a for a in activities if a.get("duration_days", 1) == 0]
-    regular    = [a for a in activities if a.get("duration_days", 1) != 0]
-    neg_float  = [a for a in activities if (a.get("total_float") or 0) < 0]
-    no_dates   = [a for a in activities if not a.get("start_date") or not a.get("finish_date")]
+    milestones   = [a for a in activities if a.get("duration_days", 1) == 0]
+    regular      = [a for a in activities if a.get("duration_days", 1) != 0]
+    neg_float    = [a for a in activities if (a.get("total_float") or 0) < 0]
+    no_dates     = [a for a in activities if not a.get("start_date") or not a.get("finish_date")]
+    constrained  = [a for a in activities
+                    if a.get("constraints", {}).get("type") not in (None, "None", "")]
 
     wbs_phases = sorted({
         (a.get("wbs_path") or ["Unknown"])[0]
         for a in activities
     })
 
-    print(f"  Total activities: {bold(str(len(activities)))}")
-    print(f"  Milestones (duration=0): {len(milestones)}")
-    print(f"  Regular activities: {len(regular)}")
-    print(f"  Activities with negative float: {len(neg_float)}")
-    print(f"  Activities with missing dates: {len(no_dates)}")
+    print(f"  Total activities:             {bold(str(len(activities)))}")
+    print(f"  Milestones (duration=0):      {len(milestones)}")
+    print(f"  Regular activities:           {len(regular)}")
+    print(f"  Negative float:               {len(neg_float)}")
+    print(f"  Mandatory constraints:        {len(constrained)}")
+    print(f"  Missing dates:                {len(no_dates)}")
     print(f"\n  Top-level WBS phases ({len(wbs_phases)}):")
     for p in wbs_phases:
         print(f"    • {p}")
+
+    print(f"\n  Calendars found: {len(calendars)}")
+    for cal in calendars:
+        work_str = ", ".join(cal.get("work_days", [])) or dim("unknown")
+        exc_count = len(cal.get("exceptions", []))
+        print(f"    • {bold(cal['name'])}  —  work days: {work_str}  |  holiday exceptions: {exc_count}")
+        for exc in cal.get("exceptions", [])[:5]:
+            print(f"        {dim(exc['date'])} {exc.get('name','')}")
+        if exc_count > 5:
+            print(f"        {dim(f'… ({exc_count - 5} more)')}")
 
     if neg_float:
         subsection("Activities with negative float")
@@ -224,18 +241,18 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool, sp_path:
 
     # ── STAGE 3: Prompt assembly ───────────────────────────────────────────────
     section("STAGE 3 — PROMPT ASSEMBLY")
-    schedule_json_str = json.dumps(activities)
-    narrative_b64     = base64.standard_b64encode(narrative_bytes).decode("utf-8")
+    schedule_md   = xer_to_markdown(activities, calendars)
+    narrative_b64 = base64.standard_b64encode(narrative_bytes).decode("utf-8")
 
-    approx_tokens = len(schedule_json_str) // 4
-    print(f"  schedule_json_str length: {len(schedule_json_str):,} characters (~{approx_tokens:,} tokens)")
+    approx_tokens = len(schedule_md) // 4
+    print(f"  schedule_md length:       {len(schedule_md):,} characters (~{approx_tokens:,} tokens)")
     print(f"  narrative_b64 length:     {len(narrative_b64):,} characters")
 
     if show_prompt:
         subsection("SYSTEM PROMPT (full)")
         print(_SYSTEM_PROMPT)
-        subsection("USER MESSAGE — schedule JSON")
-        print(f"Here is the parsed schedule data in JSON format:\n{schedule_json_str}")
+        subsection("USER MESSAGE — schedule markdown")
+        print(f"Here is the schedule data in Markdown format:\n{schedule_md}")
         subsection("USER MESSAGE — user text")
         print(_USER_TEXT)
 
@@ -247,13 +264,13 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool, sp_path:
 
     print(f"  Calling {bold(_OPENAI_MODEL)} ... ", end="", flush=True)
     try:
-        raw_text, result = _call_openai_debug(schedule_json_str, narrative_b64)
+        raw_text, result = _call_openai_debug(schedule_md, narrative_b64)
         print(green("✓"))
     except Exception as openai_exc:
         print(red(f"✗ ({type(openai_exc).__name__}: {openai_exc})"))
         print(f"  Falling back to {bold(_ANTHROPIC_MODEL)} ... ", end="", flush=True)
         try:
-            raw_text, result = _call_anthropic_debug(schedule_json_str, narrative_b64)
+            raw_text, result = _call_anthropic_debug(schedule_md, narrative_b64)
             model_used = _ANTHROPIC_MODEL
             print(green("✓"))
         except Exception as anthropic_exc:
@@ -345,14 +362,15 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool, sp_path:
         hr()
     all_chunks.extend(nar_chunks)
 
-    # 8b — XER chunking
+    # 8b — XER chunking (markdown-based, one chunk per WBS section)
     subsection("8b — XER schedule chunking")
-    xer_ch = xer_to_chunks(activities)
-    print(f"  XER chunks produced: {len(xer_ch)}\n")
+    xer_ch = xer_to_chunks(activities, calendars)
+    print(f"  XER chunks produced: {len(xer_ch)}  (format: NL-rich Markdown by section)\n")
     for j, chunk in enumerate(xer_ch):
-        meta = chunk.get("metadata", {})
-        phase  = meta.get("phase") or meta.get("activity_id") or "—"
-        print(f"  {cyan(f'[XER-{j+1}]')}  doc_type={meta.get('doc_type','')}  phase/id={bold(phase)}")
+        meta    = chunk.get("metadata", {})
+        section_label = meta.get("phase") or meta.get("section") or "—"
+        print(f"  {cyan(f'[XER-{j+1}]')}  doc_type={meta.get('doc_type','')}  "
+              f"section={meta.get('section','')}  {bold(section_label)}")
         for line in chunk["content"].splitlines():
             print(f"    {line}")
         hr()
