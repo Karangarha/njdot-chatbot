@@ -30,6 +30,7 @@ from app.api.conversations import router as conversations_router
 from app.api.pdf import router as pdf_router
 from app.api.query import router as query_router
 from app.api.review import router as review_router
+from app.api.session import router as session_router
 from app.config import config
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -75,6 +76,7 @@ app.include_router(query_router)
 app.include_router(pdf_router)
 app.include_router(conversations_router)
 app.include_router(review_router)
+app.include_router(session_router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

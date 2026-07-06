@@ -1,7 +1,11 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { createClient } from '@/lib/supabase/client'
+import jsPDF from 'jspdf'
+import autoTable from 'jspdf-autotable'
+import SessionChat from './SessionChat'
+import type { ReviewProject } from '@/lib/types'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -9,6 +13,7 @@ interface CheckItem {
   id: string
   category: string
   name: string
+  reasoning?: string
   status: 'pass' | 'warning' | 'fail'
   finding: string
   evidence: string
@@ -28,42 +33,31 @@ interface ReviewResult {
   manual_review_items: string[]
 }
 
+interface DocumentReviewProps {
+  userId?: string
+  selectedProjectId?: string | null
+  onProjectSaved?: (p: ReviewProject) => void
+  onNewReview?: () => void
+}
+
 // ── Constants ──────────────────────────────────────────────────────────────────
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
-// Maps category names from the API onto one of the four display sections.
 const SECTION_CATEGORIES: Record<string, string[]> = {
-  'Administrative & Milestones': [
-    'Administrative Dates',
-    'Completion Milestones',
-    'Schedule Logic',
-  ],
-  'Environmental & Permit Restrictions': [
-    'Environmental & Permit Restrictions',
-    'Winter Restrictions',
-  ],
-  'Working Drawings & Materials': ['Working Drawings & Materials'],
-  'Narrative Completeness': ['Narrative Completeness'],
+  'Administrative & Milestones': ['Administrative Dates', 'Completion Milestones'],
+  'Environmental, Landscape & Utilities': ['Environmental, Landscape & Utilities', 'Winter Restrictions'],
+  'Working Drawings, Materials & ITS': ['Working Drawings, Materials & ITS'],
+  'Schedule Logic': ['Schedule Logic'],
+  'Manual Review': ['Manual Review'],
 }
 
 const SECTION_ORDER = [
   'Administrative & Milestones',
-  'Environmental & Permit Restrictions',
-  'Working Drawings & Materials',
-  'Narrative Completeness',
-]
-
-const MANUAL_REVIEW_ITEMS = [
-  'Utility alignment with Key Map and Special Provisions',
-  'Gas/water/electric utility restriction windows (confirm with Special Provisions)',
-  'Environmental permit compliance beyond narrative',
-  'Landscape and planting restrictions',
-  'EDQ items review',
-  'Multi-year funding check (SP 108.10)',
-  'Other nearby construction projects (105.06)',
-  'ITS testing and burn-in period',
-  'Summer shutdown restrictions for shore routes',
+  'Environmental, Landscape & Utilities',
+  'Working Drawings, Materials & ITS',
+  'Schedule Logic',
+  'Manual Review',
 ]
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -76,19 +70,14 @@ function checksForSection(checks: CheckItem[], sectionName: string): CheckItem[]
 // ── Sub-components ─────────────────────────────────────────────────────────────
 
 function UploadZone({
-  label,
-  file,
-  inputRef,
-  accept,
-  acceptValidationText,
-  onSelect,
-  onRemove,
+  label, file, inputRef, accept, acceptValidationText, optional, onSelect, onRemove,
 }: {
   label: string
   file: File | null
   inputRef: React.RefObject<HTMLInputElement | null>
   accept: string
   acceptValidationText: string
+  optional?: boolean
   onSelect: (f: File) => void
   onRemove: () => void
 }) {
@@ -99,7 +88,6 @@ function UploadZone({
     setDragging(false)
     const f = e.dataTransfer.files[0]
     if (!f) return
-    
     if (accept === '.xer') {
       if (f.name.toLowerCase().endsWith('.xer')) onSelect(f)
     } else {
@@ -110,45 +98,35 @@ function UploadZone({
   return (
     <div className="flex-1 min-w-0">
       <p className="mb-1.5 text-xs font-semibold text-gray-700">
-        {label} <span className="text-[#CC2529]">*</span>
+        {label}{' '}
+        {optional
+          ? <span className="text-gray-400 font-normal">(optional)</span>
+          : <span className="text-[#CC2529]">*</span>}
       </p>
-
       {file ? (
-        /* ── File selected state ── */
         <div className="flex items-center gap-3 rounded-xl border border-[#1B3A6B]/25 bg-[#EEF2FF] px-4 py-3.5">
-          {/* PDF icon */}
           <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-[#1B3A6B]/10">
             <svg className="h-5 w-5 text-[#1B3A6B]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
               <path strokeLinecap="round" strokeLinejoin="round"
                 d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
             </svg>
           </div>
-          <span className="min-w-0 flex-1 truncate text-xs font-medium text-[#1B3A6B]">
-            {file.name}
-          </span>
-          <button
-            onClick={onRemove}
-            className="shrink-0 rounded-full p-1 text-gray-400 hover:bg-[#1B3A6B]/10 hover:text-[#1B3A6B] transition-colors"
-            aria-label="Remove file"
-          >
+          <span className="min-w-0 flex-1 truncate text-xs font-medium text-[#1B3A6B]">{file.name}</span>
+          <button onClick={onRemove} aria-label="Remove file"
+            className="shrink-0 rounded-full p-1 text-gray-400 hover:bg-[#1B3A6B]/10 hover:text-[#1B3A6B] transition-colors">
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
             </svg>
           </button>
         </div>
       ) : (
-        /* ── Empty drop zone ── */
-        <button
-          type="button"
-          onClick={() => inputRef.current?.click()}
+        <button type="button" onClick={() => inputRef.current?.click()}
           onDragOver={e => { e.preventDefault(); setDragging(true) }}
           onDragLeave={() => setDragging(false)}
           onDrop={handleDrop}
-          className={`w-full cursor-pointer rounded-xl border-2 border-dashed px-4 py-8 text-center transition-colors ${
-            dragging
-              ? 'border-[#1B3A6B]/60 bg-[#EEF2FF]'
-              : 'border-[#1B3A6B]/20 bg-white hover:border-[#1B3A6B]/40 hover:bg-[#1B3A6B]/2'
-          }`}
+          className={`w-full cursor-pointer rounded-xl border-2 border-dashed px-4 py-8 text-center transition-colors ${dragging
+            ? 'border-[#1B3A6B]/60 bg-[#EEF2FF]'
+            : 'border-[#1B3A6B]/20 bg-white hover:border-[#1B3A6B]/40 hover:bg-[#1B3A6B]/2'}`}
         >
           <div className="mx-auto mb-3 flex h-10 w-10 items-center justify-center rounded-full bg-[#1B3A6B]/8">
             <svg className="h-5 w-5 text-[#1B3A6B]/50" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
@@ -160,32 +138,21 @@ function UploadZone({
           <p className="text-[11px] text-gray-400">{acceptValidationText} · max 50 MB</p>
         </button>
       )}
-
-      <input
-        ref={inputRef}
-        type="file"
-        accept={accept}
-        className="hidden"
-        onChange={e => {
-          const f = e.target.files?.[0]
-          if (f) onSelect(f)
-          e.target.value = ''
-        }}
-      />
+      <input ref={inputRef} type="file" accept={accept} className="hidden"
+        onChange={e => { const f = e.target.files?.[0]; if (f) onSelect(f); e.target.value = '' }} />
     </div>
   )
 }
 
 function CheckCard({ check }: { check: CheckItem }) {
   const styles = {
-    pass:    { border: 'border-green-500',  labelColor: 'text-green-600',  label: 'COMPLIANT',    iconBg: 'bg-green-100' },
-    warning: { border: 'border-amber-500',  labelColor: 'text-amber-600',  label: 'ISSUES FOUND', iconBg: 'bg-amber-100' },
-    fail:    { border: 'border-red-500',    labelColor: 'text-red-600',    label: 'MISSING',      iconBg: 'bg-red-100' },
+    pass:    { border: 'border-green-500', labelColor: 'text-green-600', label: 'COMPLIANT',    iconBg: 'bg-green-100' },
+    fail:    { border: 'border-amber-500', labelColor: 'text-amber-600', label: 'ISSUES FOUND', iconBg: 'bg-amber-100' },
+    warning: { border: 'border-red-500',   labelColor: 'text-red-600',   label: 'MISSING',      iconBg: 'bg-red-100' },
   }[check.status]
 
   return (
     <div className={`flex items-start gap-3.5 rounded-xl border-l-4 ${styles.border} bg-white px-4 py-3.5 shadow-sm ring-1 ring-black/5`}>
-      {/* Status icon */}
       <div className={`mt-0.5 flex h-6 w-6 shrink-0 items-center justify-center rounded-full ${styles.iconBg}`}>
         {check.status === 'pass' && (
           <svg className="h-3.5 w-3.5 text-green-600" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
@@ -204,83 +171,51 @@ function CheckCard({ check }: { check: CheckItem }) {
           </svg>
         )}
       </div>
-
-      {/* Content */}
       <div className="min-w-0 flex-1">
-        <span className={`text-[10px] font-bold uppercase tracking-wider ${styles.labelColor}`}>
-          {styles.label}
-        </span>
+        <span className={`text-[10px] font-bold uppercase tracking-wider ${styles.labelColor}`}>{styles.label}</span>
         <p className="mt-0.5 text-sm font-semibold text-gray-800">{check.name}</p>
         <p className="mt-1 text-xs text-gray-600 leading-relaxed">{check.finding}</p>
-        {check.evidence && (
-          <p className="mt-1.5 text-[11px] text-gray-400 leading-relaxed italic">{check.evidence}</p>
+        {check.reasoning && (
+          <div className="mt-1.5 rounded bg-gray-50 p-2 text-[11px] text-gray-500 italic border border-gray-100">
+            <strong>Reasoning:</strong> {check.reasoning}
+          </div>
         )}
+        {check.evidence && <p className="mt-1.5 text-[11px] text-gray-400 leading-relaxed italic">{check.evidence}</p>}
       </div>
     </div>
   )
 }
 
-function CollapsibleSection({
-  title,
-  checks,
-  expanded,
-  onToggle,
-}: {
-  title: string
-  checks: CheckItem[]
-  expanded: boolean
-  onToggle: () => void
+function CollapsibleSection({ title, checks, expanded, onToggle }: {
+  title: string; checks: CheckItem[]; expanded: boolean; onToggle: () => void
 }) {
   if (checks.length === 0) return null
-
-  const passCount    = checks.filter(c => c.status === 'pass').length
-  const warnCount    = checks.filter(c => c.status === 'warning').length
-  const failCount    = checks.filter(c => c.status === 'fail').length
+  const warnCount = checks.filter(c => c.status === 'warning').length
+  const failCount = checks.filter(c => c.status === 'fail').length
 
   return (
     <div className="rounded-2xl border border-[#E8E8E8] bg-white shadow-sm overflow-hidden">
-      {/* Section header */}
-      <button
-        onClick={onToggle}
-        className="flex w-full items-center justify-between px-5 py-4 text-left hover:bg-gray-50 transition-colors"
-      >
+      <button onClick={onToggle}
+        className="flex w-full items-center justify-between px-5 py-4 text-left hover:bg-gray-50 transition-colors">
         <div className="flex items-center gap-3 min-w-0">
           <span className="font-semibold text-sm text-[#1B3A6B]">{title}</span>
           <div className="flex items-center gap-1.5">
-            {failCount > 0 && (
-              <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-700">
-                {failCount} failed
-              </span>
-            )}
-            {warnCount > 0 && (
-              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700">
-                {warnCount} warning{warnCount !== 1 ? 's' : ''}
-              </span>
-            )}
-            {failCount === 0 && warnCount === 0 && (
-              <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-bold text-green-700">
-                All passed
-              </span>
-            )}
+            {failCount > 0 && <span className="rounded-full bg-red-100 px-2 py-0.5 text-[10px] font-bold text-red-700">{failCount} failed</span>}
+            {warnCount > 0 && <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-bold text-amber-700">{warnCount} warning{warnCount !== 1 ? 's' : ''}</span>}
+            {failCount === 0 && warnCount === 0 && <span className="rounded-full bg-green-100 px-2 py-0.5 text-[10px] font-bold text-green-700">All passed</span>}
           </div>
         </div>
         <div className="flex items-center gap-2 shrink-0 ml-3">
           <span className="text-[11px] text-gray-400">{checks.length} checks</span>
-          <svg
-            className={`h-4 w-4 text-gray-400 transition-transform ${expanded ? 'rotate-180' : ''}`}
-            fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-          >
+          <svg className={`h-4 w-4 text-gray-400 transition-transform ${expanded ? 'rotate-180' : ''}`}
+            fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
             <path strokeLinecap="round" strokeLinejoin="round" d="M19 9l-7 7-7-7" />
           </svg>
         </div>
       </button>
-
-      {/* Check cards */}
       {expanded && (
         <div className="space-y-2.5 border-t border-[#E8E8E8] px-4 py-4">
-          {checks.map(check => (
-            <CheckCard key={check.id} check={check} />
-          ))}
+          {checks.map(check => <CheckCard key={check.id} check={check} />)}
         </div>
       )}
     </div>
@@ -289,29 +224,84 @@ function CollapsibleSection({
 
 // ── Main component ─────────────────────────────────────────────────────────────
 
-export default function DocumentReview() {
-  const [scheduleFile, setScheduleFile] = useState<File | null>(null)
+export default function DocumentReview({
+  userId, selectedProjectId, onProjectSaved, onNewReview,
+}: DocumentReviewProps) {
+  const [scheduleFile,  setScheduleFile]  = useState<File | null>(null)
   const [narrativeFile, setNarrativeFile] = useState<File | null>(null)
-  const [isLoading, setIsLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [result, setResult] = useState<ReviewResult | null>(null)
-  const [expanded, setExpanded] = useState<Record<string, boolean>>(
+  const [spFile,        setSpFile]        = useState<File | null>(null)
+  const [isLoading,     setIsLoading]     = useState(false)
+  const [error,         setError]         = useState<string | null>(null)
+  const [result,        setResult]        = useState<ReviewResult | null>(null)
+  const [sessionId,     setSessionId]     = useState<string | null>(null)
+  const [authToken,     setAuthToken]     = useState<string | undefined>(undefined)
+  const [activeTab,     setActiveTab]     = useState<'review' | 'chat'>('review')
+  const [expanded,      setExpanded]      = useState<Record<string, boolean>>(
     Object.fromEntries(SECTION_ORDER.map(s => [s, true]))
   )
 
-  const scheduleRef = useRef<HTMLInputElement>(null)
-  const narrativeRef = useRef<HTMLInputElement>(null)
+  const scheduleRef       = useRef<HTMLInputElement>(null)
+  const narrativeRef      = useRef<HTMLInputElement>(null)
+  const spRef             = useRef<HTMLInputElement>(null)
+  const currentProjectRef = useRef<string | null>(null)
+
+  // ── Load selected project from DB when parent changes selection ────────────
+  useEffect(() => {
+    if (!selectedProjectId) {
+      setResult(null)
+      setSessionId(null)
+      setActiveTab('review')
+      return
+    }
+    const sb = createClient()
+    sb.from('review_projects')
+      .select('*')
+      .eq('id', selectedProjectId)
+      .single()
+      .then(({ data }) => {
+        if (!data) return
+        setResult(data.review_result as ReviewResult)
+        setSessionId(data.session_id ?? null)
+        setActiveTab('review')
+        currentProjectRef.current = data.id
+      })
+  }, [selectedProjectId])
 
   const canSubmit = scheduleFile !== null && narrativeFile !== null && !isLoading
 
-  const toggleSection = (name: string) =>
-    setExpanded(prev => ({ ...prev, [name]: !prev[name] }))
+  const toggleSection = (name: string) => setExpanded(prev => ({ ...prev, [name]: !prev[name] }))
 
-  const reset = () => {
-    setScheduleFile(null)
-    setNarrativeFile(null)
-    setResult(null)
-    setError(null)
+  const handleDownloadPdf = () => {
+    if (!result) return
+    const doc = new jsPDF()
+    const { project_name, project_duration_days, model_used, summary, checks } = result
+    doc.setFontSize(18); doc.text('Schedule Compliance Review', 14, 22)
+    doc.setFontSize(11); doc.setTextColor(100)
+    doc.text(`Project: ${project_name || 'Unknown'}`, 14, 30)
+    doc.text(`Duration: ${project_duration_days} days`, 14, 36)
+    if (model_used) doc.text(`Reviewed by: ${model_used}`, 14, 42)
+    doc.setFontSize(12); doc.setTextColor(0); doc.text('Summary', 14, 52)
+    doc.setFontSize(10)
+    doc.text(`Passed: ${summary.passed}`, 14, 58)
+    doc.text(`Warnings: ${summary.warnings}`, 14, 64)
+    doc.text(`Failed: ${summary.failed}`, 14, 70)
+    autoTable(doc, {
+      startY: 78,
+      head: [['Category', 'Check', 'Reasoning', 'Status', 'Finding', 'Evidence']],
+      body: checks.map(c => [c.category, c.name, c.reasoning || '', c.status.toUpperCase(), c.finding, c.evidence]),
+      theme: 'grid',
+      styles: { fontSize: 8, cellPadding: 3 },
+      headStyles: { fillColor: [27, 58, 107] },
+      columnStyles: { 0: { cellWidth: 25 }, 1: { cellWidth: 30 }, 2: { cellWidth: 35 }, 3: { cellWidth: 15 }, 4: { cellWidth: 45 }, 5: { cellWidth: 35 } },
+      didParseCell: (data: any) => {
+        if (data.section === 'body' && data.column.index === 3) {
+          if (data.cell.raw === 'PASS')    data.cell.styles.textColor = [21, 128, 61]
+          if (data.cell.raw === 'WARNING') data.cell.styles.textColor = [180, 83, 9]
+          if (data.cell.raw === 'FAIL')    data.cell.styles.textColor = [185, 28, 28]
+        }
+      },
+    })
+    doc.save('Schedule_Compliance_Report.pdf')
   }
 
   const runReview = async () => {
@@ -322,33 +312,66 @@ export default function DocumentReview() {
     try {
       const sb = createClient()
       const { data: { session } } = await sb.auth.getSession()
-
-      const formData = new FormData()
-      formData.append('schedule_file', scheduleFile)
-      formData.append('narrative_pdf', narrativeFile)
-
       const headers: HeadersInit = {}
       if (session?.access_token) {
         headers['Authorization'] = `Bearer ${session.access_token}`
+        setAuthToken(session.access_token)
       }
 
-      const res = await fetch(`${API_BASE}/api/review`, {
-        method: 'POST',
-        headers,
-        body: formData,
-      })
+      const reviewForm = new FormData()
+      reviewForm.append('schedule_file', scheduleFile)
+      reviewForm.append('narrative_pdf', narrativeFile)
 
-      if (!res.ok) {
-        let detail = `Request failed with status ${res.status}`
-        try {
-          const body = await res.json()
-          if (typeof body.detail === 'string') detail = body.detail
-        } catch { /* keep generic */ }
+      const sessionForm = new FormData()
+      sessionForm.append('narrative_pdf', narrativeFile)
+      sessionForm.append('xer_file', scheduleFile)
+      if (spFile) sessionForm.append('special_provision_pdf', spFile)
+
+      // ── Fire review + session upload in parallel ──────────────────────────
+      const [reviewRes, sessionRes] = await Promise.all([
+        fetch(`${API_BASE}/api/review`,         { method: 'POST', headers, body: reviewForm }),
+        fetch(`${API_BASE}/api/session/upload`, { method: 'POST', headers, body: sessionForm }),
+      ])
+
+      if (!reviewRes.ok) {
+        let detail = `Request failed with status ${reviewRes.status}`
+        try { const b = await reviewRes.json(); if (typeof b.detail === 'string') detail = b.detail } catch {}
         throw new Error(detail)
       }
 
-      const data = await res.json() as ReviewResult
+      const data = await reviewRes.json() as ReviewResult
       setResult(data)
+
+      // ── Save review result to DB ──────────────────────────────────────────
+      let savedProjectId: string | null = null
+      if (userId) {
+        const { data: saved } = await sb
+          .from('review_projects')
+          .insert({
+            user_id:       userId,
+            project_name:  data.project_name || 'Untitled Project',
+            review_result: data,
+            session_id:    null,
+          })
+          .select()
+          .single()
+        if (saved) {
+          savedProjectId = saved.id
+          currentProjectRef.current = saved.id
+          onProjectSaved?.(saved as ReviewProject)
+        }
+      }
+
+      // ── Link session_id once upload resolves ──────────────────────────────
+      if (sessionRes.ok) {
+        const { session_id } = await sessionRes.json()
+        setSessionId(session_id)
+        if (savedProjectId) {
+          await sb.from('review_projects')
+            .update({ session_id, updated_at: new Date().toISOString() })
+            .eq('id', savedProjectId)
+        }
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred.')
     } finally {
@@ -356,109 +379,92 @@ export default function DocumentReview() {
     }
   }
 
-  // ── Results view ─────────────────────────────────────────────────────────────
+  // ── Results view ──────────────────────────────────────────────────────────
 
   if (result) {
     const { summary, checks, project_name, project_duration_days, model_used } = result
-    const manualItems = result.manual_review_items?.length
-      ? result.manual_review_items
-      : MANUAL_REVIEW_ITEMS
-
     return (
-      <div className="h-full overflow-y-auto bg-[#F5F5F5]">
-        <div className="mx-auto max-w-3xl px-5 py-7">
+      <div className="h-full flex flex-col bg-[#F5F5F5]">
 
-          {/* ── Top bar ── */}
-          <div className="mb-6 flex items-start justify-between gap-4">
-            <div>
-              <h2 className="text-lg font-bold text-[#1B3A6B]">Schedule Compliance Review</h2>
-              {project_name && (
-                <p className="mt-0.5 text-sm text-gray-600 font-medium">{project_name}</p>
-              )}
+        {/* Header */}
+        <div className="shrink-0 border-b border-[#E8E8E8] bg-white px-5 py-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="min-w-0">
+              <h2 className="text-base font-bold text-[#1B3A6B]">Schedule Compliance Review</h2>
+              {project_name && <p className="text-xs text-gray-600 font-medium truncate">{project_name}</p>}
               {project_duration_days > 0 && (
-                <p className="text-xs text-gray-400">{project_duration_days} calendar days</p>
-              )}
-              {model_used && (
-                <p className="mt-1 text-[11px] text-gray-400">Reviewed by {model_used}</p>
+                <p className="text-[11px] text-gray-400">
+                  {project_duration_days} calendar days{model_used ? ` · ${model_used}` : ''}
+                </p>
               )}
             </div>
-            <button
-              onClick={reset}
-              className="shrink-0 flex items-center gap-1.5 rounded-lg border border-[#E8E8E8] bg-white px-3 py-2 text-xs font-semibold text-gray-600 shadow-sm hover:border-[#1B3A6B]/30 hover:text-[#1B3A6B] transition-colors"
-            >
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round"
-                  d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
-              </svg>
-              Review Another Document
-            </button>
-          </div>
-
-          {/* ── Summary bar ── */}
-          <div className="mb-6 flex flex-wrap gap-2">
-            <span className="flex items-center gap-1.5 rounded-full bg-green-100 px-3.5 py-1.5 text-xs font-bold text-green-700">
-              <span className="h-2 w-2 rounded-full bg-green-500 inline-block" />
-              {summary.passed} Passed
-            </span>
-            <span className="flex items-center gap-1.5 rounded-full bg-amber-100 px-3.5 py-1.5 text-xs font-bold text-amber-700">
-              <span className="h-2 w-2 rounded-full bg-amber-500 inline-block" />
-              {summary.warnings} Warning{summary.warnings !== 1 ? 's' : ''}
-            </span>
-            <span className="flex items-center gap-1.5 rounded-full bg-red-100 px-3.5 py-1.5 text-xs font-bold text-red-700">
-              <span className="h-2 w-2 rounded-full bg-red-500 inline-block" />
-              {summary.failed} Failed
-            </span>
-            <span className="flex items-center gap-1.5 rounded-full bg-gray-100 px-3.5 py-1.5 text-xs font-bold text-gray-600">
-              <span className="h-2 w-2 rounded-full bg-gray-400 inline-block" />
-              {summary.manual_review ?? manualItems.length} Manual Review
-            </span>
-          </div>
-
-          {/* ── Collapsible result sections ── */}
-          <div className="space-y-3 mb-6">
-            {SECTION_ORDER.map(sectionName => (
-              <CollapsibleSection
-                key={sectionName}
-                title={sectionName}
-                checks={checksForSection(checks, sectionName)}
-                expanded={expanded[sectionName]}
-                onToggle={() => toggleSection(sectionName)}
-              />
-            ))}
-          </div>
-
-          {/* ── Manual Review section (always shown, always static) ── */}
-          <div className="rounded-2xl border border-[#E8E8E8] bg-white shadow-sm overflow-hidden">
-            <div className="px-5 py-4 border-b border-[#E8E8E8]">
-              <div className="flex items-center gap-2.5">
-                <div className="flex h-7 w-7 items-center justify-center rounded-full bg-gray-100">
-                  <svg className="h-4 w-4 text-gray-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round"
-                      d="M15.75 17.25v3.375c0 .621-.504 1.125-1.125 1.125h-9.75a1.125 1.125 0 01-1.125-1.125V7.875c0-.621.504-1.125 1.125-1.125H6.75a9.06 9.06 0 011.5.124m7.5 10.376h3.375c.621 0 1.125-.504 1.125-1.125V11.25c0-4.46-3.243-8.161-7.5-8.876a9.06 9.06 0 00-1.5-.124H9.375c-.621 0-1.125.504-1.125 1.125v3.5m7.5 10.375H9.375a1.125 1.125 0 01-1.125-1.125v-9.25m12 6.625v-1.875a3.375 3.375 0 00-3.375-3.375h-1.5a1.125 1.125 0 01-1.125-1.125v-1.5a3.375 3.375 0 00-3.375-3.375H9.75" />
-                  </svg>
-                </div>
-                <div>
-                  <p className="text-sm font-semibold text-gray-700">Manual Review Required</p>
-                  <p className="text-[11px] text-gray-400">
-                    These items cannot be automatically verified and require manual inspection
-                  </p>
-                </div>
-              </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button onClick={handleDownloadPdf}
+                className="flex items-center gap-1.5 rounded-lg bg-[#1B3A6B] px-3 py-2 text-xs font-semibold text-white shadow-sm hover:bg-[#12264a] transition-colors">
+                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5M16.5 12L12 16.5m0 0L7.5 12m4.5 4.5V3" />
+                </svg>
+                Download PDF
+              </button>
+              <button onClick={() => { setResult(null); setSessionId(null); onNewReview?.() }}
+                className="flex items-center gap-1.5 rounded-lg border border-[#E8E8E8] bg-white px-3 py-2 text-xs font-semibold text-gray-600 shadow-sm hover:border-[#1B3A6B]/30 hover:text-[#1B3A6B] transition-colors">
+                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+                </svg>
+                New Review
+              </button>
             </div>
-            <div className="px-4 py-3 space-y-1.5">
-              {manualItems.map((item, i) => (
-                <div
-                  key={i}
-                  className="flex items-start gap-2.5 rounded-lg bg-gray-50 px-3 py-2.5"
-                >
-                  <span className="mt-0.5 h-1.5 w-1.5 shrink-0 rounded-full bg-gray-400" />
-                  <span className="text-xs text-gray-600">{item}</span>
-                </div>
+          </div>
+
+          {/* Summary pills */}
+          <div className="mt-3 flex flex-wrap gap-2">
+            <span className="flex items-center gap-1.5 rounded-full bg-green-100 px-3 py-1 text-[11px] font-bold text-green-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-green-500 inline-block" />{summary.passed} Passed
+            </span>
+            <span className="flex items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-[11px] font-bold text-amber-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-amber-500 inline-block" />{summary.warnings} Warning{summary.warnings !== 1 ? 's' : ''}
+            </span>
+            <span className="flex items-center gap-1.5 rounded-full bg-red-100 px-3 py-1 text-[11px] font-bold text-red-700">
+              <span className="h-1.5 w-1.5 rounded-full bg-red-500 inline-block" />{summary.failed} Failed
+            </span>
+            <span className="flex items-center gap-1.5 rounded-full bg-gray-100 px-3 py-1 text-[11px] font-bold text-gray-600">
+              <span className="h-1.5 w-1.5 rounded-full bg-gray-400 inline-block" />
+              {summary.manual_review ?? checksForSection(checks, 'Manual Review').length} Manual Review
+            </span>
+          </div>
+
+          {/* Tabs (only when session exists) */}
+          {sessionId && (
+            <div className="mt-3 flex gap-1 border-b border-[#E8E8E8] -mb-3">
+              {(['review', 'chat'] as const).map(tab => (
+                <button key={tab} onClick={() => setActiveTab(tab)}
+                  className={`px-4 py-2 text-xs font-semibold border-b-2 transition-colors ${
+                    activeTab === tab ? 'border-[#1B3A6B] text-[#1B3A6B]' : 'border-transparent text-gray-500 hover:text-gray-700'
+                  }`}>
+                  {tab === 'review' ? 'Compliance Results' : 'Document Q&A'}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Tab content */}
+        {activeTab === 'review' || !sessionId ? (
+          <div className="flex-1 overflow-y-auto">
+            <div className="mx-auto max-w-3xl px-5 py-6 space-y-3">
+              {SECTION_ORDER.map(sectionName => (
+                <CollapsibleSection key={sectionName} title={sectionName}
+                  checks={checksForSection(checks, sectionName)}
+                  expanded={expanded[sectionName]}
+                  onToggle={() => toggleSection(sectionName)} />
               ))}
             </div>
           </div>
-
-        </div>
+        ) : (
+          <div className="flex-1 min-h-0">
+            <SessionChat sessionId={sessionId} apiBase={API_BASE} authToken={authToken} />
+          </div>
+        )}
       </div>
     )
   }
@@ -476,75 +482,66 @@ export default function DocumentReview() {
           </span>
         </div>
         <p className="mb-8 text-sm text-gray-500">
-          Upload the CPM schedule (.xer) and designer narrative (PDF) to run an automated
-          NJDOT compliance review.
+          Upload the CPM schedule (.xer), designer narrative, and optionally a Special Provision PDF
+          to run an automated NJDOT compliance review and enable document Q&A.
         </p>
 
-        {/* ── Upload zones ── */}
-        <div className="mb-6 flex flex-col gap-4 sm:flex-row">
-          <UploadZone
-            label="Construction Schedule (.xer)"
-            file={scheduleFile}
-            inputRef={scheduleRef}
-            accept=".xer"
-            acceptValidationText=".XER only"
-            onSelect={setScheduleFile}
-            onRemove={() => setScheduleFile(null)}
-          />
-          <UploadZone
-            label="Designer Narrative PDF"
-            file={narrativeFile}
-            inputRef={narrativeRef}
-            accept="application/pdf"
-            acceptValidationText="PDF only"
-            onSelect={setNarrativeFile}
-            onRemove={() => setNarrativeFile(null)}
-          />
+        {/* Row 1: XER + Narrative */}
+        <div className="mb-4 flex flex-col gap-4 sm:flex-row">
+          <UploadZone label="Construction Schedule (.xer)" file={scheduleFile} inputRef={scheduleRef}
+            accept=".xer" acceptValidationText=".XER only"
+            onSelect={setScheduleFile} onRemove={() => setScheduleFile(null)} />
+          <UploadZone label="Designer Narrative PDF" file={narrativeFile} inputRef={narrativeRef}
+            accept="application/pdf" acceptValidationText="PDF only"
+            onSelect={setNarrativeFile} onRemove={() => setNarrativeFile(null)} />
         </div>
 
-        {/* ── Error banner ── */}
+        {/* Row 2: Special Provision */}
+        <div className="mb-6">
+          <UploadZone label="Special Provision PDF" file={spFile} inputRef={spRef}
+            accept="application/pdf" acceptValidationText="PDF only · ~200 pages"
+            optional onSelect={setSpFile} onRemove={() => setSpFile(null)} />
+          {spFile && (
+            <p className="mt-1.5 text-[11px] text-gray-400">
+              Special Provision will be indexed in the background for Document Q&A.
+            </p>
+          )}
+        </div>
+
+        {/* Error */}
         {error && (
           <div className="mb-4 flex items-start gap-3 rounded-xl border border-red-200 bg-red-50 px-4 py-3">
             <svg className="mt-0.5 h-4 w-4 shrink-0 text-red-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round"
-                d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m9-.75a9 9 0 11-18 0 9 9 0 0118 0zm-9 3.75h.008v.008H12v-.008z" />
             </svg>
             <p className="text-xs text-red-700 leading-relaxed">{error}</p>
           </div>
         )}
 
-        {/* ── Run Review button / loading ── */}
+        {/* Run Review */}
         {isLoading ? (
           <div className="flex items-center justify-center gap-3 rounded-xl border border-[#1B3A6B]/15 bg-white px-5 py-4 shadow-sm">
             <svg className="h-5 w-5 animate-spin text-[#1B3A6B]" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-              <path className="opacity-75" fill="currentColor"
-                d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
             <span className="text-sm font-medium text-[#1B3A6B]">
               Analyzing documents… this may take up to 30 seconds
             </span>
           </div>
         ) : (
-          <button
-            onClick={runReview}
-            disabled={!canSubmit}
-            className={`w-full rounded-xl px-5 py-3.5 text-sm font-bold transition-all ${
-              canSubmit
-                ? 'bg-[#CC2529] text-white shadow-sm hover:bg-[#a81e21] active:scale-[0.99]'
-                : 'cursor-not-allowed bg-gray-200 text-gray-400'
-            }`}
-          >
+          <button onClick={runReview} disabled={!canSubmit}
+            className={`w-full rounded-xl px-5 py-3.5 text-sm font-bold transition-all ${canSubmit
+              ? 'bg-[#CC2529] text-white shadow-sm hover:bg-[#a81e21] active:scale-[0.99]'
+              : 'cursor-not-allowed bg-gray-200 text-gray-400'}`}>
             Run Review
           </button>
         )}
 
-        {/* ── What gets checked preview ── */}
+        {/* What gets checked */}
         {!isLoading && (
           <div className="mt-8 rounded-2xl border border-[#E8E8E8] bg-white p-5 shadow-sm">
-            <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">
-              What gets checked
-            </p>
+            <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">What gets checked</p>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
               {SECTION_ORDER.map(s => (
                 <div key={s} className="rounded-lg bg-[#F5F5F5] px-3 py-2.5 text-center">
@@ -552,6 +549,10 @@ export default function DocumentReview() {
                 </div>
               ))}
             </div>
+            <p className="mt-3 text-[11px] text-gray-400">
+              After review, use Document Q&A to ask questions across the narrative,
+              special provisions, schedule, and Construction Scheduling Manual.
+            </p>
           </div>
         )}
 

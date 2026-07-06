@@ -39,3 +39,12 @@ export interface ConversationMessage {
   bdc_alerts: BDCAlertItem[]
   created_at: string
 }
+
+export interface ReviewProject {
+  id: string
+  session_id: string | null
+  project_name: string
+  review_result: any
+  created_at: string
+  updated_at: string
+}

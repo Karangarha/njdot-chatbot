@@ -155,7 +155,9 @@ class PromptBuilder:
         for n, chunk in enumerate(chunks[: self._max_chunks], start=1):
             header  = self._chunk_header(n, chunk)
             content = (chunk.get("content") or "").strip()
-            blocks.append(f"{header}\n{content}")
+            summary = (chunk.get("metadata", {}).get("context_summary") or "").strip()
+            body    = f"Context: {summary}\n{content}" if summary else content
+            blocks.append(f"{header}\n{body}")
         return "\n\n".join(blocks)
 
     @staticmethod
