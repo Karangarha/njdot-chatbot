@@ -7,6 +7,22 @@ cd backend/
 Scripts/python.exe -m debug.<script> [args]
 ```
 
+## Saving Output to a File
+
+**Save and see output live (recommended):**
+```powershell
+Scripts/python.exe -m debug.review schedule.xer narrative.pdf | Tee-Object -FilePath review_output.txt
+Scripts/python.exe -m debug.session_query <SESSION_ID> "question" | Tee-Object -FilePath session_out.txt
+Scripts/python.exe -m debug.query "question" | Tee-Object -FilePath query_out.txt
+```
+
+**Save only (no terminal output):**
+```powershell
+Scripts/python.exe -m debug.review schedule.xer narrative.pdf > review_output.txt
+```
+
+> Note: ANSI color codes will appear as raw escape sequences in saved files. Open in a text editor that strips them, or pipe through `| Out-File -FilePath out.txt -Encoding utf8` for clean UTF-8 output.
+
 ---
 
 ## Script 1: `debug.review` — Compliance Review + Session Ingestion
