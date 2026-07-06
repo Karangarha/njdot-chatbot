@@ -224,11 +224,40 @@ def chunk_narrative(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 # ── Special provision chunker (sliding window) ─────────────────────────────────
 
+def _detect_sp_boilerplate(pages: List[Dict[str, Any]], sample_size: int = 15) -> set:
+    """
+    Find lines that repeat across pages (project title, contract no, page N of M).
+
+    A line is considered boilerplate if it appears on more than half of the
+    sampled pages.  Each line is counted at most once per page so frequent
+    content lines don't get accidentally stripped.
+    """
+    from collections import Counter
+    sample = pages[:sample_size]
+    if not sample:
+        return set()
+
+    line_counts: Counter = Counter()
+    for page in sample:
+        seen: set = set()
+        for raw in page["text"].splitlines():
+            line = raw.strip()
+            if line and line not in seen:
+                line_counts[line] += 1
+                seen.add(line)
+
+    threshold = max(2, len(sample) * 0.5)
+    return {line for line, count in line_counts.items() if count >= threshold}
+
+
 def chunk_special_provision(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Chunk a Special Provision PDF using a sliding token window.
 
-    No section detection — SP structure varies per project.
+    Page headers and footers (project name, contract number, page N of M) are
+    detected by finding lines that repeat across pages and stripped before
+    building the token stream, so they don't pollute every chunk.
+
     600 tokens max, 100-token overlap.
 
     Parameters
@@ -243,13 +272,21 @@ def chunk_special_provision(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     enc   = _get_enc()
     pages = _filter_pages(pages)
 
+    boilerplate = _detect_sp_boilerplate(pages)
+
     # Build a flat token stream, recording which PDF page each token came from
     page_token_starts: List[tuple[int, int]] = []   # (token_offset, page_num)
     all_tokens: List[int] = []
 
     for page in pages:
+        cleaned = "\n".join(
+            ln for ln in page["text"].splitlines()
+            if ln.strip() not in boilerplate
+        ).strip()
+        if not cleaned:
+            continue
         page_token_starts.append((len(all_tokens), page["page_num"]))
-        all_tokens.extend(enc.encode(page["text"].strip() + "\n"))
+        all_tokens.extend(enc.encode(cleaned + "\n"))
 
     def _page_at(token_idx: int) -> int:
         page_num = page_token_starts[0][1] if page_token_starts else 1
