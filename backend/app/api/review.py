@@ -231,17 +231,25 @@ def parse_xer_calendars(xer_text: str) -> list:
             or "Project Calendar"
         )
 
-        # Working days — xerparser stores as comma-sep string or list
+        # Working days — xerparser may give a comma-sep string, a list, or a float
         work_days: list = []
         day_hr = getattr(cal_obj, "day_hr_cnt", None)
-        if day_hr:
-            parts = day_hr.split(",") if isinstance(day_hr, str) else list(day_hr)
-            for i, val in enumerate(parts[:7]):
-                try:
-                    if float(val) > 0:
-                        work_days.append(_DAY_NAMES[i])
-                except (ValueError, TypeError):
-                    pass
+        if day_hr is not None:
+            try:
+                if isinstance(day_hr, str):
+                    parts = day_hr.replace("|", ",").split(",")
+                elif isinstance(day_hr, (int, float)):
+                    parts = []   # single scalar — no per-day breakdown available
+                else:
+                    parts = list(day_hr)
+                for i, val in enumerate(parts[:7]):
+                    try:
+                        if float(val) > 0:
+                            work_days.append(_DAY_NAMES[i])
+                    except (ValueError, TypeError):
+                        pass
+            except Exception:
+                pass
 
         # Holiday exceptions
         exceptions: list = []
