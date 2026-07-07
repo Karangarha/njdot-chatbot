@@ -384,14 +384,17 @@ def run_review(xer_path: Path, narrative_path: Path, show_prompt: bool, sp_path:
             tmp_path_sp = tmp.name
         try:
             sp_pages = PDFParser(tmp_path_sp).extract_text()
+
+            sp_gantt = sum(1 for p in sp_pages if not p.get("text", "").strip())
+            sp_text_pages = [p for p in sp_pages if p.get("text", "").strip()]
+            print(f"  SP PDF pages total: {len(sp_pages)}  |  with text: {len(sp_text_pages)}  |  blank/filtered: {sp_gantt}")
+            print(f"  Table extraction: {green('enabled')} (pdfplumber will convert tables to NL sentences)\n")
+
+            # Keep tmp_path_sp alive during chunking so pdfplumber can extract tables
+            sp_chunks = chunk_special_provision(sp_pages, pdf_path=tmp_path_sp)
         finally:
             os.unlink(tmp_path_sp)
 
-        sp_gantt = sum(1 for p in sp_pages if not p.get("text", "").strip())
-        sp_text_pages = [p for p in sp_pages if p.get("text", "").strip()]
-        print(f"  SP PDF pages total: {len(sp_pages)}  |  with text: {len(sp_text_pages)}  |  blank/filtered: {sp_gantt}")
-
-        sp_chunks = chunk_special_provision(sp_pages)
         print(f"  SP chunks produced: {len(sp_chunks)}\n")
         for j, chunk in enumerate(sp_chunks):
             meta = chunk.get("metadata", {})

@@ -222,6 +222,107 @@ def chunk_narrative(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return chunks
 
 
+# ── Special provision table → NL helpers ──────────────────────────────────────
+
+def _table_to_nl(table: List[List]) -> str:
+    """Convert a pdfplumber table (list of rows/cells) to NL sentences.
+
+    The first row is treated as column headers.  Each subsequent row produces
+    one sentence listing header: value pairs, skipping empty/dash-only cells.
+    """
+    if not table or len(table) < 2:
+        return ""
+
+    def _clean(cell) -> Optional[str]:
+        if cell is None:
+            return None
+        s = str(cell).strip().replace("\n", " ")
+        return s if s and s not in ("-", "—", "N/A", "") else None
+
+    cleaned  = [[_clean(c) for c in row] for row in table]
+    headers  = cleaned[0]
+    data_rows = cleaned[1:]
+
+    sentences: List[str] = []
+    for row in data_rows:
+        parts = []
+        for i, cell in enumerate(row):
+            if cell:
+                hdr = (headers[i] or f"Field{i+1}") if i < len(headers) else f"Field{i+1}"
+                parts.append(f"{hdr}: {cell}")
+        if parts:
+            sentences.append(", ".join(parts) + ".")
+
+    return ("Table:\n" + "\n".join(sentences)) if sentences else ""
+
+
+def _extract_page_with_tables(
+    pdf_path: str,
+    pages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Re-open the PDF with pdfplumber to replace linearized table text with NL.
+
+    For each page:
+      1. Detect tables and their bounding boxes.
+      2. Convert each table to NL sentences via ``_table_to_nl``.
+      3. Re-extract text from the non-table regions of the page.
+      4. Return NL table blocks + non-table paragraph text.
+
+    Falls back silently to the original page text on any error.
+    """
+    try:
+        import pdfplumber as _plumber
+    except ImportError:
+        return pages
+
+    enriched: List[Dict[str, Any]] = []
+    try:
+        with _plumber.open(pdf_path) as pdf:
+            for page_dict in pages:
+                p_num = page_dict["page_num"]
+                if p_num > len(pdf.pages):
+                    enriched.append(page_dict)
+                    continue
+
+                pdf_page = pdf.pages[p_num - 1]
+
+                try:
+                    finders     = pdf_page.find_tables()
+                    tables_data = [f.extract() for f in finders]
+                    table_bboxes = [f.bbox for f in finders]
+                except Exception:
+                    enriched.append(page_dict)
+                    continue
+
+                nl_blocks = [b for b in (_table_to_nl(t) for t in tables_data) if b]
+
+                # Text from non-table regions of the page
+                if table_bboxes:
+                    def _outside(obj, bboxes=table_bboxes):
+                        for bbox in bboxes:
+                            if (obj.get("x0", 0) >= bbox[0] - 2
+                                    and obj.get("x1", 0) <= bbox[2] + 2
+                                    and obj.get("top", 0) >= bbox[1] - 2
+                                    and obj.get("bottom", 0) <= bbox[3] + 2):
+                                return False
+                        return True
+                    try:
+                        non_table_text = pdf_page.filter(_outside).extract_text() or ""
+                    except Exception:
+                        non_table_text = page_dict["text"]
+                else:
+                    non_table_text = page_dict["text"]
+
+                parts = nl_blocks + ([non_table_text.strip()] if non_table_text.strip() else [])
+                combined = "\n\n".join(parts)
+                enriched.append({**page_dict, "text": combined or page_dict["text"]})
+
+    except Exception:
+        return pages
+
+    return enriched
+
+
 # ── Special provision chunker (sliding window) ─────────────────────────────────
 
 def _detect_sp_boilerplate(pages: List[Dict[str, Any]], sample_size: int = 15) -> set:
@@ -250,13 +351,20 @@ def _detect_sp_boilerplate(pages: List[Dict[str, Any]], sample_size: int = 15) -
     return {line for line, count in line_counts.items() if count >= threshold}
 
 
-def chunk_special_provision(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+def chunk_special_provision(
+    pages: List[Dict[str, Any]],
+    pdf_path: Optional[str] = None,
+) -> List[Dict[str, Any]]:
     """
     Chunk a Special Provision PDF using a sliding token window.
 
-    Page headers and footers (project name, contract number, page N of M) are
-    detected by finding lines that repeat across pages and stripped before
-    building the token stream, so they don't pollute every chunk.
+    When ``pdf_path`` is provided, pdfplumber extracts tables as structured
+    rows which are converted to NL sentences (e.g. "Route: 49, Station: 12+75,
+    AC Thickness: 10 inches.").  Non-table paragraph text is extracted
+    separately so table columns are never linearized into garbled fragments.
+
+    Page headers/footers (project name, contract number, page N of M) are
+    detected by finding lines that repeat across pages and stripped.
 
     600 tokens max, 100-token overlap.
 
@@ -264,6 +372,9 @@ def chunk_special_provision(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     ----------
     pages : list[dict]
         Output of ``PDFParser.extract_text()``.
+    pdf_path : str | None
+        Path to the original PDF for table extraction via pdfplumber.
+        When supplied, tables are converted to NL before chunking.
 
     Returns
     -------
@@ -271,6 +382,9 @@ def chunk_special_provision(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     """
     enc   = _get_enc()
     pages = _filter_pages(pages)
+
+    if pdf_path:
+        pages = _extract_page_with_tables(pdf_path, pages)
 
     boilerplate = _detect_sp_boilerplate(pages)
 
