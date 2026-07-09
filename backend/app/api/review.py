@@ -212,58 +212,101 @@ def parse_xer_to_json(xer_text: str) -> list:
 
 
 def parse_xer_calendars(xer_text: str) -> list:
-    """Extract calendar definitions (name, working days, holidays) from an XER file."""
-    _DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
-    try:
-        xer = Xer(xer_text)
-    except Exception:
-        return []
+    """Extract calendar definitions from raw XER text by parsing the CALENDAR table directly.
 
-    cal_store = getattr(xer, "calendars", None) or {}
-    if not cal_store:
-        return []
+    xerparser exposes clndr_data as a scalar float (day_hr_cnt) rather than the
+    nested parenthetical string we need, so we bypass it and read the raw rows.
 
-    calendars = []
-    for cal_obj in cal_store.values():
-        name = (
-            getattr(cal_obj, "clndr_name", None)
-            or getattr(cal_obj, "name", None)
-            or "Project Calendar"
-        )
+    clndr_data encodes working days in a DaysOfWeek section where day numbers
+    1–7 map to Sun–Sat.  A day is working when its entry contains at least one
+    work-period marker (s|HH:MM), otherwise it is empty (non-working).
+    Exception dates are Primavera serials (days since Dec 30, 1899).
+    """
+    from datetime import date as _date, timedelta as _td
+    import re as _re
 
-        # Working days — xerparser may give a comma-sep string, a list, or a float
-        work_days: list = []
-        day_hr = getattr(cal_obj, "day_hr_cnt", None)
-        if day_hr is not None:
+    _P6_EPOCH = _date(1899, 12, 30)
+    _ABBREV   = {1: "Sun", 2: "Mon", 3: "Tue", 4: "Wed", 5: "Thu", 6: "Fri", 7: "Sat"}
+
+    # ── Parse CALENDAR table rows from raw XER text ───────────────────────────
+    in_calendar   = False
+    clndr_id_idx  = clndr_name_idx = clndr_data_idx = -1
+    raw_calendars: dict = {}   # clndr_id (str) → {name, clndr_data}
+
+    for line in xer_text.splitlines():
+        if line.startswith("%T\t"):
+            in_calendar = (line.strip() == "%T\tCALENDAR")
+            clndr_id_idx = clndr_name_idx = clndr_data_idx = -1
+            continue
+        if not in_calendar:
+            continue
+        if line.startswith("%F\t"):
+            fields = line[3:].split("\t")
             try:
-                if isinstance(day_hr, str):
-                    parts = day_hr.replace("|", ",").split(",")
-                elif isinstance(day_hr, (int, float)):
-                    parts = []   # single scalar — no per-day breakdown available
-                else:
-                    parts = list(day_hr)
-                for i, val in enumerate(parts[:7]):
-                    try:
-                        if float(val) > 0:
-                            work_days.append(_DAY_NAMES[i])
-                    except (ValueError, TypeError):
-                        pass
+                clndr_id_idx   = fields.index("clndr_id")
+                clndr_name_idx = fields.index("clndr_name")
+                clndr_data_idx = fields.index("clndr_data")
+            except ValueError:
+                pass
+            continue
+        if line.startswith("%R\t") and clndr_id_idx != -1:
+            fields = line[3:].split("\t")
+            try:
+                cal_id   = fields[clndr_id_idx].strip()
+                cal_name = fields[clndr_name_idx].strip() if clndr_name_idx < len(fields) else ""
+                cal_data = fields[clndr_data_idx].strip() if clndr_data_idx < len(fields) else ""
+            except IndexError:
+                continue
+            raw_calendars[cal_id] = {"name": cal_name, "clndr_data": cal_data}
+
+    # ── Helpers to parse a clndr_data string ─────────────────────────────────
+
+    def _working_days(clndr_data: str) -> list:
+        """Return abbreviated day names for days that have work periods."""
+        if not clndr_data:
+            return []
+        dow_start = clndr_data.find("DaysOfWeek()(")
+        if dow_start == -1:
+            return []
+        exc_pos  = clndr_data.find("(0||Exceptions", dow_start)
+        view_pos = clndr_data.find("(0||VIEW",       dow_start)
+        end = min(p for p in [exc_pos, view_pos, len(clndr_data)] if p != -1)
+        dow_text = clndr_data[dow_start:end]
+
+        working = []
+        for day_num in range(1, 8):
+            # Non-working days have exactly (0||N()()) — empty children list
+            non_working = f"(0||{day_num}()())" in dow_text
+            has_entry   = f"(0||{day_num}()("  in dow_text
+            if has_entry and not non_working:
+                working.append(_ABBREV[day_num])
+        return working
+
+    def _exception_dates(clndr_data: str) -> list:
+        """Return sorted list of {date, name} dicts from the Exceptions section."""
+        if not clndr_data:
+            return []
+        exc_start = clndr_data.find("(0||Exceptions()(")
+        if exc_start == -1:
+            return []
+        exc_text = clndr_data[exc_start:]
+        dates = []
+        for m in _re.finditer(r'd\|(\d+)', exc_text):
+            try:
+                d = _P6_EPOCH + _td(days=int(m.group(1)))
+                dates.append({"date": d.strftime("%Y-%m-%d"), "name": ""})
             except Exception:
                 pass
+        return dates
 
-        # Holiday exceptions
-        exceptions: list = []
-        exc_list = getattr(cal_obj, "exceptions", None) or getattr(cal_obj, "holiday_list", None) or []
-        for exc in exc_list:
-            exc_date = getattr(exc, "exception_date", None) or getattr(exc, "date", None)
-            if exc_date:
-                date_str = exc_date.strftime("%Y-%m-%d") if hasattr(exc_date, "strftime") else str(exc_date)
-                exc_name = getattr(exc, "exception_name", "") or getattr(exc, "name", "") or ""
-                exceptions.append({"date": date_str, "name": exc_name})
-
+    # ── Build output ──────────────────────────────────────────────────────────
+    calendars = []
+    for cal_id, cal in raw_calendars.items():
+        work_days  = _working_days(cal["clndr_data"])
+        exceptions = _exception_dates(cal["clndr_data"])
         calendars.append({
-            "id":         str(getattr(cal_obj, "clndr_id", "") or ""),
-            "name":       name,
+            "id":         cal_id,
+            "name":       cal["name"] or "Project Calendar",
             "work_days":  work_days,
             "exceptions": sorted(exceptions, key=lambda e: e["date"]),
         })

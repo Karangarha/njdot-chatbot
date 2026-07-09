@@ -42,7 +42,7 @@ from app.ingestion.session_chunker   import (
     chunk_special_provision,
     xer_to_chunks,
 )
-from app.api.review import parse_xer_to_json
+from app.api.review import parse_xer_to_json, parse_xer_calendars
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/session", tags=["session"])
@@ -135,7 +135,8 @@ def _process_session(
             try:
                 xer_text   = xer_bytes.decode("utf-8", errors="ignore")
                 activities = parse_xer_to_json(xer_text)
-                xer_chunks = xer_to_chunks(activities)
+                calendars  = parse_xer_calendars(xer_text)
+                xer_chunks = xer_to_chunks(activities, calendars)
                 all_chunks.extend(xer_chunks)
                 logger.info("Session %s: XER → %d chunks", session_id, len(xer_chunks))
             except HTTPException as exc:
@@ -304,9 +305,32 @@ Sources in context:
 
 Rules:
 - Cite the source tag for every fact you state, e.g. "per [Narrative]".
-- Be concise — one or two paragraphs maximum.
-- If the answer is not in the context, say exactly: "Not found in the provided documents."
+- Be concise — one or two paragraphs maximum (up to three if coverage caveats
+  apply, per below).
 - Do not infer or invent beyond what the context states.
+
+Answering aggregate or full-scan questions (e.g. "check for any negative
+float," "are there any missing items," "does every activity have X," "is
+there any instance of Y"):
+- These questions ask you to verify something across an entire dataset
+  (e.g. all schedule activities), not to find one fact in one place.
+- If [Schedule] context is present but does not obviously cover every phase
+  or activity of the project, do not treat that as proof the condition is
+  absent. State what the retrieved [Schedule] excerpts show (e.g. "the N
+  activities shown in [Schedule] all have Total Float of 0 or greater"), then
+  explicitly say that full coverage of the schedule could not be confirmed
+  from the retrieved excerpts, naming any phases you can tell are missing.
+- A [Manual] chunk stating a rule or requirement (e.g. "negative floats will
+  not be permitted") is evidence of the standard, not evidence that this
+  project's schedule complies with it. Never cite a [Manual] rule as proof
+  of a project-specific fact — only [Narrative], [SP], or [Schedule] context
+  can confirm what is actually true for this project.
+
+If, after applying the above, no context is relevant to the question at all
+(not even partial [Schedule] or [Narrative]/[SP] evidence), say exactly:
+"Not found in the provided documents."
+Do not use this fallback merely because coverage is incomplete — only use it
+when nothing relevant was retrieved.
 """
 
 

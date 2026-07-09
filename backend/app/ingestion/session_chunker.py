@@ -468,33 +468,64 @@ def xer_to_markdown(
     """
     lines: List[str] = ["# Project Schedule", ""]
 
+    # Build calendar-id → name lookup for the Calendar column
+    cal_map: Dict[str, str] = {
+        cal["id"]: cal["name"]
+        for cal in (calendars or [])
+        if cal.get("id") and cal.get("name")
+    }
+
+    def _cal_name(act: Dict[str, Any]) -> str:
+        """Return abbreviated calendar name for an activity, or '—'."""
+        return cal_map.get(str(act.get("calendar_id", "")), "—")
+
     # ── Calendar ──────────────────────────────────────────────────────────────
     if calendars:
+        # Determine project date window so exception lists stay relevant
+        _act_dates = sorted(
+            d for a in activities
+            for d in [a.get("start_date"), a.get("finish_date")]
+            if d
+        )
+        _proj_start = _act_dates[0][:4]  if _act_dates else "2000"
+        _proj_end   = _act_dates[-1][:4] if _act_dates else "2099"
+        # ±1 year buffer so holidays at the very edges are included
+        _win_start = str(int(_proj_start) - 1)
+        _win_end   = str(int(_proj_end)   + 1)
+
         lines += ["## Calendar", ""]
         for cal in calendars:
             name = cal.get("name") or "Project Calendar"
             work_str = ", ".join(cal.get("work_days", [])) or "unknown"
             lines.append(f"**{name}** — Working days: {work_str}")
-            excs = cal.get("exceptions", [])
+            excs = [
+                e for e in cal.get("exceptions", [])
+                if _win_start <= e["date"][:4] <= _win_end
+            ]
             if excs:
+                _exc_cap = 30
+                shown = excs[:_exc_cap]
                 exc_str = ", ".join(
                     e["date"] + (f" ({e['name']})" if e.get("name") else "")
-                    for e in excs
+                    for e in shown
                 )
-                lines.append(f"Holiday exceptions: {exc_str}")
+                if len(excs) > _exc_cap:
+                    exc_str += f" (+{len(excs) - _exc_cap} more restricted dates)"
+                lines.append(f"Holiday/restricted exceptions: {exc_str}")
         lines.append("")
 
     # ── Milestones ────────────────────────────────────────────────────────────
     milestones = [a for a in activities if a.get("duration_days", 1) == 0]
     if milestones:
         lines += ["## Milestones", "",
-                  "| ID | Name | Date | Float | Predecessors |",
-                  "|----|------|------|-------|-------------|"]
+                  "| ID | Name | Date | Float | Calendar | Predecessors |",
+                  "|----|------|------|-------|----------|-------------|"]
         for m in milestones:
             date = m.get("start_date") or m.get("finish_date") or "—"
             lines.append(
                 f"| {m['activity_id']} | {m['activity_name']} | {date} | "
-                f"{m.get('total_float', 0)} | {_fmt_preds(m.get('predecessors', []))} |"
+                f"{m.get('total_float', 0)} | {_cal_name(m)} | "
+                f"{_fmt_preds(m.get('predecessors', []))} |"
             )
         lines.append("")
 
@@ -548,15 +579,15 @@ def xer_to_markdown(
         )
         lines += [
             f"## Phase: {phase}  ({len(non_ms)} activities, {date_range})", "",
-            "| ID | Name | Start | Finish | Duration | Float | Predecessors |",
-            "|----|------|-------|--------|----------|-------|-------------|",
+            "| ID | Name | Start | Finish | Duration | Float | Calendar | Predecessors |",
+            "|----|------|-------|--------|----------|-------|----------|-------------|",
         ]
         for a in non_ms:
             lines.append(
                 f"| {a['activity_id']} | {a['activity_name']} | "
                 f"{a.get('start_date','—')} | {a.get('finish_date','—')} | "
                 f"{a.get('duration_days','—')} | {a.get('total_float','—')} | "
-                f"{_fmt_preds(a.get('predecessors', []))} |"
+                f"{_cal_name(a)} | {_fmt_preds(a.get('predecessors', []))} |"
             )
         lines.append("")
 
