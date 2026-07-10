@@ -1,20 +1,27 @@
 """Session-scoped document upload and Q&A endpoints.
 
+Architecture (hybrid): the Special Provision is served by hybrid RAG
+(embeddings in session_chunks); the schedule (XER) and designer narrative are
+served by GraphRAG — a CPM-computed knowledge graph in session_graphs, read
+at query time via an always-injected digest plus LLM graph tools.
+
 POST /api/session/upload
     Accepts narrative_pdf, special_provision_pdf, and/or xer_file.
-    Parses, chunks, and embeds in the background — no LLM per chunk.
-    Returns {session_id, status: "processing"} immediately.
+    SP is chunked+embedded; XER runs through the deterministic CPM engine and
+    becomes a knowledge graph; the narrative is sectioned + entity-extracted
+    into the same graph. Returns {session_id, status: "processing"} immediately.
 
 GET /api/session/status/{session_id}
     SSE stream of ingestion progress events.
     Closes when status reaches "ready" or "error".
 
 POST /api/session/query
-    Full-text + vector search across session chunks and the permanent
-    scheduling collection, then an LLM call for the final answer.
-    Returns {answer, sources}.
+    Vector search over SP chunks + the permanent scheduling collection, plus
+    the graph digest and a tool-use loop over the knowledge graph, then an
+    LLM answer. Returns {answer, sources}.
 
-Required Supabase setup — run migrate_session_chunks.sql once.
+Required Supabase setup — run migrate_session_chunks.sql and
+migrate_session_graphs.sql once.
 """
 
 from __future__ import annotations
@@ -40,9 +47,18 @@ from app.ingestion.pdf_parser        import PDFParser
 from app.ingestion.session_chunker   import (
     chunk_narrative,
     chunk_special_provision,
-    xer_to_chunks,
 )
-from app.api.review import parse_xer_to_json, parse_xer_calendars
+from app.generation.tool_loop import run_tool_loop
+from app.graph        import add_narrative_to_graph, build_graph, load_graph, save_graph
+from app.graph.digest import build_digest
+from app.graph.tools  import bind_graph_tools
+from app.scheduling import (
+    build_calendars,
+    build_network,
+    cross_check,
+    parse_xer_all,
+    run_cpm,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/session", tags=["session"])
@@ -89,6 +105,15 @@ def _bytes_to_sp_chunks(raw: bytes) -> List[Dict[str, Any]]:
         os.unlink(tmp_path)
 
 
+def _extraction_llm() -> Optional[LLMClient]:
+    """LLM for narrative entity extraction; None disables extraction gracefully."""
+    try:
+        return LLMClient()
+    except Exception as exc:
+        logger.warning("Narrative extraction disabled (no LLM client): %s", exc)
+        return None
+
+
 def _insert_chunks(db: Any, session_id: str, chunks: List[Dict[str, Any]]) -> None:
     rows = [
         {
@@ -113,79 +138,123 @@ def _process_session(
     xer_bytes:       Optional[bytes],
 ) -> None:
     """
-    Parse → chunk → embed (parallel) → insert for all uploaded docs.
+    Hybrid ingestion (GraphRAG cutover):
+      - Special Provision → chunk → embed → session_chunks (hybrid RAG path)
+      - Schedule (XER) + Designer Narrative → CPM engine + knowledge graph
+        (session_graphs); NOT embedded — Q&A reads them via the graph digest
+        and graph tools.
     Updates _progress at each stage so the SSE stream stays current.
-    No LLM calls — all chunking is deterministic.
     """
     try:
         db       = get_db()
         embedder = Embedder()
         all_chunks: List[Dict[str, Any]] = []
+        nar_chunks: List[Dict[str, Any]] = []
+        graph_saved = False
 
-        # ── 1. Designer Narrative ──────────────────────────────────────────────
+        # ── 1. Designer Narrative (graph source; not embedded) ────────────────
         if narrative_bytes:
             _set_progress(session_id, status="parsing", message="Parsing designer narrative…")
             nar_chunks = _bytes_to_pdf_chunks(narrative_bytes, chunk_narrative)
-            all_chunks.extend(nar_chunks)
-            logger.info("Session %s: narrative → %d chunks", session_id, len(nar_chunks))
+            logger.info("Session %s: narrative → %d sections (graph)", session_id, len(nar_chunks))
 
-        # ── 2. XER Schedule Activities ─────────────────────────────────────────
+        # ── 2. XER Schedule → CPM → knowledge graph (not embedded) ────────────
         if xer_bytes:
             _set_progress(session_id, status="parsing", message="Processing schedule activities…")
             try:
                 xer_text   = xer_bytes.decode("utf-8", errors="ignore")
-                activities = parse_xer_to_json(xer_text)
-                calendars  = parse_xer_calendars(xer_text)
-                xer_chunks = xer_to_chunks(activities, calendars)
-                all_chunks.extend(xer_chunks)
-                logger.info("Session %s: XER → %d chunks", session_id, len(xer_chunks))
+                parsed     = parse_xer_all(xer_text)
+                activities = parsed["activities"]
+                calendars  = parsed["calendars"]
+                project    = parsed["project"]
+
+                # Deterministic CPM pass + cross-check (non-fatal: the graph
+                # then simply lacks computed values)
+                cpm = xcheck = None
+                try:
+                    _set_progress(session_id, status="parsing",
+                                  message="Computing critical path…")
+                    cpm = run_cpm(build_network(activities),
+                                  build_calendars(calendars), project)
+                    xcheck = cross_check(activities, cpm)
+                except Exception:
+                    logger.exception("Session %s: CPM computation failed", session_id)
+
+                _set_progress(session_id, status="parsing",
+                              message="Building knowledge graph…")
+                graph = build_graph(activities, calendars,
+                                    cpm=cpm, crosscheck=xcheck, project=project)
+                if nar_chunks:
+                    _set_progress(session_id, status="parsing",
+                                  message="Extracting narrative entities…")
+                    add_narrative_to_graph(graph, nar_chunks, activities,
+                                           llm=_extraction_llm())
+                save_graph(db, session_id, graph)
+                graph_saved = True
+                logger.info("Session %s: knowledge graph saved (%d nodes)",
+                            session_id, graph.number_of_nodes())
             except HTTPException as exc:
                 # XER parse failure is non-fatal; log and continue
                 logger.warning("Session %s: XER parse failed — %s", session_id, exc.detail)
+            except Exception:
+                logger.exception("Session %s: graph build/save failed", session_id)
+        elif nar_chunks:
+            # Narrative without a schedule still gets a (narrative-only) graph
+            try:
+                _set_progress(session_id, status="parsing",
+                              message="Extracting narrative entities…")
+                graph = build_graph([], [])
+                add_narrative_to_graph(graph, nar_chunks, [], llm=_extraction_llm())
+                save_graph(db, session_id, graph)
+                graph_saved = True
+            except Exception:
+                logger.exception("Session %s: narrative graph build failed", session_id)
 
-        # ── 3. Special Provision ───────────────────────────────────────────────
+        # ── 3. Special Provision (hybrid RAG path; embedded) ───────────────────
         if sp_bytes:
             _set_progress(session_id, status="parsing", message="Parsing special provision PDF…")
             sp_chunks = _bytes_to_sp_chunks(sp_bytes)
             all_chunks.extend(sp_chunks)
             logger.info("Session %s: SP → %d chunks", session_id, len(sp_chunks))
 
-        if not all_chunks:
+        if not all_chunks and not graph_saved:
             _set_progress(session_id, status="error", message="No content extracted from uploaded files.")
             return
 
-        # ── 4. Parallel embedding ──────────────────────────────────────────────
-        total_batches = (len(all_chunks) + embedder.batch_size - 1) // embedder.batch_size
-        _set_progress(
-            session_id,
-            status="embedding",
-            message=f"Embedding batch 0/{total_batches}…",
-            step=0,
-            total=total_batches,
-        )
-
-        def _on_progress(done: int, total: int) -> None:
+        # ── 4. Parallel embedding + store (SP chunks only) ─────────────────────
+        if all_chunks:
+            total_batches = (len(all_chunks) + embedder.batch_size - 1) // embedder.batch_size
             _set_progress(
                 session_id,
                 status="embedding",
-                message=f"Embedding batch {done}/{total}…",
-                step=done,
-                total=total,
+                message=f"Embedding batch 0/{total_batches}…",
+                step=0,
+                total=total_batches,
             )
 
-        embedder.embed_parallel(all_chunks, max_workers=3, on_progress=_on_progress)
+            def _on_progress(done: int, total: int) -> None:
+                _set_progress(
+                    session_id,
+                    status="embedding",
+                    message=f"Embedding batch {done}/{total}…",
+                    step=done,
+                    total=total,
+                )
 
-        # ── 5. Store ───────────────────────────────────────────────────────────
-        _set_progress(session_id, status="storing", message="Storing chunks…")
-        _insert_chunks(db, session_id, all_chunks)
+            embedder.embed_parallel(all_chunks, max_workers=3, on_progress=_on_progress)
+
+            _set_progress(session_id, status="storing", message="Storing chunks…")
+            _insert_chunks(db, session_id, all_chunks)
 
         _set_progress(
             session_id,
             status="ready",
             message="Documents ready. You can now ask questions.",
             chunk_count=len(all_chunks),
+            has_graph=graph_saved,
         )
-        logger.info("Session %s complete — %d chunks stored", session_id, len(all_chunks))
+        logger.info("Session %s complete — %d chunks stored, graph=%s",
+                    session_id, len(all_chunks), graph_saved)
 
     except Exception as exc:
         logger.exception("Session %s failed", session_id)
@@ -248,12 +317,18 @@ async def session_status(session_id: str) -> StreamingResponse:
                     .gt("expires_at", "now()") \
                     .execute()
             count = res.count or 0
-            if count > 0:
+            graph_rows = db.table("session_graphs") \
+                           .select("session_id") \
+                           .eq("session_id", session_id) \
+                           .gt("expires_at", "now()") \
+                           .execute().data or []
+            if count > 0 or graph_rows:
                 _set_progress(
                     session_id,
                     status="ready",
                     message="Documents ready. You can now ask questions.",
                     chunk_count=count,
+                    has_graph=bool(graph_rows),
                 )
             else:
                 _set_progress(session_id, status="error", message="Session not found or expired.")
@@ -331,6 +406,38 @@ If, after applying the above, no context is relevant to the question at all
 "Not found in the provided documents."
 Do not use this fallback merely because coverage is incomplete — only use it
 when nothing relevant was retrieved.
+"""
+
+
+_QA_SYSTEM_GRAPH = """\
+You are an assistant helping an NJDOT engineer review a construction project.
+
+You have TWO kinds of project knowledge:
+
+1. Retrieved document context (below in the user message):
+     [SP]      – Special Provision (project-specific contract requirements)
+     [Manual]  – NJDOT Construction Scheduling Manual (official standards)
+2. The project's schedule + designer-narrative KNOWLEDGE GRAPH:
+     [Graph]   – a digest is included below, and you can call graph tools
+                 (get_activity, get_critical_path, predecessors, successors,
+                 trace_path, why_critical, find_activities, narrative_links,
+                 get_narrative_section, search_narrative) for precise detail.
+
+Rules:
+- The graph's float, critical-path, and date values were computed
+  deterministically by a CPM engine — they are authoritative. NEVER attempt
+  your own float or critical-path arithmetic; call a tool instead.
+- For schedule-logic questions (critical path, what drives X, float, dates,
+  sequences) use the graph tools. For narrative content beyond the digest,
+  use search_narrative / get_narrative_section — the narrative is NOT in the
+  retrieved chunks.
+- Cite a source tag for every fact: "per [Graph]", "per [SP]", "per [Manual]".
+- A [Manual] rule is evidence of the standard, not of this project's
+  compliance; only [Graph] or [SP] facts confirm what is true for this project.
+- Be concise — one or two paragraphs, or a short list for enumerations.
+- Do not infer or invent beyond what the context and tools return. If neither
+  the context nor the graph answers the question, say:
+  "Not found in the provided documents."
 """
 
 
@@ -424,18 +531,37 @@ async def session_query(req: QueryRequest) -> dict:
             "similarity": round(row.get("similarity", 0.0), 3),
         })
 
-    if not context_parts:
+    # ── GraphRAG path: schedule + narrative live in the knowledge graph ────────
+    graph_loaded = load_graph(db, req.session_id)
+
+    if graph_loaded is None and not context_parts:
         return {
             "answer":  "No relevant content found in the uploaded documents.",
             "sources": [],
         }
 
-    context_text = "\n\n---\n\n".join(context_parts)
-    user_message = f"Context:\n{context_text}\n\nQuestion: {req.question}"
+    llm = LLMClient()
 
-    # ── LLM answer ─────────────────────────────────────────────────────────────
-    llm    = LLMClient()
-    answer = llm.complete(_QA_SYSTEM, user_message)
+    if graph_loaded is not None:
+        graph, cpm_summary = graph_loaded
+        digest = build_digest(graph, cpm_summary)
+        context_parts.insert(0, f"[Graph] Project schedule/narrative digest\n{digest}")
+        sources.insert(0, {"label": "Schedule Graph", "heading": "digest"})
+
+        context_text = "\n\n---\n\n".join(context_parts)
+        user_message = f"Context:\n{context_text}\n\nQuestion: {req.question}"
+
+        answer, tool_trace = run_tool_loop(
+            llm, _QA_SYSTEM_GRAPH, user_message,
+            tools=bind_graph_tools(graph, cpm_summary),
+        )
+        for t in tool_trace:
+            sources.append({"label": "Schedule Graph", "tool": t["tool"],
+                            "args": t["args"]})
+    else:
+        context_text = "\n\n---\n\n".join(context_parts)
+        user_message = f"Context:\n{context_text}\n\nQuestion: {req.question}"
+        answer = llm.complete(_QA_SYSTEM, user_message)
 
     # ── Persist messages (non-fatal) ───────────────────────────────────────────
     try:

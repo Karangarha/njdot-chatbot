@@ -5,7 +5,7 @@ Wraps either ``openai.OpenAI.chat.completions.create`` or
 The active provider is selected by ``config.LLM_PROVIDER``:
 
     LLM_PROVIDER=openai      → gpt-4o  (default)
-    LLM_PROVIDER=anthropic   → claude-sonnet-4-20250514
+    LLM_PROVIDER=anthropic   → claude-sonnet-5
 
 Usage
 -----
@@ -35,8 +35,10 @@ except ImportError:
 
 
 _DEFAULT_MODEL_OPENAI    = "gpt-4o"
-_DEFAULT_MODEL_ANTHROPIC = "claude-sonnet-4-20250514"
-_ANTHROPIC_MAX_TOKENS    = 2048
+_DEFAULT_MODEL_ANTHROPIC = "claude-sonnet-5"
+# Sonnet 5 runs adaptive thinking by default; max_tokens must cover thinking
+# plus the visible answer.
+_ANTHROPIC_MAX_TOKENS    = 8192
 
 
 class LLMClient:
@@ -102,6 +104,11 @@ class LLMClient:
         """The active LLM provider ("openai" or "anthropic")."""
         return self._provider
 
+    @property
+    def client(self) -> Union[openai.OpenAI, anthropic_sdk.Anthropic]:
+        """The underlying SDK client (used by the tool-use loop)."""
+        return self._client
+
     def complete(self, system_prompt: str, user_message: str) -> str:
         """Run a single-turn chat completion and return the raw response text.
 
@@ -124,14 +131,17 @@ class LLMClient:
         """
         if self._provider == "anthropic":
             try:
+                # No temperature: Sonnet 5 rejects non-default sampling params.
                 message = self._client.messages.create(  # type: ignore[union-attr]
                     model=self._model,
                     max_tokens=_ANTHROPIC_MAX_TOKENS,
-                    temperature=0,
                     system=system_prompt,
                     messages=[{"role": "user", "content": user_message}],
                 )
-                return message.content[0].text
+                # Adaptive thinking may prepend thinking blocks — take text blocks.
+                return "\n".join(
+                    b.text for b in message.content if b.type == "text"
+                ).strip()
             except Exception as exc:
                 raise RuntimeError(
                     f"LLM completion failed [{type(exc).__name__}]: {exc}"

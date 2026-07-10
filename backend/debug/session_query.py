@@ -25,7 +25,11 @@ from app.database import get_db
 from app.generation.llm_client import LLMClient
 
 # ── Same constants and prompts as session.py ──────────────────────────────────
-from app.api.session import _QA_SYSTEM, _DOC_TAG, _DOC_LABEL
+from app.api.session import _QA_SYSTEM, _QA_SYSTEM_GRAPH, _DOC_TAG, _DOC_LABEL
+from app.generation.tool_loop import run_tool_loop
+from app.graph import load_graph
+from app.graph.digest import build_digest
+from app.graph.tools import bind_graph_tools
 
 
 def run_session_query(session_id: str, question: str, match_count: int, show_prompt: bool) -> None:
@@ -193,6 +197,22 @@ def run_session_query(session_id: str, question: str, match_count: int, show_pro
             "similarity": round(row.get("similarity", 0.0), 4),
         })
 
+    # ── STAGE 5b: Knowledge graph (GraphRAG path) ────────────────────────────
+    graph_loaded = load_graph(db, session_id)
+    graph_tools = None
+    system_prompt = _QA_SYSTEM
+    if graph_loaded is not None:
+        graph, cpm_summary = graph_loaded
+        digest = build_digest(graph, cpm_summary)
+        context_parts.insert(0, f"[Graph] Project schedule/narrative digest\n{digest}")
+        graph_tools = bind_graph_tools(graph, cpm_summary)
+        system_prompt = _QA_SYSTEM_GRAPH
+        print(f"  Graph: {green('loaded')} — {graph.number_of_nodes()} nodes, "
+              f"{graph.number_of_edges()} edges; digest {len(digest):,} chars; "
+              f"{len(graph_tools)} tools bound")
+    else:
+        print(f"  Graph: {yellow('none')} — plain RAG path")
+
     context_text = "\n\n---\n\n".join(context_parts)
     user_message = f"Context:\n\n{context_text}\n\nQuestion: {question}"
 
@@ -202,21 +222,32 @@ def run_session_query(session_id: str, question: str, match_count: int, show_pro
 
     if show_prompt:
         subsection("SYSTEM PROMPT (full)")
-        print(_QA_SYSTEM)
+        print(system_prompt)
         subsection("USER MESSAGE (full)")
         print(user_message)
 
-    # ── STAGE 6: LLM call ────────────────────────────────────────────────────
+    # ── STAGE 6: LLM call (tool loop when a graph exists) ────────────────────
     section("STAGE 6 — LLM CALL")
     llm = LLMClient()
     print(f"  Provider: {bold(llm.provider)}  Model: {bold(llm.model)}")
 
     t_llm = time.time()
     print(f"  Calling LLM ... ", end="", flush=True)
-    raw_response = llm.complete(_QA_SYSTEM, user_message)
+    if graph_tools is not None:
+        raw_response, tool_trace = run_tool_loop(
+            llm, system_prompt, user_message, tools=graph_tools)
+    else:
+        raw_response = llm.complete(system_prompt, user_message)
+        tool_trace = []
     elapsed = time.time() - t_llm
     print(green("✓"))
     print(f"  Elapsed: {elapsed:.1f}s")
+
+    if tool_trace:
+        subsection(f"GRAPH TOOL ROUNDS ({len(tool_trace)})")
+        for i, t in enumerate(tool_trace, 1):
+            print(f"  [{i}] {cyan(t['tool'])}({json.dumps(t['args'])})")
+            print(f"      → {dim(t['result_preview'])}")
 
     # ── STAGE 7: Raw LLM response ─────────────────────────────────────────────
     section("STAGE 7 — RAW LLM RESPONSE")

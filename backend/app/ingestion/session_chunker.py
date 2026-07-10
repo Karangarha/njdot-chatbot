@@ -447,14 +447,18 @@ def _fmt_preds(preds: List[str], limit: int = 4) -> str:
 def xer_to_markdown(
     activities: List[Dict[str, Any]],
     calendars: Optional[List[Dict[str, Any]]] = None,
+    cpm: Any = None,
+    crosscheck: Optional[Dict[str, Any]] = None,
+    project: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
     Convert parsed XER activities to NL-rich Markdown.
 
-    Produces a document with sections: Calendar, Milestones, Negative Float,
-    Mandatory Constraints, and one ## Phase section per WBS path.  Every
-    activity name and ID appears verbatim so both vector and keyword search
-    can find individual activities.
+    Produces a document with sections: Calendar, Critical Path*, CPM
+    Validation*, Milestones, Negative Float, Mandatory Constraints, and one
+    ## Phase section per WBS path (* only when CPM results are supplied).
+    Every activity name and ID appears verbatim so both vector and keyword
+    search can find individual activities.
 
     Also used by the review pipeline as the schedule representation sent to
     the compliance LLM (instead of raw JSON).
@@ -465,6 +469,14 @@ def xer_to_markdown(
         Output of ``parse_xer_to_json()``.
     calendars : list[dict] | None
         Output of ``parse_xer_calendars()`` (optional).
+    cpm : CpmResult | None
+        Output of ``app.scheduling.run_cpm()``.  When present, Milestone and
+        Phase tables gain a computed Critical column and the Critical Path /
+        CPM Validation sections are emitted.
+    crosscheck : dict | None
+        Output of ``app.scheduling.cross_check()``.
+    project : dict | None
+        Output of ``parse_xer_project()``.
     """
     lines: List[str] = ["# Project Schedule", ""]
 
@@ -478,6 +490,27 @@ def xer_to_markdown(
     def _cal_name(act: Dict[str, Any]) -> str:
         """Return abbreviated calendar name for an activity, or '—'."""
         return cal_map.get(str(act.get("calendar_id", "")), "—")
+
+    by_id: Dict[str, Dict[str, Any]] = {a["activity_id"]: a for a in activities}
+
+    def _cpm_of(act: Dict[str, Any]):
+        return cpm.activities.get(act.get("activity_id")) if cpm else None
+
+    def _crit_str(act: Dict[str, Any]) -> str:
+        r = _cpm_of(act)
+        if r is None or r.excluded or r.total_float is None:
+            return "—"
+        return "Yes" if r.is_critical else "No"
+
+    def _float_str(act: Dict[str, Any]) -> str:
+        """Computed total float (authoritative), with the P6 value when they differ."""
+        r = _cpm_of(act)
+        stored = act.get("total_float")
+        if r is None or r.excluded or r.total_float is None:
+            return str(stored) if stored is not None else "—"
+        if stored is not None and abs(r.total_float - int(stored)) > 1:
+            return f"{r.total_float} (P6: {stored})"
+        return str(r.total_float)
 
     # ── Calendar ──────────────────────────────────────────────────────────────
     if calendars:
@@ -514,33 +547,108 @@ def xer_to_markdown(
                 lines.append(f"Holiday/restricted exceptions: {exc_str}")
         lines.append("")
 
+    # ── Critical Path (computed) ──────────────────────────────────────────────
+    if cpm is not None:
+        lines += ["## Critical Path", ""]
+        proj_bits = []
+        if project and project.get("project_name"):
+            proj_bits.append(f"Project: {project['project_name']}.")
+        if cpm.data_date:
+            proj_bits.append(f"Data date: {cpm.data_date}.")
+        if cpm.project_finish:
+            proj_bits.append(f"Computed project finish: {cpm.project_finish}.")
+        if project and project.get("must_finish_date"):
+            proj_bits.append(f"Must-finish date: {project['must_finish_date']}.")
+        crit_count = sum(1 for r in cpm.activities.values() if r.is_critical)
+        proj_bits.append(f"{crit_count} activities are on the critical path "
+                         f"(computed total float ≤ 0).")
+        lines += [" ".join(proj_bits), ""]
+
+        # Map (pred, succ) → relationship label for chain rendering
+        link_lbl: Dict[tuple, str] = {}
+        for a in activities:
+            for l in a.get("pred_links", []):
+                lag = l.get("lag_days", 0)
+                link_lbl[(l["activity_id"], a["activity_id"])] = (
+                    f"{l.get('type', 'FS')}{lag:+d}" if lag else l.get("type", "FS"))
+
+        for i, chain in enumerate(cpm.critical_paths, 1):
+            lines.append(f"**Critical chain {i}:**")
+            for j, aid in enumerate(chain):
+                act = by_id.get(aid, {})
+                r = cpm.activities.get(aid)
+                rel = ""
+                if j > 0:
+                    rel = f" ({link_lbl.get((chain[j-1], aid), 'FS')} from {chain[j-1]})"
+                lines.append(
+                    f"{j+1}. {aid} — {act.get('activity_name', '')}"
+                    f" (start {r.es}, finish {r.ef}, total float {r.total_float}){rel}"
+                )
+            lines.append("")
+
+    # ── CPM Validation (computed vs P6-stored) ────────────────────────────────
+    if cpm is not None and crosscheck is not None:
+        s = crosscheck.get("summary", {})
+        lines += ["## CPM Validation", "",
+                  "Float, critical-path, and date values in this document were "
+                  "computed deterministically by a CPM engine (forward/backward "
+                  "pass over the activity network at working-day granularity) "
+                  "and are authoritative. Differences from the P6-stored values "
+                  "listed below are review findings.", "",
+                  f"Cross-check summary: {s.get('checked', 0)} activities checked, "
+                  f"{s.get('clean', 0)} clean, {s.get('float_mismatches', 0)} float "
+                  f"mismatches, {s.get('date_mismatches', 0)} date mismatches, "
+                  f"{s.get('critical_flag_diffs', 0)} critical-flag differences "
+                  f"(tolerance ±{s.get('tolerance_days', 1)} day).", ""]
+        for line in crosscheck.get("assessment", []):
+            lines.append(f"- {line}")
+        mismatches = crosscheck.get("mismatches", [])
+        if mismatches:
+            _mm_cap = 15
+            lines += ["", "| Activity | Field | Computed | P6 Stored | Δ days |",
+                      "|----------|-------|----------|-----------|--------|"]
+            for m in mismatches[:_mm_cap]:
+                lines.append(
+                    f"| {m['activity_id']} | {m['field']} | {m['computed']} | "
+                    f"{m['stored']} | {m.get('delta_days', '—')} |")
+            if len(mismatches) > _mm_cap:
+                lines.append(f"| … | +{len(mismatches) - _mm_cap} more rows | | | |")
+        lines.append("")
+
     # ── Milestones ────────────────────────────────────────────────────────────
     milestones = [a for a in activities if a.get("duration_days", 1) == 0]
     if milestones:
         lines += ["## Milestones", "",
-                  "| ID | Name | Date | Float | Calendar | Predecessors |",
-                  "|----|------|------|-------|----------|-------------|"]
+                  "| ID | Name | Date | Float | Critical | Calendar | Predecessors |",
+                  "|----|------|------|-------|----------|----------|-------------|"]
         for m in milestones:
             date = m.get("start_date") or m.get("finish_date") or "—"
             lines.append(
                 f"| {m['activity_id']} | {m['activity_name']} | {date} | "
-                f"{m.get('total_float', 0)} | {_cal_name(m)} | "
+                f"{_float_str(m)} | {_crit_str(m)} | {_cal_name(m)} | "
                 f"{_fmt_preds(m.get('predecessors', []))} |"
             )
         lines.append("")
 
     # ── Negative float ────────────────────────────────────────────────────────
-    neg_float = [a for a in activities if (a.get("total_float") or 0) < 0]
+    def _eff_float(a: Dict[str, Any]) -> int:
+        """Computed total float when available, else the P6-stored value."""
+        r = _cpm_of(a)
+        if r is not None and r.total_float is not None:
+            return r.total_float
+        return int(a.get("total_float") or 0)
+
+    neg_float = [a for a in activities if _eff_float(a) < 0]
     if neg_float:
         lines += ["## Activities with Negative Float", "",
                   "| ID | Name | Start | Finish | Float | Phase |",
                   "|----|------|-------|--------|-------|-------|"]
-        for a in sorted(neg_float, key=lambda x: x.get("total_float", 0)):
+        for a in sorted(neg_float, key=_eff_float):
             phase = " > ".join(a.get("wbs_path") or ["—"])
             lines.append(
                 f"| {a['activity_id']} | {a['activity_name']} | "
                 f"{a.get('start_date','—')} | {a.get('finish_date','—')} | "
-                f"{a.get('total_float','—')} | {phase} |"
+                f"{_float_str(a)} | {phase} |"
             )
         lines.append("")
 
@@ -579,14 +687,14 @@ def xer_to_markdown(
         )
         lines += [
             f"## Phase: {phase}  ({len(non_ms)} activities, {date_range})", "",
-            "| ID | Name | Start | Finish | Duration | Float | Calendar | Predecessors |",
-            "|----|------|-------|--------|----------|-------|----------|-------------|",
+            "| ID | Name | Start | Finish | Duration | Float | Critical | Calendar | Predecessors |",
+            "|----|------|-------|--------|----------|-------|----------|----------|-------------|",
         ]
         for a in non_ms:
             lines.append(
                 f"| {a['activity_id']} | {a['activity_name']} | "
                 f"{a.get('start_date','—')} | {a.get('finish_date','—')} | "
-                f"{a.get('duration_days','—')} | {a.get('total_float','—')} | "
+                f"{a.get('duration_days','—')} | {_float_str(a)} | {_crit_str(a)} | "
                 f"{_cal_name(a)} | {_fmt_preds(a.get('predecessors', []))} |"
             )
         lines.append("")
@@ -599,14 +707,18 @@ def xer_to_markdown(
 def xer_to_chunks(
     activities: List[Dict[str, Any]],
     calendars: Optional[List[Dict[str, Any]]] = None,
+    cpm: Any = None,
+    crosscheck: Optional[Dict[str, Any]] = None,
+    project: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Convert parsed XER activities into Markdown-based chunks for embedding.
 
     Calls ``xer_to_markdown()`` and splits the output on ``##`` section
-    boundaries.  Each section (Calendar, Milestones, Negative Float, each
-    Phase) becomes one chunk.  Sections that exceed ``_XER_MAX_TOKENS`` are
-    split with a sliding window that keeps the section header in every piece.
+    boundaries.  Each section (Calendar, Critical Path, CPM Validation,
+    Milestones, Negative Float, each Phase) becomes one chunk.  Sections that
+    exceed ``_XER_MAX_TOKENS`` are split with a sliding window that keeps the
+    section header in every piece.
 
     Parameters
     ----------
@@ -614,9 +726,22 @@ def xer_to_chunks(
         Output of ``parse_xer_to_json()``.
     calendars : list[dict] | None
         Output of ``parse_xer_calendars()`` (optional; adds a Calendar chunk).
+    cpm, crosscheck, project
+        Optional CPM results (see ``xer_to_markdown``); phase chunks then gain
+        ``has_critical`` / ``critical_activity_ids`` metadata.
     """
     enc = _get_enc()
-    md  = xer_to_markdown(activities, calendars)
+    md  = xer_to_markdown(activities, calendars, cpm=cpm,
+                          crosscheck=crosscheck, project=project)
+
+    # Phase name → computed-critical activity ids (for chunk metadata)
+    crit_by_phase: Dict[str, List[str]] = defaultdict(list)
+    if cpm is not None:
+        for a in activities:
+            r = cpm.activities.get(a.get("activity_id"))
+            if r is not None and r.is_critical:
+                phase_key = " > ".join(a.get("wbs_path") or ["General"])
+                crit_by_phase[phase_key].append(a["activity_id"])
 
     raw_sections = re.split(r"(?=^## )", md, flags=re.MULTILINE)
 
@@ -638,6 +763,10 @@ def xer_to_chunks(
                 "section":  "phase",
                 "phase":    phase_name,
             }
+            if cpm is not None:
+                crit_ids = crit_by_phase.get(phase_name, [])
+                meta_base["has_critical"] = bool(crit_ids)
+                meta_base["critical_activity_ids"] = crit_ids[:30]
         else:
             meta_base = {
                 "doc_type": "xer_activities",

@@ -1,7 +1,7 @@
 """POST /api/review — Schedule compliance review endpoint.
 
 Accepts two PDF uploads (schedule_pdf, narrative_pdf), converts them to
-base64, and sends them to GPT-4o (primary) or claude-sonnet-4-20250514
+base64, and sends them to GPT-4o (primary) or claude-sonnet-5
 (fallback) with a structured compliance-check prompt.  Returns a JSON
 compliance report with a "model_used" field indicating which model ran.
 """
@@ -17,16 +17,24 @@ from datetime import datetime
 import anthropic
 import openai
 from fastapi import APIRouter, File, HTTPException, UploadFile
-from xerparser import Xer
 
 from app.ingestion.session_chunker import xer_to_markdown
+from app.scheduling import build_calendars, build_network, cross_check, run_cpm
+# Re-exported for backward compatibility (session.py and debug scripts import
+# these from app.api.review); canonical implementations live in app.scheduling.
+from app.scheduling.xer_extract import (  # noqa: F401
+    parse_xer_all,
+    parse_xer_calendars,
+    parse_xer_project,
+    parse_xer_to_json,
+)
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["review"])
 
 _OPENAI_MODEL = "gpt-4o"
-_ANTHROPIC_MODEL = "claude-sonnet-4-20250514"
+_ANTHROPIC_MODEL = "claude-sonnet-5"
 
 
 _SYSTEM_PROMPT = """\
@@ -37,13 +45,19 @@ You are evaluating a Markdown document derived from a Primavera P6 (.xer) file. 
 
 **## Calendar** — project calendar name, working days (e.g., Mon–Fri), and holiday exception dates. Use this for all working-day and business-day calculations. If absent, assume a standard Mon–Fri calendar with US federal holidays.
 
-**## Milestones** — table of zero-duration activities (ID | Name | Date | Float | Predecessors). Includes key dates: Advertisement (M100), Bid Opening, Award, Construction Start, Substantial Completion, Contract Completion.
+**## Critical Path** — the project's critical path(s) COMPUTED DETERMINISTICALLY by a CPM engine (forward/backward pass over the activity network), listed as ordered activity chains with computed start, finish, and total float. The project data date and computed project finish are stated here.
 
-**## Activities with Negative Float** — all activities where float < 0, sorted ascending. Includes WBS phase path.
+**## CPM Validation** — a comparison of the CPM engine's computed values against the values stored in the P6 file, with a summary and per-activity mismatch rows.
+
+CRITICAL-PATH AUTHORITY RULE: when ## Critical Path and ## CPM Validation are present, their values and the Critical (Yes/No) and Float columns in the tables below are precomputed and authoritative. Do NOT recompute float, critical-path membership, project finish, or open ends yourself — read them from these sections. A float value shown as "N (P6: M)" means the engine computed N while the P6 file stores M; treat N as correct and the difference as a finding. Mismatches listed in ## CPM Validation indicate the schedule may not have been recalculated after edits or that float is being manipulated — evaluate them under the cpm_consistency check.
+
+**## Milestones** — table of zero-duration activities (ID | Name | Date | Float | Critical | Predecessors). Includes key dates: Advertisement (M100), Bid Opening, Award, Construction Start, Substantial Completion, Contract Completion.
+
+**## Activities with Negative Float** — all activities where computed float < 0, sorted ascending. Includes WBS phase path.
 
 **## Activities with Mandatory Constraints** — activities with date constraints applied (constraint type and date shown).
 
-**## Phase: [WBS Path]** — one section per WBS phase, containing a table of all activities: ID | Name | Start | Finish | Duration (days) | Float | Predecessors.
+**## Phase: [WBS Path]** — one section per WBS phase, containing a table of all activities: ID | Name | Start | Finish | Duration (days) | Float | Critical | Predecessors.
 
 Use activity IDs and names verbatim in your evidence. Every activity in the schedule appears in exactly one Phase section.
 
@@ -129,6 +143,7 @@ CATEGORY: Schedule Logic
 - id: "no_lag", name: "No Lag Present"
 - id: "no_open_ends", name: "No Open Ends Present"
 - id: "no_mandatory_constraints", name: "No Mandatory Constraints Applied"
+- id: "cpm_consistency", name: "P6 Stored Values Match Recomputed CPM (Schedule Recalculated)" — pass when ## CPM Validation reports zero or tolerance-only mismatches; fail when it reports float or date mismatches beyond tolerance (cite the affected activity IDs); warning when the ## CPM Validation section is absent.
 
 CATEGORY: Manual Review
 For each item below, evaluate what you can from the schedule JSON and the narrative PDF. Use "pass" if there is clear evidence in the documents that the requirement is met, "fail" if there is clear evidence of non-compliance, or "warning" if data is insufficient to make a determination.
@@ -145,173 +160,6 @@ _USER_TEXT = (
     "Please perform the full compliance review on the two documents above "
     "and return the JSON report as specified."
 )
-
-
-def parse_xer_to_json(xer_text: str) -> list:
-    try:
-        xer = Xer(xer_text)
-    except Exception as e:
-        logger.error(f"Error parsing XER content: {e}")
-        raise HTTPException(status_code=400, detail="Failed to parse XER file.")
-
-    task_id_map = {}
-    activities_data = {}
-
-    def get_wbs_path(wbs_id):
-        path = []
-        if hasattr(xer, 'wbs_nodes'):
-            current_wbs = xer.wbs_nodes.get(wbs_id)
-            while current_wbs:
-                wbs_name = getattr(current_wbs, 'wbs_name', getattr(current_wbs, 'name', ''))
-                if wbs_name:
-                    path.insert(0, wbs_name)
-                parent_id = getattr(current_wbs, 'parent_wbs_id', None)
-                current_wbs = xer.wbs_nodes.get(parent_id) if parent_id else None
-        return path
-
-    for activity in xer.tasks.values():
-        internal_db_key = activity.uid  
-        human_readable_id = getattr(activity, 'task_code', '') 
-        task_id_map[internal_db_key] = human_readable_id
-        
-        wbs_id = getattr(activity, 'wbs_id', None)
-        hierarchy_path = get_wbs_path(wbs_id) if wbs_id else []
-        
-        activities_data[human_readable_id] = {
-            "activity_id": human_readable_id,
-            "activity_name": getattr(activity, 'name', ''),
-            "wbs_path": hierarchy_path,
-            "start_date": activity.start.strftime('%Y-%m-%d') if getattr(activity, 'start', None) else None,
-            "finish_date": activity.finish.strftime('%Y-%m-%d') if getattr(activity, 'finish', None) else None,
-            "duration_days": int(getattr(activity, 'duration', 0) or 0),
-            "total_float": int(getattr(activity, 'total_float', 0) or 0),
-            "calendar_id": getattr(activity, 'clndr_id', ''),
-            "predecessors": [],
-            "successors": [],
-            "constraints": {
-                "type": getattr(activity, 'cstr_type', None) or "None",
-                "date": activity.cstr_date.strftime('%Y-%m-%d') if getattr(activity, 'cstr_date', None) else None
-            }
-        }
-
-    if hasattr(xer, 'relationships'):
-        for relation in xer.relationships.values():
-            pred_internal_key = getattr(relation, 'pred_task_id', None)
-            succ_internal_key = getattr(relation, 'task_id', None)
-
-            pred_readable_id = task_id_map.get(pred_internal_key)
-            succ_readable_id = task_id_map.get(succ_internal_key)
-
-            if pred_readable_id and pred_readable_id in activities_data:
-                activities_data[pred_readable_id]["successors"].append(succ_readable_id)
-                
-            if succ_readable_id and succ_readable_id in activities_data:
-                activities_data[succ_readable_id]["predecessors"].append(pred_readable_id)
-
-    return list(activities_data.values())
-
-
-def parse_xer_calendars(xer_text: str) -> list:
-    """Extract calendar definitions from raw XER text by parsing the CALENDAR table directly.
-
-    xerparser exposes clndr_data as a scalar float (day_hr_cnt) rather than the
-    nested parenthetical string we need, so we bypass it and read the raw rows.
-
-    clndr_data encodes working days in a DaysOfWeek section where day numbers
-    1–7 map to Sun–Sat.  A day is working when its entry contains at least one
-    work-period marker (s|HH:MM), otherwise it is empty (non-working).
-    Exception dates are Primavera serials (days since Dec 30, 1899).
-    """
-    from datetime import date as _date, timedelta as _td
-    import re as _re
-
-    _P6_EPOCH = _date(1899, 12, 30)
-    _ABBREV   = {1: "Sun", 2: "Mon", 3: "Tue", 4: "Wed", 5: "Thu", 6: "Fri", 7: "Sat"}
-
-    # ── Parse CALENDAR table rows from raw XER text ───────────────────────────
-    in_calendar   = False
-    clndr_id_idx  = clndr_name_idx = clndr_data_idx = -1
-    raw_calendars: dict = {}   # clndr_id (str) → {name, clndr_data}
-
-    for line in xer_text.splitlines():
-        if line.startswith("%T\t"):
-            in_calendar = (line.strip() == "%T\tCALENDAR")
-            clndr_id_idx = clndr_name_idx = clndr_data_idx = -1
-            continue
-        if not in_calendar:
-            continue
-        if line.startswith("%F\t"):
-            fields = line[3:].split("\t")
-            try:
-                clndr_id_idx   = fields.index("clndr_id")
-                clndr_name_idx = fields.index("clndr_name")
-                clndr_data_idx = fields.index("clndr_data")
-            except ValueError:
-                pass
-            continue
-        if line.startswith("%R\t") and clndr_id_idx != -1:
-            fields = line[3:].split("\t")
-            try:
-                cal_id   = fields[clndr_id_idx].strip()
-                cal_name = fields[clndr_name_idx].strip() if clndr_name_idx < len(fields) else ""
-                cal_data = fields[clndr_data_idx].strip() if clndr_data_idx < len(fields) else ""
-            except IndexError:
-                continue
-            raw_calendars[cal_id] = {"name": cal_name, "clndr_data": cal_data}
-
-    # ── Helpers to parse a clndr_data string ─────────────────────────────────
-
-    def _working_days(clndr_data: str) -> list:
-        """Return abbreviated day names for days that have work periods."""
-        if not clndr_data:
-            return []
-        dow_start = clndr_data.find("DaysOfWeek()(")
-        if dow_start == -1:
-            return []
-        exc_pos  = clndr_data.find("(0||Exceptions", dow_start)
-        view_pos = clndr_data.find("(0||VIEW",       dow_start)
-        end = min(p for p in [exc_pos, view_pos, len(clndr_data)] if p != -1)
-        dow_text = clndr_data[dow_start:end]
-
-        working = []
-        for day_num in range(1, 8):
-            # Non-working days have exactly (0||N()()) — empty children list
-            non_working = f"(0||{day_num}()())" in dow_text
-            has_entry   = f"(0||{day_num}()("  in dow_text
-            if has_entry and not non_working:
-                working.append(_ABBREV[day_num])
-        return working
-
-    def _exception_dates(clndr_data: str) -> list:
-        """Return sorted list of {date, name} dicts from the Exceptions section."""
-        if not clndr_data:
-            return []
-        exc_start = clndr_data.find("(0||Exceptions()(")
-        if exc_start == -1:
-            return []
-        exc_text = clndr_data[exc_start:]
-        dates = []
-        for m in _re.finditer(r'd\|(\d+)', exc_text):
-            try:
-                d = _P6_EPOCH + _td(days=int(m.group(1)))
-                dates.append({"date": d.strftime("%Y-%m-%d"), "name": ""})
-            except Exception:
-                pass
-        return dates
-
-    # ── Build output ──────────────────────────────────────────────────────────
-    calendars = []
-    for cal_id, cal in raw_calendars.items():
-        work_days  = _working_days(cal["clndr_data"])
-        exceptions = _exception_dates(cal["clndr_data"])
-        calendars.append({
-            "id":         cal_id,
-            "name":       cal["name"] or "Project Calendar",
-            "work_days":  work_days,
-            "exceptions": sorted(exceptions, key=lambda e: e["date"]),
-        })
-
-    return calendars
 
 
 def _parse_json(raw_text: str, model_label: str) -> dict:
@@ -372,7 +220,7 @@ def _call_openai(schedule_md: str, narrative_b64: str) -> dict:
 
 
 def _call_anthropic(schedule_md: str, narrative_b64: str) -> dict:
-    """Send both documents to claude-sonnet-4-20250514 and return the parsed compliance report."""
+    """Send both documents to claude-sonnet-5 and return the parsed compliance report."""
     api_key = os.getenv("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise RuntimeError("ANTHROPIC_API_KEY is not configured")
@@ -406,7 +254,8 @@ def _call_anthropic(schedule_md: str, narrative_b64: str) -> dict:
         ],
     )
 
-    raw_text = message.content[0].text if message.content else ""
+    # Adaptive thinking may prepend thinking blocks — take text blocks only.
+    raw_text = "\n".join(b.text for b in message.content if b.type == "text").strip()
     return _parse_json(raw_text, "Claude")
 
 
@@ -431,11 +280,25 @@ async def review_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to read uploaded files: {exc}") from exc
 
-    # Parse XER → Markdown (used by both LLM calls)
+    # Parse XER → CPM → Markdown (used by both LLM calls)
     xer_text      = schedule_bytes.decode("utf-8", errors="ignore")
-    schedule_json = parse_xer_to_json(xer_text)
-    calendars     = parse_xer_calendars(xer_text)
-    schedule_md   = xer_to_markdown(schedule_json, calendars)
+    parsed        = parse_xer_all(xer_text)
+    schedule_json = parsed["activities"]
+    calendars     = parsed["calendars"]
+    project       = parsed["project"]
+
+    # Deterministic CPM pass + cross-check against P6-stored values.
+    # Non-fatal: on failure the review degrades to the plain markdown the
+    # pipeline produced before the CPM engine existed.
+    cpm = xcheck = None
+    try:
+        cpm = run_cpm(build_network(schedule_json), build_calendars(calendars), project)
+        xcheck = cross_check(schedule_json, cpm)
+    except Exception:
+        logger.exception("CPM computation failed; review proceeds without computed values")
+
+    schedule_md = xer_to_markdown(schedule_json, calendars,
+                                  cpm=cpm, crosscheck=xcheck, project=project)
 
     # Encode PDF
     narrative_b64 = base64.standard_b64encode(narrative_bytes).decode("utf-8")
