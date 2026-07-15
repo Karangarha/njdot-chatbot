@@ -39,7 +39,8 @@ from app.compliance.catalog import BUILTIN_CHECKS, CheckDef
 from app.compliance.eval_engine import evaluate_checks
 from app.config import config
 from app.database import get_db
-from app.graph_neo4j.seed import seed_narrative, seed_schedule
+from app.graph_neo4j.seed import seed_narrative, seed_schedule, seed_special_provision
+from app.graph_neo4j.tools import search_special_provision
 from app.ingestion.pdf_parser import PDFParser
 from app.ingestion.session_chunker import chunk_narrative, chunk_special_provision
 from app.models import ReviewCheckResult, ReviewResponse
@@ -110,6 +111,49 @@ def _build_sp_search_fn(
         return "\n\n---\n\n".join(top) if top else "No matching Special Provision text found."
 
     return _search
+
+
+def _build_sp_search_fn_from_graph(
+    graph: Any, embeddings: OpenAIEmbeddings, project_id: str,
+) -> Optional[Callable[[str], str]]:
+    """Special Provision search backed by persisted ``SPChunk`` nodes (see
+    ``graph_neo4j.seed.seed_special_provision``) — the ``reseed=False`` fast
+    path's equivalent of ``_build_sp_search_fn``, without re-parsing,
+    re-chunking, or re-embedding the PDF. Only ``embeddings.embed_query``
+    runs per check. Returns ``None`` if this project has no SP chunks
+    (matches "no SP uploaded" behavior).
+    """
+    existing = graph.query(
+        "MATCH (s:SPChunk {projectId: $pid}) RETURN count(s) AS c LIMIT 1",
+        params={"pid": project_id},
+    )
+    if not existing or not existing[0]["c"]:
+        return None
+
+    def _search(query: str, top_k: int = 5) -> str:
+        q_vec = embeddings.embed_query(query)
+        result = search_special_provision(graph, q_vec, project_id, top_k)
+        chunks = result.get("chunks", [])
+        if not chunks:
+            return "No matching Special Provision text found."
+        return "\n\n---\n\n".join(c["content"] for c in chunks)
+
+    return _search
+
+
+def _read_project_summary(graph: Any, project_id: str) -> tuple[str, int]:
+    """Read ``project_name``/``duration_days`` back from the ``Project`` node
+    — used by the ``reseed=False`` fast path instead of re-parsing the XER.
+    """
+    rows = graph.query(
+        "MATCH (p:Project {projectId: $pid}) "
+        "RETURN p.projectName AS projectName, p.durationDays AS durationDays LIMIT 1",
+        params={"pid": project_id},
+    )
+    if not rows:
+        return "Unknown", 0
+    row = rows[0]
+    return row.get("projectName") or "Unknown", row.get("durationDays") or 0
 
 
 # ── Checklist selection ────────────────────────────────────────────────────────
@@ -203,6 +247,7 @@ def _run_review_pipeline(
     sp_bytes: Optional[bytes],
     selected_checks: Optional[List[CheckDef]],
     project_id: str,
+    reseed: bool = True,
 ) -> dict:
     """Parse -> CPM -> seed Neo4j -> evaluate the checklist -> frontend shape.
 
@@ -212,39 +257,78 @@ def _run_review_pipeline(
     Neo4j node written/read this call to one project — see graph_neo4j's
     multi-project isolation design (no wipe step: MERGE-based writes are
     idempotent, and a project's schedule bytes never change between re-runs).
+
+    ``reseed=False`` (re-run) skips re-parsing the XER, re-running CPM, and
+    re-parsing/re-chunking/re-embedding the narrative and Special Provision
+    PDFs when this project was already seeded — those bytes are identical
+    to the original run, so redoing ingestion would just recreate data
+    that's already in Neo4j (and re-spend OpenAI embedding calls for
+    nothing). Falls back to a full reseed if no existing data is found
+    (self-healing for an edge case where the graph never got seeded).
     """
     start_time = datetime.now(timezone.utc)
     logger.info("=== Review started at %s ===", start_time.isoformat(timespec="seconds"))
 
-    # ── Parse XER -> CPM -> crosscheck ──────────────────────────────────────────
-    xer_text = schedule_bytes.decode("utf-8", errors="ignore")
-    parsed = parse_xer_all(xer_text)
-    activities = parsed["activities"]
-    calendars = parsed["calendars"]
-    project = parsed["project"]
-
-    # Non-fatal: on failure the review proceeds without computed CPM values.
-    cpm = xcheck = None
-    try:
-        cpm = run_cpm(build_network(activities), build_calendars(calendars), project)
-        xcheck = cross_check(activities, cpm)
-    except Exception:
-        logger.exception("CPM computation failed; review proceeds without computed values")
-
-    # ── Seed Neo4j (schedule + narrative), fenced to this project_id ───────────
     graph = get_neo4j()
-    seed_schedule(graph, activities, calendars, cpm, xcheck, project, project_id=project_id)
-
     embeddings = OpenAIEmbeddings(model=config.EMBEDDING_MODEL, api_key=config.OPENAI_API_KEY)
-    narrative_pages = _bytes_to_pdf_pages(narrative_bytes)
-    nar_chunks = chunk_narrative(narrative_pages)
-    nar_vectors = embeddings.embed_documents([c["content"] for c in nar_chunks]) if nar_chunks else []
-    # llm=None: entity extraction (Commitment/Permit/... nodes) is a Document
-    # Q&A enrichment, not needed for the checklist itself — the full narrative
-    # text (seeded regardless) is what evaluate_checks reads.
-    seed_narrative(graph, nar_chunks, nar_vectors, activities, project_id=project_id, llm=None)
 
-    sp_search_fn = _build_sp_search_fn(sp_bytes, embeddings)
+    if not reseed:
+        existing = graph.query(
+            "MATCH (a:Activity {projectId: $pid}) RETURN count(a) AS c LIMIT 1",
+            params={"pid": project_id},
+        )
+        reseed = not existing or not existing[0]["c"]
+        if reseed:
+            logger.warning(
+                "_run_review_pipeline: project_id=%s has no seeded graph data; "
+                "falling back to a full reseed", project_id,
+            )
+
+    if reseed:
+        # ── Parse XER -> CPM -> crosscheck ──────────────────────────────────
+        xer_text = schedule_bytes.decode("utf-8", errors="ignore")
+        parsed = parse_xer_all(xer_text)
+        activities = parsed["activities"]
+        calendars = parsed["calendars"]
+        project = parsed["project"]
+
+        # Non-fatal: on failure the review proceeds without computed CPM values.
+        cpm = xcheck = None
+        try:
+            cpm = run_cpm(build_network(activities), build_calendars(calendars), project)
+            xcheck = cross_check(activities, cpm)
+        except Exception:
+            logger.exception("CPM computation failed; review proceeds without computed values")
+
+        # ── Seed Neo4j (schedule + narrative + SP), fenced to this project_id ──
+        seed_schedule(graph, activities, calendars, cpm, xcheck, project, project_id=project_id)
+
+        narrative_pages = _bytes_to_pdf_pages(narrative_bytes)
+        nar_chunks = chunk_narrative(narrative_pages)
+        nar_vectors = embeddings.embed_documents([c["content"] for c in nar_chunks]) if nar_chunks else []
+        # llm=None: entity extraction (Commitment/Permit/... nodes) is a Document
+        # Q&A enrichment, not needed for the checklist itself — the full narrative
+        # text (seeded regardless) is what evaluate_checks reads.
+        seed_narrative(graph, nar_chunks, nar_vectors, activities, project_id=project_id, llm=None)
+
+        sp_search_fn = _build_sp_search_fn(sp_bytes, embeddings)
+        if sp_bytes:
+            # Persist chunks/embeddings so a later re-run can reuse them via
+            # search_special_provision instead of recreating them here.
+            sp_pages = _bytes_to_pdf_pages(sp_bytes)
+            sp_chunks = chunk_special_provision(sp_pages)
+            if sp_chunks:
+                sp_vectors = embeddings.embed_documents([c["content"] for c in sp_chunks])
+                seed_special_provision(graph, sp_chunks, sp_vectors, project_id=project_id)
+
+        project_name = (project or {}).get("project_name") or "Unknown"
+        duration_days = 0
+        if cpm is not None and cpm.data_date and cpm.project_finish:
+            duration_days = (cpm.project_finish - cpm.data_date).days
+    else:
+        # ── Fast path: project already seeded — reuse existing chunks ───────
+        project_name, duration_days = _read_project_summary(graph, project_id)
+        sp_search_fn = _build_sp_search_fn_from_graph(graph, embeddings, project_id)
 
     # ── Evaluate the checklist ───────────────────────────────────────────────────
     primary = ChatOpenAI(model=config.CHAT_MODEL, temperature=0, api_key=config.OPENAI_API_KEY)
@@ -260,13 +344,9 @@ def _run_review_pipeline(
         logger.exception("Compliance evaluation failed")
         raise HTTPException(status_code=502, detail=f"Compliance evaluation failed: {exc}") from exc
 
-    duration_days = 0
-    if cpm is not None and cpm.data_date and cpm.project_finish:
-        duration_days = (cpm.project_finish - cpm.data_date).days
-
     response = ReviewResponse(
         project_id=project_id,
-        project_name=(project or {}).get("project_name") or "Unknown",
+        project_name=project_name,
         project_duration_days=duration_days,
         summary=_summarize(check_results),
         checks=check_results,
@@ -280,8 +360,8 @@ def _run_review_pipeline(
     end_time = datetime.now(timezone.utc)
     elapsed = (end_time - start_time).total_seconds()
     logger.info(
-        "=== Review finished at %s (%.1fs elapsed) | started %s ===",
-        end_time.isoformat(timespec="seconds"), elapsed, start_time.isoformat(timespec="seconds"),
+        "=== Review finished at %s (%.1fs elapsed) | started %s | reseed=%s ===",
+        end_time.isoformat(timespec="seconds"), elapsed, start_time.isoformat(timespec="seconds"), reseed,
     )
 
     return _to_frontend_shape(response)
@@ -408,7 +488,9 @@ async def review_rerun_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch stored files: {exc}") from exc
 
-    result = _run_review_pipeline(schedule_bytes, narrative_bytes, sp_bytes, selected_checks, project_id)
+    result = _run_review_pipeline(
+        schedule_bytes, narrative_bytes, sp_bytes, selected_checks, project_id, reseed=False,
+    )
 
     db.table("review_projects").update({
         "review_result": result,

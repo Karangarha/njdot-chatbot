@@ -271,6 +271,9 @@ def seed_schedule(
     # can't store as a native property (no nested lists) — kept as a JSON string
     # and parsed back in graph_neo4j/tools.py's get_critical_path.
     summary = cpm.summary_dict() if cpm is not None else {}
+    duration_days = 0
+    if cpm is not None and cpm.data_date and cpm.project_finish:
+        duration_days = (cpm.project_finish - cpm.data_date).days
     project_props = {
         "projectId": project_id,
         "projectName": (project or {}).get("project_name") or (project or {}).get("project_code"),
@@ -281,6 +284,9 @@ def seed_schedule(
         "criticalCount": summary.get("critical_count"),
         "computedCount": summary.get("computed_count"),
         "warnings": summary.get("warnings", []),
+        # Precomputed so a re-run can read the duration straight back without
+        # re-parsing the XER / re-running CPM — see review.py's reseed=False path.
+        "durationDays": duration_days,
     }
     graph.query(
         "MERGE (p:Project {projectId: $projectId}) SET p += $props",
@@ -396,4 +402,43 @@ def seed_narrative(
         "mentions": len(mention_rows),
     }
     logger.info("seed_narrative: %s", stats)
+    return stats
+
+
+def seed_special_provision(
+    graph: Neo4jGraph,
+    chunks: List[Dict[str, Any]],
+    vectors: List[List[float]],
+    project_id: str = "default",
+) -> Dict[str, int]:
+    """Seed Special Provision chunks as SPChunk nodes, mirroring the
+    NarrativeChunk half of ``seed_narrative``.
+
+    Persisted once per project (instead of the old ephemeral in-process
+    search) so a re-run can reuse these chunks/embeddings via
+    ``graph_neo4j.tools.search_special_provision`` instead of re-parsing,
+    re-chunking, and re-embedding the SP PDF on every call. ``chunks``/
+    ``vectors`` are exactly what ``ingestion.session_chunker
+    .chunk_special_provision()`` + ``embeddings.embed_documents()`` produce
+    — must align 1:1 by index.
+    """
+    chunk_rows = [
+        {
+            "id": f"sp-{i}",
+            "content": c.get("content", ""),
+            "pagePdf": (c.get("metadata") or {}).get("page_pdf"),
+            "embedding": vectors[i] if i < len(vectors) else None,
+        }
+        for i, c in enumerate(chunks)
+    ]
+    if chunk_rows:
+        graph.query(
+            "UNWIND $rows AS row "
+            "MERGE (s:SPChunk {id: row.id, projectId: $projectId}) "
+            "SET s += row",
+            params={"rows": chunk_rows, "projectId": project_id},
+        )
+
+    stats = {"chunks": len(chunk_rows)}
+    logger.info("seed_special_provision: %s", stats)
     return stats

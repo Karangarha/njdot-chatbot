@@ -21,3 +21,8 @@ CREATE INDEX IF NOT EXISTS idx_review_projects_user
     ON review_projects (user_id, created_at DESC);
 
 GRANT ALL ON review_projects TO authenticated;
+-- service_role bypasses RLS but still needs table-level grants — needed by
+-- the backend's re-run endpoint, which reads/updates this table server-side
+-- via the service-role client (app.database.get_db), not the user's own
+-- authenticated session.
+GRANT ALL ON review_projects TO service_role;
