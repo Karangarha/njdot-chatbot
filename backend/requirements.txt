@@ -69,3 +69,11 @@ zstandard==0.25.0
 python-multipart
 xerparser
 networkx>=3.4
+
+# Neo4j + LangChain migration
+neo4j==6.2.0
+langchain==1.3.13
+langchain-openai==1.3.5
+langchain-anthropic==1.4.8
+langchain-neo4j==0.10.0
+numpy

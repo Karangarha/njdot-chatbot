@@ -1,24 +1,49 @@
 """POST /api/review — Schedule compliance review endpoint.
 
-Accepts two PDF uploads (schedule_pdf, narrative_pdf), converts them to
-base64, and sends them to GPT-4o (primary) or claude-sonnet-5
-(fallback) with a structured compliance-check prompt.  Returns a JSON
-compliance report with a "model_used" field indicating which model ran.
+Accepts a CPM schedule XER file, a narrative PDF, and an optional Special
+Provision PDF. Seeds the schedule + narrative into Neo4j under a fresh
+per-review ``project_id`` (multi-project isolation — see
+``graph_neo4j.tools``'s Cypher fencing and ``graph_neo4j.seed``'s
+composite-key ``MERGE`` writes) and runs the 56-check catalog
+through ``app.compliance.eval_engine.evaluate_checks``: one
+Pydantic-structured LLM call per check (GPT-4o primary, Claude fallback via
+LangChain's ``.with_fallbacks()``), replacing the old single-mega-prompt +
+manual JSON parsing.
+
+The Special Provision (if uploaded) is chunked and embedded in-process only
+— no persistence needed for a one-shot review, unlike the session-scoped
+Supabase retrieval Phase 6 uses for Document Q&A.
+
+Returns the frontend's pre-existing JSON contract via ``_to_frontend_shape``
+so ``DocumentReview.tsx`` needs no changes — only this adapter must track
+frontend field-shape changes going forward.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
-from datetime import datetime
+import tempfile
+import uuid
+from datetime import datetime, timezone
+from typing import Any, Callable, Dict, List, Optional
 
-import anthropic
-import openai
-from fastapi import APIRouter, File, HTTPException, UploadFile
+import numpy as np
+from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from langchain_anthropic import ChatAnthropic
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
-from app.ingestion.session_chunker import xer_to_markdown
+from app.auth import user_id_from_token, user_id_from_token_optional
+from app.compliance.catalog import BUILTIN_CHECKS, CheckDef
+from app.compliance.eval_engine import evaluate_checks
+from app.config import config
+from app.database import get_db
+from app.graph_neo4j.seed import seed_narrative, seed_schedule
+from app.ingestion.pdf_parser import PDFParser
+from app.ingestion.session_chunker import chunk_narrative, chunk_special_provision
+from app.models import ReviewCheckResult, ReviewResponse
+from app.neo4j_client import get_neo4j
 from app.scheduling import build_calendars, build_network, cross_check, run_cpm
 # Re-exported for backward compatibility (session.py and debug scripts import
 # these from app.api.review); canonical implementations live in app.scheduling.
@@ -33,310 +58,362 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["review"])
 
-_OPENAI_MODEL = "gpt-4o"
 _ANTHROPIC_MODEL = "claude-sonnet-5"
 
+_STORAGE_BUCKET = "review-files"
 
-_SYSTEM_PROMPT = """\
-You are an expert Construction Schedule Compliance Agent. Your objective is to evaluate Critical Path Method (CPM) project schedules against Department of Transportation (DOT) compliance rules.
-
-### 1. DATA CONTEXT: THE SCHEDULE MARKDOWN
-You are evaluating a Markdown document derived from a Primavera P6 (.xer) file. It is organized into these sections:
-
-**## Calendar** — project calendar name, working days (e.g., Mon–Fri), and holiday exception dates. Use this for all working-day and business-day calculations. If absent, assume a standard Mon–Fri calendar with US federal holidays.
-
-**## Critical Path** — the project's critical path(s) COMPUTED DETERMINISTICALLY by a CPM engine (forward/backward pass over the activity network), listed as ordered activity chains with computed start, finish, and total float. The project data date and computed project finish are stated here.
-
-**## CPM Validation** — a comparison of the CPM engine's computed values against the values stored in the P6 file, with a summary and per-activity mismatch rows.
-
-CRITICAL-PATH AUTHORITY RULE: when ## Critical Path and ## CPM Validation are present, their values and the Critical (Yes/No) and Float columns in the tables below are precomputed and authoritative. Do NOT recompute float, critical-path membership, project finish, or open ends yourself — read them from these sections. A float value shown as "N (P6: M)" means the engine computed N while the P6 file stores M; treat N as correct and the difference as a finding. Mismatches listed in ## CPM Validation indicate the schedule may not have been recalculated after edits or that float is being manipulated — evaluate them under the cpm_consistency check.
-
-**## Milestones** — table of zero-duration activities (ID | Name | Date | Float | Critical | Predecessors). Includes key dates: Advertisement (M100), Bid Opening, Award, Construction Start, Substantial Completion, Contract Completion.
-
-**## Activities with Negative Float** — all activities where computed float < 0, sorted ascending. Includes WBS phase path.
-
-**## Activities with Mandatory Constraints** — activities with date constraints applied (constraint type and date shown).
-
-**## Phase: [WBS Path]** — one section per WBS phase, containing a table of all activities: ID | Name | Start | Finish | Duration (days) | Float | Critical | Predecessors.
-
-Use activity IDs and names verbatim in your evidence. Every activity in the schedule appears in exactly one Phase section.
-
-### 2. EXECUTION CONSTRAINTS & WORKFLOW
-For EVERY rule specified under "CHECKS TO RUN", you must perform a strict sequential analysis in your internal scratchpad:
-1. **Locate Data:** Identify the relevant activities using names, types, or `wbs_path`.
-2. **Execute Reasoning:** Compare the data fields directly against the target constraint values. If checking a day of the week, inspect the day provided in the date string.
-3. **Determine Status:** Set to "pass", "fail", or "warning" based on objective comparison. If data required for a geographic or regional check is completely absent from the schedule, select "warning".
-4. **Extract Evidence:** Quote explicit identifiers, dates, paths, or values used to determine the result.
-
-### 3. OUTPUT SCHEMA
-Return ONLY a valid JSON object. Do not include markdown code fences. 
-
-{
-  "project_name": "<string or 'Unknown'>",
-  "project_duration_days": <number>,
-  "summary": {
-    "passed": <number>,
-    "warnings": <number>,
-    "failed": <number>,
-    "manual_review": <number>
-  },
-  "checks": [
-    {
-      "id": "<string>",
-      "category": "<string>",
-      "name": "<string>",
-      "reasoning": "<Step-by-step logic detailing how the schedule data matches or violates the specific rule parameters>",
-      "status": "pass" | "warning" | "fail",
-      "finding": "<A single clear sentence explaining why the check passed, failed, or generated a warning>",
-      "evidence": "<Direct quote or citation of relevant activity IDs, dates, durations, or paths used>"
-    }
-  ],
-  "manual_review_items": [<string>, ...]
-}
-
-### 4. RIGID EVALUATION RULES
-- **Completeness:** Every single item under "CHECKS TO RUN" must exist in the output `checks` array in the exact order listed.
-- **Strict Status Enums:** The `status` field must be exactly "pass", "warning", or "fail". No deviations.
-- **Weekday Verifications:** For `ad_date_day` and `bid_date_day`, if the explicit day string says "Tuesday" or "Thursday", the status is "pass". Other weekdays are "fail".
-- **Duration Calculation:** For `schedule_duration`, locate the start_date of M100 and end_date of M950. Calculate the duration. Do NOT include weekends or holidays. It must be under 3 years.
-- **Award to Construction:** For `award_to_construction`, determine project type. Timeframes must strictly be: 40 business days (State), 55 business days (Federal), or 25-55 business days (Pavement Preservation). Mark "warning" if project type is unknown.
-- **Substantial to Final Gap:** For `substantial_to_final`, determine the project budget. Ensure a 60-calendar-day gap for projects $50M or less, and a 90-day gap for projects over $50M. Mark "warning" if budget is unknown.
-- **Regional Completion:** For `substantial_regional_deadlines`, check geography. Substantial completion must be before October 1 for North of Route 195, and October 15 for South of Route 195. Mark "warning" if geography is unknown.
-- **Missing Data Fallback:** If a checklist rule cannot be evaluated due to missing context, mark status as "warning", state "Data unavailable for verification" in the finding, and "No data found" in evidence.
-- **Summary Congruence:** Summary counts must exactly equal the mathematical sum of the statuses in the `checks` array.
-
-### 5. CHECKS TO RUN
-
-CATEGORY: Administrative Dates
-- id: "schedule_duration", name: "Schedule Duration Under 3 Years (Exclude Weekends and Holidays)"
-- id: "ad_date_day", name: "Advertisement Date Falls on Tuesday or Thursday"
-- id: "bid_date_day", name: "Bid Date Falls on Tuesday or Thursday"
-- id: "ad_to_bid_gap", name: "15 Business Days: Advertisement to Bid"
-- id: "bid_to_award_gap", name: "15 Business Days: Bid to Award"
-- id: "award_to_construction", name: "Award to Construction Start Timeframe (40 days State / 55 days Federal / 25-55 days Pavement)"
-
-CATEGORY: Completion Milestones
-- id: "substantial_to_final", name: "Substantial to Final Completion Gap (60 Days <= $50M / 90 Days > $50M)"
-- id: "substantial_regional_deadlines", name: "Substantial Completion Before Oct 1 (North 195) or Oct 15 (South 195)"
-- id: "no_completion_in_winter", name: "Completion Dates Not Between Dec 15 and Mar 15"
-
-CATEGORY: Environmental, Landscape & Utilities
-- id: "row_availability", name: "ROW Availability Date Precedes Parcel Work"
-- id: "landscape_season", name: "Landscape/Planting Limited to Mar 1-May 15 or Aug 15-Dec 1"
-- id: "gas_interruption", name: "No Gas Service Interruptions Oct 1 to Apr 1"
-- id: "water_interruption", name: "No Water Service Interruptions Apr 1 to Sep 30"
-- id: "electric_interruption", name: "No Electric Service Interruptions Jun 1 to Sep 30"
-
-CATEGORY: Winter Restrictions
-- id: "no_concrete_winter", name: "No Concrete Activities Dec 15 – Mar 15"
-- id: "no_paving_winter", name: "No Paving Activities Dec 15 – Mar 15"
-
-CATEGORY: Working Drawings, Materials & ITS
-- id: "working_drawing_review_time", name: "Working Drawing Review Durations (30/45 Days)"
-- id: "steel_pole_lead_time", name: "Steel Traffic Signal Pole Fabrication Lead Time (4 Months)"
-- id: "aluminum_pole_lead_time", name: "Aluminum Lighting/Signal Pole Fabrication Lead Time (2 Months)"
-- id: "controller_lead_time", name: "Traffic Signal Controller Fabrication Lead Time (4 Months)"
-- id: "its_burn_in", name: "ITS New Installation Observation Period (6 Months)"
-
-CATEGORY: Schedule Logic
-- id: "no_negative_float", name: "No Negative Float Present"
-- id: "no_lag", name: "No Lag Present"
-- id: "no_open_ends", name: "No Open Ends Present"
-- id: "no_mandatory_constraints", name: "No Mandatory Constraints Applied"
-- id: "cpm_consistency", name: "P6 Stored Values Match Recomputed CPM (Schedule Recalculated)" — pass when ## CPM Validation reports zero or tolerance-only mismatches; fail when it reports float or date mismatches beyond tolerance (cite the affected activity IDs); warning when the ## CPM Validation section is absent.
-
-CATEGORY: Manual Review
-For each item below, evaluate what you can from the schedule JSON and the narrative PDF. Use "pass" if there is clear evidence in the documents that the requirement is met, "fail" if there is clear evidence of non-compliance, or "warning" if data is insufficient to make a determination.
-- id: "utility_alignment", name: "Utility Alignments Match Key Sheet and Special Provisions"
-- id: "environmental_permit", name: "Environmental Permit Compliance Beyond Narrative"
-- id: "edq_items", name: "EDQ Items Cross-Referenced for Missing Construction Activities"
-- id: "multi_year_funding", name: "Multi-Year Funding Logic Applied (SP 108.10)"
-- id: "nearby_projects", name: "No Conflicts with Nearby Construction Projects (105.06)"
-- id: "traffic_control_staging", name: "Traffic Control Staging Sequences Match Schedule Narrative"
-- id: "summer_shutdown", name: "Summer Shutdown Restrictions Applied (NJ Shore Routes)"
-"""
-
-_USER_TEXT = (
-    "Please perform the full compliance review on the two documents above "
-    "and return the JSON report as specified."
-)
+# EvaluationSchema's Pass/Fail/Missing -> the frontend's existing lowercase enum.
+_STATUS_MAP = {"Pass": "pass", "Fail": "fail", "Missing": "warning"}
 
 
-def _parse_json(raw_text: str, model_label: str) -> dict:
-    """Parse JSON from a model response, stripping markdown fences if needed."""
+# ── PDF helpers ──────────────────────────────────────────────────────────────
+
+def _bytes_to_pdf_pages(raw: bytes) -> List[Dict[str, Any]]:
+    """Write bytes to a temp file and extract pages via PDFParser."""
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
     try:
-        return json.loads(raw_text)
-    except json.JSONDecodeError:
-        stripped = raw_text.strip()
-        if stripped.startswith("```"):
-            stripped = stripped.split("\n", 1)[-1]
-            stripped = stripped.rsplit("```", 1)[0].strip()
+        return PDFParser(tmp_path).extract_text()
+    finally:
+        os.unlink(tmp_path)
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    va, vb = np.array(a), np.array(b)
+    denom = np.linalg.norm(va) * np.linalg.norm(vb)
+    return float(np.dot(va, vb) / denom) if denom else 0.0
+
+
+def _build_sp_search_fn(
+    sp_bytes: Optional[bytes], embeddings: OpenAIEmbeddings,
+) -> Optional[Callable[[str], str]]:
+    """In-process cosine-ranked Special Provision search.
+
+    No persistence needed for a one-shot review call — unlike Phase 6's
+    session-scoped Supabase retrieval (``retrieval_langchain.sp_retriever``),
+    used for Document Q&A where a session_id already exists.
+    """
+    if not sp_bytes:
+        return None
+    pages = _bytes_to_pdf_pages(sp_bytes)
+    chunks = chunk_special_provision(pages)
+    if not chunks:
+        return None
+    texts = [c["content"] for c in chunks]
+    vectors = embeddings.embed_documents(texts)
+
+    def _search(query: str, top_k: int = 5) -> str:
+        q_vec = embeddings.embed_query(query)
+        scored = sorted(zip(texts, vectors), key=lambda tv: -_cosine(q_vec, tv[1]))
+        top = [t for t, _ in scored[:top_k]]
+        return "\n\n---\n\n".join(top) if top else "No matching Special Provision text found."
+
+    return _search
+
+
+# ── Checklist selection ────────────────────────────────────────────────────────
+
+def _parse_checks(raw: Optional[str]) -> Optional[List[CheckDef]]:
+    """Parse the ``checks`` form field into a ``CheckDef`` list.
+
+    ``raw`` is a JSON array of ``{check_key, category, name, instruction,
+    source_files}`` (the frontend's effective checklist — built-ins plus any
+    user customizations). Returns ``None`` when ``raw`` is absent (caller
+    falls back to the full ``BUILTIN_CHECKS`` catalog, matching pre-Feature-1
+    behavior). Raises ``HTTPException(400)`` on malformed JSON, a non-array
+    payload, an empty array ("no checks selected"), or a check missing a
+    required field.
+    """
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="checks must be valid JSON") from exc
+    if not isinstance(parsed, list):
+        raise HTTPException(status_code=400, detail="checks must be a JSON array")
+    if len(parsed) == 0:
+        raise HTTPException(status_code=400, detail="No checks selected for review.")
+
+    checks: List[CheckDef] = []
+    for i, item in enumerate(parsed):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"checks[{i}] must be an object")
         try:
-            return json.loads(stripped)
-        except json.JSONDecodeError as exc:
-            logger.error("%s returned non-JSON response: %s", model_label, raw_text[:500])
+            checks.append(CheckDef(
+                check_key=item["check_key"],
+                category=item["category"],
+                name=item["name"],
+                instruction=item.get("instruction", ""),
+                source_files=item.get("source_files") or ["schedule"],
+            ))
+        except KeyError as exc:
             raise HTTPException(
-                status_code=500,
-                detail=f"{model_label} did not return valid JSON. The response could not be parsed.",
+                status_code=400, detail=f"checks[{i}] missing required field: {exc}",
             ) from exc
+    return checks
 
 
-def _call_openai(schedule_md: str, narrative_b64: str) -> dict:
-    """Send both documents to GPT-4o and return the parsed compliance report."""
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
+# ── Response shaping ──────────────────────────────────────────────────────────
 
-    client = openai.OpenAI(api_key=api_key)
+def _summarize(results: List[ReviewCheckResult]) -> Dict[str, int]:
+    return {
+        "passed": sum(1 for r in results if r.status == "Pass"),
+        "warnings": sum(1 for r in results if r.status == "Missing"),
+        "failed": sum(1 for r in results if r.status == "Fail"),
+        "manual_review": sum(1 for r in results if r.category == "Manual Review"),
+    }
 
-    response = client.chat.completions.create(
-        model=_OPENAI_MODEL,
-        temperature=0,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": _SYSTEM_PROMPT},
+
+def _to_frontend_shape(response: ReviewResponse) -> dict:
+    """Map the internal Pass/Fail/Missing + evidence/source shape onto the
+    frontend's existing pass/warning/fail + reasoning/finding/evidence shape.
+
+    ``schedule_file_path``/``narrative_pdf_path``/``special_provision_pdf_path``
+    are deliberately NOT included here — this function runs inside
+    ``_run_review_pipeline``, which is upload-agnostic (see its docstring);
+    callers that know the Storage paths merge them into this dict themselves.
+    """
+    return {
+        "project_id": response.project_id,
+        "project_name": response.project_name,
+        "project_duration_days": response.project_duration_days,
+        "model_used": response.model_used,
+        "summary": response.summary,
+        "checks": [
             {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Here is the schedule data in Markdown format:\n{schedule_md}",
-                    },
-                    {
-                        "type": "file",
-                        "file": {
-                            "filename": "narrative.pdf",
-                            "file_data": f"data:application/pdf;base64,{narrative_b64}",
-                        },
-                    },
-                    {"type": "text", "text": _USER_TEXT},
-                ],
-            },
-        ],
-    )
-
-    raw_text = response.choices[0].message.content or ""
-    return _parse_json(raw_text, "GPT-4o")
-
-
-def _call_anthropic(schedule_md: str, narrative_b64: str) -> dict:
-    """Send both documents to claude-sonnet-5 and return the parsed compliance report."""
-    api_key = os.getenv("ANTHROPIC_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("ANTHROPIC_API_KEY is not configured")
-
-    client = anthropic.Anthropic(api_key=api_key)
-
-    message = client.messages.create(
-        model=_ANTHROPIC_MODEL,
-        max_tokens=8192,
-        system=_SYSTEM_PROMPT,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": f"Here is the schedule data in Markdown format:\n{schedule_md}",
-                    },
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": narrative_b64,
-                        },
-                        "title": "Project Narrative",
-                    },
-                    {"type": "text", "text": _USER_TEXT},
-                ],
+                "id": c.id,
+                "category": c.category,
+                "name": c.name,
+                "reasoning": f"Source: {c.source}",
+                "status": _STATUS_MAP.get(c.status, "warning"),
+                "finding": c.evidence,
+                "evidence": c.evidence,
             }
+            for c in response.checks
         ],
+        "manual_review_items": response.manual_review_items,
+    }
+
+
+def _run_review_pipeline(
+    schedule_bytes: bytes,
+    narrative_bytes: bytes,
+    sp_bytes: Optional[bytes],
+    selected_checks: Optional[List[CheckDef]],
+    project_id: str,
+) -> dict:
+    """Parse -> CPM -> seed Neo4j -> evaluate the checklist -> frontend shape.
+
+    Shared by the initial upload endpoint and the rerun endpoint — the only
+    difference between them is where the three byte blobs come from (a fresh
+    multipart upload vs. downloaded from Storage). ``project_id`` fences every
+    Neo4j node written/read this call to one project — see graph_neo4j's
+    multi-project isolation design (no wipe step: MERGE-based writes are
+    idempotent, and a project's schedule bytes never change between re-runs).
+    """
+    start_time = datetime.now(timezone.utc)
+    logger.info("=== Review started at %s ===", start_time.isoformat(timespec="seconds"))
+
+    # ── Parse XER -> CPM -> crosscheck ──────────────────────────────────────────
+    xer_text = schedule_bytes.decode("utf-8", errors="ignore")
+    parsed = parse_xer_all(xer_text)
+    activities = parsed["activities"]
+    calendars = parsed["calendars"]
+    project = parsed["project"]
+
+    # Non-fatal: on failure the review proceeds without computed CPM values.
+    cpm = xcheck = None
+    try:
+        cpm = run_cpm(build_network(activities), build_calendars(calendars), project)
+        xcheck = cross_check(activities, cpm)
+    except Exception:
+        logger.exception("CPM computation failed; review proceeds without computed values")
+
+    # ── Seed Neo4j (schedule + narrative), fenced to this project_id ───────────
+    graph = get_neo4j()
+    seed_schedule(graph, activities, calendars, cpm, xcheck, project, project_id=project_id)
+
+    embeddings = OpenAIEmbeddings(model=config.EMBEDDING_MODEL, api_key=config.OPENAI_API_KEY)
+    narrative_pages = _bytes_to_pdf_pages(narrative_bytes)
+    nar_chunks = chunk_narrative(narrative_pages)
+    nar_vectors = embeddings.embed_documents([c["content"] for c in nar_chunks]) if nar_chunks else []
+    # llm=None: entity extraction (Commitment/Permit/... nodes) is a Document
+    # Q&A enrichment, not needed for the checklist itself — the full narrative
+    # text (seeded regardless) is what evaluate_checks reads.
+    seed_narrative(graph, nar_chunks, nar_vectors, activities, project_id=project_id, llm=None)
+
+    sp_search_fn = _build_sp_search_fn(sp_bytes, embeddings)
+
+    # ── Evaluate the checklist ───────────────────────────────────────────────────
+    primary = ChatOpenAI(model=config.CHAT_MODEL, temperature=0, api_key=config.OPENAI_API_KEY)
+    fallback = ChatAnthropic(model=_ANTHROPIC_MODEL, anthropic_api_key=config.ANTHROPIC_API_KEY)
+    llm = primary.with_fallbacks([fallback])
+
+    try:
+        check_results = evaluate_checks(
+            selected_checks or BUILTIN_CHECKS, graph, llm,
+            sp_search_fn=sp_search_fn, project_id=project_id,
+        )
+    except Exception as exc:
+        logger.exception("Compliance evaluation failed")
+        raise HTTPException(status_code=502, detail=f"Compliance evaluation failed: {exc}") from exc
+
+    duration_days = 0
+    if cpm is not None and cpm.data_date and cpm.project_finish:
+        duration_days = (cpm.project_finish - cpm.data_date).days
+
+    response = ReviewResponse(
+        project_id=project_id,
+        project_name=(project or {}).get("project_name") or "Unknown",
+        project_duration_days=duration_days,
+        summary=_summarize(check_results),
+        checks=check_results,
+        manual_review_items=[c.name for c in check_results if c.category == "Manual Review"],
+        # .with_fallbacks() resolves per-call; a single top-level label can't
+        # capture "some checks fell back to Claude" — reporting the primary
+        # model here is a reasonable simplification for this metadata field.
+        model_used=config.CHAT_MODEL,
     )
 
-    # Adaptive thinking may prepend thinking blocks — take text blocks only.
-    raw_text = "\n".join(b.text for b in message.content if b.type == "text").strip()
-    return _parse_json(raw_text, "Claude")
+    end_time = datetime.now(timezone.utc)
+    elapsed = (end_time - start_time).total_seconds()
+    logger.info(
+        "=== Review finished at %s (%.1fs elapsed) | started %s ===",
+        end_time.isoformat(timespec="seconds"), elapsed, start_time.isoformat(timespec="seconds"),
+    )
+
+    return _to_frontend_shape(response)
 
 
 @router.post(
     "/review",
     summary="Schedule compliance review",
     description=(
-        "Accepts a CPM schedule XER file and a narrative PDF, sends both to GPT-4o "
-        "(with Claude as fallback) for compliance analysis, and returns a "
-        "structured JSON report with a 'model_used' field."
+        "Accepts a CPM schedule XER file, a narrative PDF, and an optional "
+        "Special Provision PDF. Runs the 56-check NJDOT compliance checklist "
+        "against a Neo4j-backed knowledge graph (GPT-4o primary, Claude "
+        "fallback) and returns a structured JSON report."
     ),
 )
 async def review_endpoint(
     schedule_file: UploadFile = File(..., description="CPM schedule XER file"),
     narrative_pdf: UploadFile = File(..., description="Project narrative PDF"),
+    special_provision_pdf: Optional[UploadFile] = File(
+        None, description="Optional Special Provision PDF"),
+    checks: Optional[str] = Form(
+        None,
+        description="Optional JSON array of the checks to run "
+                     "({check_key, category, name, instruction, source_files}). "
+                     "When omitted, the full built-in 56-check catalog runs.",
+    ),
+    authorization: Optional[str] = Header(default=None),
 ) -> dict:
-    """Run a schedule compliance review against NJDOT requirements."""
-    # ── Read and encode files ──────────────────────────────────────────────────
+    """Run a schedule compliance review against NJDOT requirements.
+
+    Usable signed-out (``authorization`` absent or invalid just means the
+    review isn't persisted to Storage — see ``user_id_from_token_optional``).
+    Generates the ``project_id`` that fences this review's Neo4j data and,
+    for signed-in callers, doubles as the Storage path prefix and the
+    ``review_projects.id`` the frontend inserts under (backend-led upload —
+    the frontend never talks to Storage directly, avoiding a double upload
+    of the same file bytes).
+    """
+    selected_checks = _parse_checks(checks)
+    project_id = str(uuid.uuid4())
+
     try:
         schedule_bytes = await schedule_file.read()
         narrative_bytes = await narrative_pdf.read()
+        sp_bytes = await special_provision_pdf.read() if special_provision_pdf else None
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to read uploaded files: {exc}") from exc
 
-    # Parse XER → CPM → Markdown (used by both LLM calls)
-    xer_text      = schedule_bytes.decode("utf-8", errors="ignore")
-    parsed        = parse_xer_all(xer_text)
-    schedule_json = parsed["activities"]
-    calendars     = parsed["calendars"]
-    project       = parsed["project"]
-
-    # Deterministic CPM pass + cross-check against P6-stored values.
-    # Non-fatal: on failure the review degrades to the plain markdown the
-    # pipeline produced before the CPM engine existed.
-    cpm = xcheck = None
-    try:
-        cpm = run_cpm(build_network(schedule_json), build_calendars(calendars), project)
-        xcheck = cross_check(schedule_json, cpm)
-    except Exception:
-        logger.exception("CPM computation failed; review proceeds without computed values")
-
-    schedule_md = xer_to_markdown(schedule_json, calendars,
-                                  cpm=cpm, crosscheck=xcheck, project=project)
-
-    # Encode PDF
-    narrative_b64 = base64.standard_b64encode(narrative_bytes).decode("utf-8")
-
-    # ── Primary: GPT-4o ───────────────────────────────────────────────────────
-    model_used = _OPENAI_MODEL
-    try:
-        result = _call_openai(schedule_md, narrative_b64)
-        logger.info("Review completed via %s", _OPENAI_MODEL)
-    except HTTPException:
-        # JSON parse failure from OpenAI — propagate immediately, no fallback needed
-        raise
-    except Exception as openai_exc:
-        logger.warning(
-            "OpenAI call failed (%s: %s), falling back to %s",
-            type(openai_exc).__name__,
-            openai_exc,
-            _ANTHROPIC_MODEL,
-        )
-        # ── Fallback: Claude ──────────────────────────────────────────────────
-        model_used = _ANTHROPIC_MODEL
+    user_id = user_id_from_token_optional(authorization)
+    schedule_path = narrative_path = sp_path = None
+    if user_id:
         try:
-            result = _call_anthropic(schedule_md, narrative_b64)
-            logger.info("Review completed via %s (fallback)", _ANTHROPIC_MODEL)
-        except HTTPException:
-            raise
-        except Exception as anthropic_exc:
-            logger.exception("Both OpenAI and Anthropic calls failed")
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Both AI providers failed. "
-                    f"OpenAI: {type(openai_exc).__name__}: {openai_exc}. "
-                    f"Anthropic: {type(anthropic_exc).__name__}: {anthropic_exc}."
-                ),
-            ) from anthropic_exc
+            db = get_db()
+            bucket = db.storage.from_(_STORAGE_BUCKET)
+            base = f"{user_id}/{project_id}"
+            schedule_path = f"{base}/schedule.xer"
+            bucket.upload(schedule_path, schedule_bytes, {"upsert": "true"})
+            narrative_path = f"{base}/narrative.pdf"
+            bucket.upload(narrative_path, narrative_bytes, {"upsert": "true"})
+            if sp_bytes:
+                sp_path = f"{base}/special_provision.pdf"
+                bucket.upload(sp_path, sp_bytes, {"upsert": "true"})
+        except Exception:
+            # Best-effort — "Re-run" just won't be offered for this project;
+            # the review itself should still succeed.
+            logger.exception("Failed to persist review files to Storage for project_id=%s", project_id)
+            schedule_path = narrative_path = sp_path = None
 
-    # ── Finalise response ─────────────────────────────────────────────────────
-    result["model_used"] = model_used
+    result = _run_review_pipeline(schedule_bytes, narrative_bytes, sp_bytes, selected_checks, project_id)
+    result["schedule_file_path"] = schedule_path
+    result["narrative_pdf_path"] = narrative_path
+    result["special_provision_pdf_path"] = sp_path
+    return result
+
+
+@router.post(
+    "/review/{project_id}/rerun",
+    summary="Re-run a past schedule compliance review",
+    description=(
+        "Re-executes a previously saved review's original files (fetched "
+        "from Storage — no re-upload needed), optionally against an edited "
+        "checklist. Overwrites the review_projects row's review_result in "
+        "place. Requires the caller's Supabase JWT to match the project's "
+        "owner."
+    ),
+)
+async def review_rerun_endpoint(
+    project_id: str,
+    authorization: Optional[str] = Header(default=None),
+    checks: Optional[str] = Form(
+        None,
+        description="Optional JSON array of the checks to run, same shape as "
+                     "POST /api/review. Omit to re-run the full built-in catalog.",
+    ),
+) -> dict:
+    """Re-run a saved review against its stored files, without re-uploading."""
+    user_id = user_id_from_token(authorization)
+    selected_checks = _parse_checks(checks)
+
+    db = get_db()
+    rows = (
+        db.table("review_projects").select("*").eq("id", project_id).limit(1).execute().data
+    ) or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Review project not found")
+    row = rows[0]
+    if row.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="This review does not belong to you")
+
+    schedule_path = row.get("schedule_file_path")
+    narrative_path = row.get("narrative_pdf_path")
+    sp_path = row.get("special_provision_pdf_path")
+    if not schedule_path or not narrative_path:
+        raise HTTPException(
+            status_code=400,
+            detail="Original files for this review are not available — re-upload once to enable re-run.",
+        )
+
+    try:
+        bucket = db.storage.from_(_STORAGE_BUCKET)
+        schedule_bytes = bucket.download(schedule_path)
+        narrative_bytes = bucket.download(narrative_path)
+        sp_bytes = bucket.download(sp_path) if sp_path else None
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch stored files: {exc}") from exc
+
+    result = _run_review_pipeline(schedule_bytes, narrative_bytes, sp_bytes, selected_checks, project_id)
+
+    db.table("review_projects").update({
+        "review_result": result,
+        "project_name": result.get("project_name") or row.get("project_name"),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("id", project_id).execute()
 
     return result

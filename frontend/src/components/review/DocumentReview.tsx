@@ -5,7 +5,9 @@ import { createClient } from '@/lib/supabase/client'
 import jsPDF from 'jspdf'
 import autoTable from 'jspdf-autotable'
 import SessionChat from './SessionChat'
-import type { ReviewProject } from '@/lib/types'
+import ChecklistManager from './ChecklistManager'
+import { getEffectiveChecks, toCheckSpecs } from '@/lib/checklist'
+import type { ComplianceCheck, ReviewProject } from '@/lib/types'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -20,6 +22,7 @@ interface CheckItem {
 }
 
 interface ReviewResult {
+  project_id: string
   project_name: string
   project_duration_days: number
   model_used: string
@@ -31,6 +34,9 @@ interface ReviewResult {
   }
   checks: CheckItem[]
   manual_review_items: string[]
+  schedule_file_path?: string | null
+  narrative_pdf_path?: string | null
+  special_provision_pdf_path?: string | null
 }
 
 interface DocumentReviewProps {
@@ -46,9 +52,10 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
 const SECTION_CATEGORIES: Record<string, string[]> = {
   'Administrative & Milestones': ['Administrative Dates', 'Completion Milestones'],
-  'Environmental, Landscape & Utilities': ['Environmental, Landscape & Utilities', 'Winter Restrictions'],
+  'Environmental, Landscape & Utilities': ['Environmental, Landscape & Utilities', 'Winter Restrictions', 'Weather Restrictions'],
   'Working Drawings, Materials & ITS': ['Working Drawings, Materials & ITS'],
   'Schedule Logic': ['Schedule Logic'],
+  "Designer's Narrative": ["Designer's Narrative"],
   'Manual Review': ['Manual Review'],
 }
 
@@ -57,6 +64,7 @@ const SECTION_ORDER = [
   'Environmental, Landscape & Utilities',
   'Working Drawings, Materials & ITS',
   'Schedule Logic',
+  "Designer's Narrative",
   'Manual Review',
 ]
 
@@ -239,11 +247,25 @@ export default function DocumentReview({
   const [expanded,      setExpanded]      = useState<Record<string, boolean>>(
     Object.fromEntries(SECTION_ORDER.map(s => [s, true]))
   )
+  const [effectiveChecks, setEffectiveChecks] = useState<ComplianceCheck[]>([])
+  const [checklistOpen,   setChecklistOpen]   = useState(false)
+  const [isRerunning,     setIsRerunning]     = useState(false)
+  const [rerunError,      setRerunError]      = useState<string | null>(null)
 
   const scheduleRef       = useRef<HTMLInputElement>(null)
   const narrativeRef      = useRef<HTMLInputElement>(null)
   const spRef             = useRef<HTMLInputElement>(null)
   const currentProjectRef = useRef<string | null>(null)
+  // Synchronous re-entrancy guards — refs update instantly (unlike state),
+  // so they catch a fast double-click that fires both `click` events before
+  // the isLoading/isRerunning state update has re-rendered the button away.
+  const submittingRef = useRef(false)
+  const rerunningRef  = useRef(false)
+
+  // ── Load the user's effective checklist (built-ins or their own fork) ──────
+  useEffect(() => {
+    getEffectiveChecks(userId).then(setEffectiveChecks)
+  }, [userId])
 
   // ── Load selected project from DB when parent changes selection ────────────
   useEffect(() => {
@@ -306,6 +328,16 @@ export default function DocumentReview({
 
   const runReview = async () => {
     if (!scheduleFile || !narrativeFile) return
+    if (submittingRef.current) return   // guards a fast double-click race
+    submittingRef.current = true
+
+    const specs = toCheckSpecs(effectiveChecks)
+    if (userId && effectiveChecks.length > 0 && specs.length === 0) {
+      setError('No checks are selected to run. Open "Manage Checklist" and enable at least one.')
+      submittingRef.current = false
+      return
+    }
+
     setIsLoading(true)
     setError(null)
 
@@ -321,6 +353,8 @@ export default function DocumentReview({
       const reviewForm = new FormData()
       reviewForm.append('schedule_file', scheduleFile)
       reviewForm.append('narrative_pdf', narrativeFile)
+      if (spFile) reviewForm.append('special_provision_pdf', spFile)
+      if (specs.length > 0) reviewForm.append('checks', JSON.stringify(specs))
 
       const sessionForm = new FormData()
       sessionForm.append('narrative_pdf', narrativeFile)
@@ -343,15 +377,25 @@ export default function DocumentReview({
       setResult(data)
 
       // ── Save review result to DB ──────────────────────────────────────────
+      // The backend already uploaded the original files to Storage (when
+      // signed in) and generated project_id — see /api/review's
+      // backend-led upload. We just insert one row using that same id as
+      // the primary key, so Neo4j's projectId === review_projects.id from
+      // the very first run. No frontend Storage access, no second upload
+      // of the same bytes, no follow-up PATCH.
       let savedProjectId: string | null = null
       if (userId) {
         const { data: saved } = await sb
           .from('review_projects')
           .insert({
-            user_id:       userId,
-            project_name:  data.project_name || 'Untitled Project',
-            review_result: data,
-            session_id:    null,
+            id:                          data.project_id,
+            user_id:                     userId,
+            project_name:                data.project_name || 'Untitled Project',
+            review_result:               data,
+            session_id:                  null,
+            schedule_file_path:          data.schedule_file_path ?? null,
+            narrative_pdf_path:          data.narrative_pdf_path ?? null,
+            special_provision_pdf_path:  data.special_provision_pdf_path ?? null,
           })
           .select()
           .single()
@@ -376,6 +420,57 @@ export default function DocumentReview({
       setError(err instanceof Error ? err.message : 'An unexpected error occurred.')
     } finally {
       setIsLoading(false)
+      submittingRef.current = false
+    }
+  }
+
+  const handleRerun = async () => {
+    const projectId = currentProjectRef.current
+    if (!projectId || rerunningRef.current) return
+    rerunningRef.current = true
+
+    const specs = toCheckSpecs(effectiveChecks)
+    if (effectiveChecks.length > 0 && specs.length === 0) {
+      setRerunError('No checks are selected to run. Open "Manage Checklist" and enable at least one.')
+      rerunningRef.current = false
+      return
+    }
+
+    setIsRerunning(true)
+    setRerunError(null)
+    try {
+      const sb = createClient()
+      let { data: { session } } = await sb.auth.getSession()
+      // getSession() should auto-refresh an expired token, but fall back to
+      // an explicit refresh if it still came back empty rather than silently
+      // sending the request with no Authorization header (guaranteed 401).
+      if (!session?.access_token) {
+        const refreshed = await sb.auth.refreshSession()
+        session = refreshed.data.session
+      }
+      if (!session?.access_token) {
+        throw new Error('Your session has expired. Please sign in again and retry.')
+      }
+
+      const form = new FormData()
+      if (specs.length > 0) form.append('checks', JSON.stringify(specs))
+
+      const res = await fetch(`${API_BASE}/api/review/${projectId}/rerun`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${session.access_token}` },
+        body: form,
+      })
+      if (!res.ok) {
+        let detail = `Request failed with status ${res.status}`
+        try { const b = await res.json(); if (typeof b.detail === 'string') detail = b.detail } catch {}
+        throw new Error(detail)
+      }
+      setResult(await res.json() as ReviewResult)
+    } catch (err) {
+      setRerunError(err instanceof Error ? err.message : 'An unexpected error occurred.')
+    } finally {
+      setIsRerunning(false)
+      rerunningRef.current = false
     }
   }
 
@@ -384,6 +479,7 @@ export default function DocumentReview({
   if (result) {
     const { summary, checks, project_name, project_duration_days, model_used } = result
     return (
+      <>
       <div className="h-full flex flex-col bg-[#F5F5F5]">
 
         {/* Header */}
@@ -399,6 +495,21 @@ export default function DocumentReview({
               )}
             </div>
             <div className="flex items-center gap-2 shrink-0">
+              {currentProjectRef.current && (
+                <button onClick={() => setChecklistOpen(true)} disabled={isRerunning}
+                  className="flex items-center gap-1.5 rounded-lg border border-[#E8E8E8] bg-white px-3 py-2 text-xs font-semibold text-gray-600 shadow-sm hover:border-[#1B3A6B]/30 hover:text-[#1B3A6B] transition-colors disabled:opacity-50">
+                  Manage Checklist
+                </button>
+              )}
+              {currentProjectRef.current && (
+                <button onClick={handleRerun} disabled={isRerunning}
+                  className="flex items-center gap-1.5 rounded-lg border border-[#E8E8E8] bg-white px-3 py-2 text-xs font-semibold text-gray-600 shadow-sm hover:border-[#1B3A6B]/30 hover:text-[#1B3A6B] transition-colors disabled:opacity-50">
+                  <svg className={`h-3.5 w-3.5 ${isRerunning ? 'animate-spin' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+                  </svg>
+                  {isRerunning ? 'Re-running…' : 'Re-run Review'}
+                </button>
+              )}
               <button onClick={handleDownloadPdf}
                 className="flex items-center gap-1.5 rounded-lg bg-[#1B3A6B] px-3 py-2 text-xs font-semibold text-white shadow-sm hover:bg-[#12264a] transition-colors">
                 <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -406,7 +517,7 @@ export default function DocumentReview({
                 </svg>
                 Download PDF
               </button>
-              <button onClick={() => { setResult(null); setSessionId(null); onNewReview?.() }}
+              <button onClick={() => { setResult(null); setSessionId(null); setRerunError(null); onNewReview?.() }}
                 className="flex items-center gap-1.5 rounded-lg border border-[#E8E8E8] bg-white px-3 py-2 text-xs font-semibold text-gray-600 shadow-sm hover:border-[#1B3A6B]/30 hover:text-[#1B3A6B] transition-colors">
                 <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
                   <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
@@ -415,6 +526,12 @@ export default function DocumentReview({
               </button>
             </div>
           </div>
+
+          {rerunError && (
+            <div className="mt-3 flex items-start gap-2 rounded-lg border border-red-200 bg-red-50 px-3 py-2">
+              <p className="text-[11px] text-red-700 leading-relaxed">{rerunError}</p>
+            </div>
+          )}
 
           {/* Summary pills */}
           <div className="mt-3 flex flex-wrap gap-2">
@@ -466,6 +583,15 @@ export default function DocumentReview({
           </div>
         )}
       </div>
+
+      {checklistOpen && (
+        <ChecklistManager
+          userId={userId}
+          onChange={setEffectiveChecks}
+          onClose={() => setChecklistOpen(false)}
+        />
+      )}
+      </>
     )
   }
 
@@ -475,11 +601,20 @@ export default function DocumentReview({
     <div className="h-full overflow-y-auto bg-[#F5F5F5]">
       <div className="mx-auto max-w-2xl px-5 py-10">
 
-        <div className="mb-1 flex items-center gap-2">
-          <h2 className="text-lg font-bold text-[#1B3A6B]">Document Review</h2>
-          <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-700">
-            Beta Testing
-          </span>
+        <div className="mb-1 flex items-center justify-between gap-2">
+          <div className="flex items-center gap-2">
+            <h2 className="text-lg font-bold text-[#1B3A6B]">Document Review</h2>
+            <span className="rounded-full bg-amber-100 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-amber-700">
+              Beta Testing
+            </span>
+          </div>
+          <button onClick={() => setChecklistOpen(true)}
+            className="flex items-center gap-1.5 rounded-lg border border-[#E8E8E8] bg-white px-3 py-1.5 text-xs font-semibold text-gray-600 shadow-sm hover:border-[#1B3A6B]/30 hover:text-[#1B3A6B] transition-colors">
+            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9 12h3.75M9 15h3.75M9 18h3.75m3 .75H18a2.25 2.25 0 002.25-2.25V6.108c0-1.135-.845-2.098-1.976-2.192a48.424 48.424 0 00-1.123-.08m-5.801 0c-.065.21-.1.433-.1.664 0 .414.336.75.75.75h4.5a.75.75 0 00.75-.75 2.25 2.25 0 00-.1-.664m-5.8 0A2.251 2.251 0 0113.5 2.25H15c1.012 0 1.867.668 2.15 1.586m-5.8 0c-.376.023-.75.05-1.124.08C9.095 4.01 8.25 4.973 8.25 6.108V8.25m0 0H4.875c-.621 0-1.125.504-1.125 1.125v11.25c0 .621.504 1.125 1.125 1.125h9.75c.621 0 1.125-.504 1.125-1.125V9.375c0-.621-.504-1.125-1.125-1.125H8.25z" />
+            </svg>
+            Manage Checklist
+          </button>
         </div>
         <p className="mb-8 text-sm text-gray-500">
           Upload the CPM schedule (.xer), designer narrative, and optionally a Special Provision PDF
@@ -557,6 +692,14 @@ export default function DocumentReview({
         )}
 
       </div>
+
+      {checklistOpen && (
+        <ChecklistManager
+          userId={userId}
+          onChange={setEffectiveChecks}
+          onClose={() => setChecklistOpen(false)}
+        />
+      )}
     </div>
   )
 }

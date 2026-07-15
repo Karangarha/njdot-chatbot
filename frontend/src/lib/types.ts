@@ -45,6 +45,37 @@ export interface ReviewProject {
   session_id: string | null
   project_name: string
   review_result: any
+  schedule_file_path?: string | null
+  narrative_pdf_path?: string | null
+  special_provision_pdf_path?: string | null
   created_at: string
   updated_at: string
+}
+
+// Which document(s) a check draws evidence from — any combination.
+export type SourceFile = 'schedule' | 'narrative' | 'sp'
+
+export interface ComplianceCheck {
+  id: string
+  user_id: string | null
+  check_key: string
+  category: string
+  name: string
+  instruction: string
+  check_type: string
+  source_files: SourceFile[]
+  is_builtin: boolean
+  enabled: boolean
+  sort_order: number
+  created_at: string
+  updated_at: string
+}
+
+// Enabled-only payload sent as the `checks` form field on POST /api/review.
+export interface CheckSpec {
+  check_key: string
+  category: string
+  name: string
+  instruction: string
+  source_files: SourceFile[]
 }

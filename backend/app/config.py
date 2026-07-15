@@ -59,12 +59,21 @@ class Config:
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSIONS: int = 1536
 
+    # Neo4j (local Desktop instance — see backend/app/neo4j_client.py)
+    NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    NEO4J_USERNAME: str = os.getenv("NEO4J_USERNAME", "neo4j")
+    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "")
+    NEO4J_DATABASE: str = os.getenv("NEO4J_DATABASE", "neo4j")
+
     @classmethod
     def validate(cls) -> bool:
         """Validate required configuration."""
         required = {
             "SUPABASE_URL": cls.SUPABASE_URL,
             "SUPABASE_SERVICE_ROLE_KEY": cls.SUPABASE_SERVICE_ROLE_KEY,
+            "NEO4J_URI": cls.NEO4J_URI,
+            "NEO4J_USERNAME": cls.NEO4J_USERNAME,
+            "NEO4J_PASSWORD": cls.NEO4J_PASSWORD,
         }
         if not cls.USE_LOCAL_LLM:
             required["OPENAI_API_KEY"] = cls.OPENAI_API_KEY

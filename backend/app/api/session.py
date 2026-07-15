@@ -1,27 +1,29 @@
 """Session-scoped document upload and Q&A endpoints.
 
 Architecture (hybrid): the Special Provision is served by hybrid RAG
-(embeddings in session_chunks); the schedule (XER) and designer narrative are
-served by GraphRAG — a CPM-computed knowledge graph in session_graphs, read
-at query time via an always-injected digest plus LLM graph tools.
+(embeddings in Supabase ``session_chunks``); the schedule (XER) and designer
+narrative are served by GraphRAG — a CPM-computed knowledge graph in Neo4j
+(``project_id`` = ``session_id``), read at query time via an always-injected
+digest plus a LangChain tool-calling agent (``create_agent``).
 
 POST /api/session/upload
     Accepts narrative_pdf, special_provision_pdf, and/or xer_file.
-    SP is chunked+embedded; XER runs through the deterministic CPM engine and
-    becomes a knowledge graph; the narrative is sectioned + entity-extracted
-    into the same graph. Returns {session_id, status: "processing"} immediately.
+    SP is chunked+embedded into Supabase; XER runs through the deterministic
+    CPM engine and is seeded into Neo4j; the narrative is sectioned +
+    entity-extracted into the same graph. Returns {session_id, status:
+    "processing"} immediately.
 
 GET /api/session/status/{session_id}
     SSE stream of ingestion progress events.
     Closes when status reaches "ready" or "error".
 
 POST /api/session/query
-    Vector search over SP chunks + the permanent scheduling collection, plus
-    the graph digest and a tool-use loop over the knowledge graph, then an
-    LLM answer. Returns {answer, sources}.
+    Vector search over the permanent scheduling collection (pre-fetched
+    context) plus a tool-calling agent with access to the Neo4j knowledge
+    graph and Special Provision retrieval. Returns {answer, sources}.
 
-Required Supabase setup — run migrate_session_chunks.sql and
-migrate_session_graphs.sql once.
+Required setup — run migrate_session_chunks.sql once (Supabase); Neo4j
+Desktop must be running (see app.neo4j_client).
 """
 
 from __future__ import annotations
@@ -34,24 +36,26 @@ import tempfile
 import uuid
 from typing import Any, Dict, List, Optional
 
-import openai
 from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from langchain.agents import create_agent
+from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from pydantic import BaseModel
 
 from app.config   import config
 from app.database import get_db
 from app.generation.llm_client       import LLMClient
+from app.graph_neo4j import build_digest, build_tools, clear_project, seed_narrative, seed_schedule
 from app.ingestion.embedder          import Embedder
 from app.ingestion.pdf_parser        import PDFParser
 from app.ingestion.session_chunker   import (
     chunk_narrative,
     chunk_special_provision,
 )
-from app.generation.tool_loop import run_tool_loop
-from app.graph        import add_narrative_to_graph, build_graph, load_graph, save_graph
-from app.graph.digest import build_digest
-from app.graph.tools  import bind_graph_tools
+from app.neo4j_client import get_neo4j
+from app.retrieval_langchain.sp_retriever import build_sp_tool, retrieve_sp_chunks
 from app.scheduling import (
     build_calendars,
     build_network,
@@ -64,6 +68,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/session", tags=["session"])
 
 _DB_BATCH = 50
+_ANTHROPIC_MODEL = "claude-sonnet-5"
 
 # ── In-process progress store ──────────────────────────────────────────────────
 # Dict is GIL-protected in CPython; safe for single-process FastAPI deploys.
@@ -129,6 +134,15 @@ def _insert_chunks(db: Any, session_id: str, chunks: List[Dict[str, Any]]) -> No
         db.table("session_chunks").insert(rows[i : i + _DB_BATCH]).execute()
 
 
+def _has_graph(graph: Any, session_id: str) -> bool:
+    """Whether any node was seeded into Neo4j for this session (schedule or
+    narrative-only — narrative-only sessions have no Project node)."""
+    rows = graph.query(
+        "MATCH (n {projectId: $sid}) RETURN n LIMIT 1", params={"sid": session_id},
+    )
+    return bool(rows)
+
+
 # ── Background ingestion ───────────────────────────────────────────────────────
 
 def _process_session(
@@ -138,27 +152,29 @@ def _process_session(
     xer_bytes:       Optional[bytes],
 ) -> None:
     """
-    Hybrid ingestion (GraphRAG cutover):
-      - Special Provision → chunk → embed → session_chunks (hybrid RAG path)
-      - Schedule (XER) + Designer Narrative → CPM engine + knowledge graph
-        (session_graphs); NOT embedded — Q&A reads them via the graph digest
-        and graph tools.
+    Hybrid ingestion:
+      - Special Provision -> chunk -> embed -> Supabase session_chunks (hybrid RAG path)
+      - Schedule (XER) + Designer Narrative -> CPM engine + Neo4j knowledge
+        graph (project_id = session_id); Q&A reads them via the graph digest
+        and a LangChain tool-calling agent.
     Updates _progress at each stage so the SSE stream stays current.
     """
     try:
         db       = get_db()
         embedder = Embedder()
+        graph    = get_neo4j()
+        embeddings = OpenAIEmbeddings(model=config.EMBEDDING_MODEL, api_key=config.OPENAI_API_KEY)
         all_chunks: List[Dict[str, Any]] = []
         nar_chunks: List[Dict[str, Any]] = []
         graph_saved = False
 
-        # ── 1. Designer Narrative (graph source; not embedded) ────────────────
+        # ── 1. Designer Narrative (graph source; not embedded to Supabase) ────
         if narrative_bytes:
             _set_progress(session_id, status="parsing", message="Parsing designer narrative…")
             nar_chunks = _bytes_to_pdf_chunks(narrative_bytes, chunk_narrative)
             logger.info("Session %s: narrative → %d sections (graph)", session_id, len(nar_chunks))
 
-        # ── 2. XER Schedule → CPM → knowledge graph (not embedded) ────────────
+        # ── 2. XER Schedule → CPM → Neo4j knowledge graph ─────────────────────
         if xer_bytes:
             _set_progress(session_id, status="parsing", message="Processing schedule activities…")
             try:
@@ -181,36 +197,39 @@ def _process_session(
                     logger.exception("Session %s: CPM computation failed", session_id)
 
                 _set_progress(session_id, status="parsing",
-                              message="Building knowledge graph…")
-                graph = build_graph(activities, calendars,
-                                    cpm=cpm, crosscheck=xcheck, project=project)
+                              message="Seeding knowledge graph…")
+                clear_project(graph, session_id)
+                seed_schedule(graph, activities, calendars, cpm, xcheck, project,
+                              project_id=session_id)
+
+                nar_vectors: List[List[float]] = []
                 if nar_chunks:
                     _set_progress(session_id, status="parsing",
                                   message="Extracting narrative entities…")
-                    add_narrative_to_graph(graph, nar_chunks, activities,
-                                           llm=_extraction_llm())
-                save_graph(db, session_id, graph)
+                    nar_vectors = embeddings.embed_documents([c["content"] for c in nar_chunks])
+                seed_narrative(graph, nar_chunks, nar_vectors, activities,
+                               project_id=session_id, llm=_extraction_llm())
                 graph_saved = True
-                logger.info("Session %s: knowledge graph saved (%d nodes)",
-                            session_id, graph.number_of_nodes())
+                logger.info("Session %s: knowledge graph seeded", session_id)
             except HTTPException as exc:
                 # XER parse failure is non-fatal; log and continue
                 logger.warning("Session %s: XER parse failed — %s", session_id, exc.detail)
             except Exception:
-                logger.exception("Session %s: graph build/save failed", session_id)
+                logger.exception("Session %s: graph seed failed", session_id)
         elif nar_chunks:
             # Narrative without a schedule still gets a (narrative-only) graph
             try:
                 _set_progress(session_id, status="parsing",
                               message="Extracting narrative entities…")
-                graph = build_graph([], [])
-                add_narrative_to_graph(graph, nar_chunks, [], llm=_extraction_llm())
-                save_graph(db, session_id, graph)
+                clear_project(graph, session_id)
+                nar_vectors = embeddings.embed_documents([c["content"] for c in nar_chunks])
+                seed_narrative(graph, nar_chunks, nar_vectors, [],
+                               project_id=session_id, llm=_extraction_llm())
                 graph_saved = True
             except Exception:
-                logger.exception("Session %s: narrative graph build failed", session_id)
+                logger.exception("Session %s: narrative graph seed failed", session_id)
 
-        # ── 3. Special Provision (hybrid RAG path; embedded) ───────────────────
+        # ── 3. Special Provision (hybrid RAG path; embedded to Supabase) ───────
         if sp_bytes:
             _set_progress(session_id, status="parsing", message="Parsing special provision PDF…")
             sp_chunks = _bytes_to_sp_chunks(sp_bytes)
@@ -305,8 +324,9 @@ async def session_status(session_id: str) -> StreamingResponse:
     Stream closes when status is "ready" or "error".
 
     If the session_id is not in the in-memory store (e.g. after a server
-    restart or page reload), we fall back to the database to check whether
-    chunks exist — so restored sessions transition to "ready" immediately.
+    restart or page reload), we fall back to Supabase (SP chunks) and Neo4j
+    (schedule/narrative graph) to check whether content exists — so restored
+    sessions transition to "ready" immediately.
     """
     if session_id not in _progress:
         try:
@@ -317,18 +337,14 @@ async def session_status(session_id: str) -> StreamingResponse:
                     .gt("expires_at", "now()") \
                     .execute()
             count = res.count or 0
-            graph_rows = db.table("session_graphs") \
-                           .select("session_id") \
-                           .eq("session_id", session_id) \
-                           .gt("expires_at", "now()") \
-                           .execute().data or []
-            if count > 0 or graph_rows:
+            has_graph = _has_graph(get_neo4j(), session_id)
+            if count > 0 or has_graph:
                 _set_progress(
                     session_id,
                     status="ready",
                     message="Documents ready. You can now ask questions.",
                     chunk_count=count,
-                    has_graph=bool(graph_rows),
+                    has_graph=has_graph,
                 )
             else:
                 _set_progress(session_id, status="error", message="Session not found or expired.")
@@ -356,12 +372,6 @@ async def session_status(session_id: str) -> StreamingResponse:
 
 # ── Query endpoint ─────────────────────────────────────────────────────────────
 
-_DOC_TAG: Dict[str, str] = {
-    "designer_narrative": "[Narrative]",
-    "special_provision":  "[SP]",
-    "xer_activities":     "[Schedule]",
-}
-
 _DOC_LABEL: Dict[str, str] = {
     "designer_narrative": "Designer Narrative",
     "special_provision":  "Special Provision",
@@ -373,70 +383,54 @@ You are an assistant helping an NJDOT engineer review a construction project.
 Answer the question using ONLY the context provided below.
 
 Sources in context:
-  [Narrative]  – Designer Narrative (project-specific schedule explanation)
   [SP]         – Special Provision (project-specific contract requirements)
-  [Schedule]   – CPM schedule milestone and phase data
   [Manual]     – NJDOT Construction Scheduling Manual (official standards)
 
 Rules:
-- Cite the source tag for every fact you state, e.g. "per [Narrative]".
-- Be concise — one or two paragraphs maximum (up to three if coverage caveats
-  apply, per below).
+- Cite the source tag for every fact you state, e.g. "per [SP]".
+- Be concise — one or two paragraphs maximum.
 - Do not infer or invent beyond what the context states.
+- A [Manual] chunk stating a rule or requirement is evidence of the standard,
+  not evidence that this project's schedule complies with it. Never cite a
+  [Manual] rule as proof of a project-specific fact — only [SP] context
+  confirms what is actually true for this project.
 
-Answering aggregate or full-scan questions (e.g. "check for any negative
-float," "are there any missing items," "does every activity have X," "is
-there any instance of Y"):
-- These questions ask you to verify something across an entire dataset
-  (e.g. all schedule activities), not to find one fact in one place.
-- If [Schedule] context is present but does not obviously cover every phase
-  or activity of the project, do not treat that as proof the condition is
-  absent. State what the retrieved [Schedule] excerpts show (e.g. "the N
-  activities shown in [Schedule] all have Total Float of 0 or greater"), then
-  explicitly say that full coverage of the schedule could not be confirmed
-  from the retrieved excerpts, naming any phases you can tell are missing.
-- A [Manual] chunk stating a rule or requirement (e.g. "negative floats will
-  not be permitted") is evidence of the standard, not evidence that this
-  project's schedule complies with it. Never cite a [Manual] rule as proof
-  of a project-specific fact — only [Narrative], [SP], or [Schedule] context
-  can confirm what is actually true for this project.
-
-If, after applying the above, no context is relevant to the question at all
-(not even partial [Schedule] or [Narrative]/[SP] evidence), say exactly:
+If no context is relevant to the question at all, say exactly:
 "Not found in the provided documents."
-Do not use this fallback merely because coverage is incomplete — only use it
-when nothing relevant was retrieved.
 """
 
 
 _QA_SYSTEM_GRAPH = """\
 You are an assistant helping an NJDOT engineer review a construction project.
 
-You have TWO kinds of project knowledge:
+You have access to:
+  [Manual]  – NJDOT Construction Scheduling Manual (official standards; may
+              appear as pre-fetched context below)
+  Tools:
+    - query_schedule_graph: answer schedule-logic questions (predecessors/
+      successors, negative float, mandatory constraints, WBS/phase filtering,
+      narrative-entity mentions) via Cypher against the project's knowledge
+      graph.
+    - get_critical_path: the precomputed critical path chain(s) — always use
+      this instead of query_schedule_graph for critical-path questions.
+    - search_narrative: semantic search over the designer narrative's full text.
+    - search_special_provisions: search the project's Special Provision text.
 
-1. Retrieved document context (below in the user message):
-     [SP]      – Special Provision (project-specific contract requirements)
-     [Manual]  – NJDOT Construction Scheduling Manual (official standards)
-2. The project's schedule + designer-narrative KNOWLEDGE GRAPH:
-     [Graph]   – a digest is included below, and you can call graph tools
-                 (get_activity, get_critical_path, predecessors, successors,
-                 trace_path, why_critical, find_activities, narrative_links,
-                 get_narrative_section, search_narrative) for precise detail.
+A digest of the project's schedule (data date, computed finish, critical
+path, milestones, phases, cross-check findings) is included below — read it
+first; call a tool only for detail beyond what the digest already states.
 
 Rules:
 - The graph's float, critical-path, and date values were computed
   deterministically by a CPM engine — they are authoritative. NEVER attempt
   your own float or critical-path arithmetic; call a tool instead.
-- For schedule-logic questions (critical path, what drives X, float, dates,
-  sequences) use the graph tools. For narrative content beyond the digest,
-  use search_narrative / get_narrative_section — the narrative is NOT in the
-  retrieved chunks.
-- Cite a source tag for every fact: "per [Graph]", "per [SP]", "per [Manual]".
+- Cite a source for every fact: "per the schedule graph", "per [SP]", "per
+  [Manual]".
 - A [Manual] rule is evidence of the standard, not of this project's
-  compliance; only [Graph] or [SP] facts confirm what is true for this project.
+  compliance; only the graph or [SP] facts confirm what is true for this project.
 - Be concise — one or two paragraphs, or a short list for enumerations.
 - Do not infer or invent beyond what the context and tools return. If neither
-  the context nor the graph answers the question, say:
+  the context nor the tools answer the question, say:
   "Not found in the provided documents."
 """
 
@@ -450,8 +444,10 @@ class QueryRequest(BaseModel):
 @router.post("/query", summary="Ask a question across session documents + scheduling manual")
 async def session_query(req: QueryRequest) -> dict:
     """
-    Vector search session chunks + scheduling manual → LLM answer.
-    Session must be in "ready" status before querying.
+    Answer a question using the permanent scheduling-manual collection
+    (pre-fetched context) plus, when this session has graph/SP content, a
+    tool-calling agent with access to the Neo4j knowledge graph and Special
+    Provision retrieval. Session must be in "ready" status before querying.
     """
     progress = _progress.get(req.session_id, {})
     if progress.get("status") != "ready":
@@ -460,32 +456,11 @@ async def session_query(req: QueryRequest) -> dict:
             detail=f"Session not ready. Current status: {progress.get('status', 'unknown')}",
         )
 
-    db  = get_db()
-    oai = openai.OpenAI(api_key=config.OPENAI_API_KEY)
+    db = get_db()
+    embeddings = OpenAIEmbeddings(model=config.EMBEDDING_MODEL, api_key=config.OPENAI_API_KEY)
+    q_embedding = embeddings.embed_query(req.question)
 
-    # ── Embed question ─────────────────────────────────────────────────────────
-    q_embedding: List[float] = (
-        oai.embeddings.create(model=config.EMBEDDING_MODEL, input=[req.question])
-        .data[0]
-        .embedding
-    )
-
-    # ── Search session chunks ──────────────────────────────────────────────────
-    session_rows = (
-        db.rpc(
-            "match_session_chunks",
-            {
-                "query_embedding": q_embedding,
-                "p_session_id":    req.session_id,
-                "match_count":     req.match_count,
-                "match_threshold": 0.2,
-            },
-        )
-        .execute()
-        .data
-    ) or []
-
-    # ── Search scheduling manual (permanent collection) ────────────────────────
+    # ── Search scheduling manual (permanent collection) — pre-fetched context ──
     manual_rows = (
         db.rpc(
             "match_chunks",
@@ -500,26 +475,8 @@ async def session_query(req: QueryRequest) -> dict:
         .data
     ) or []
 
-    # ── Build context + source list ────────────────────────────────────────────
     context_parts: List[str] = []
     sources:       List[Dict[str, Any]] = []
-
-    for row in session_rows:
-        doc_type = row.get("doc_type", "")
-        tag      = _DOC_TAG.get(doc_type, "[Doc]")
-        meta     = row.get("metadata", {})
-        heading  = meta.get("section_heading") or meta.get("phase") or meta.get("activity_id") or ""
-        page     = f"p.{meta['page_pdf']}" if meta.get("page_pdf") else ""
-        ref      = f" {heading} {page}".strip()
-
-        context_parts.append(f"{tag}{ref}\n{row['content']}")
-        sources.append({
-            "label":      _DOC_LABEL.get(doc_type, doc_type),
-            "heading":    heading,
-            "page_pdf":   meta.get("page_pdf"),
-            "similarity": round(row.get("similarity", 0.0), 3),
-        })
-
     for row in manual_rows:
         meta = row.get("metadata", {})
         context_parts.append(
@@ -531,37 +488,55 @@ async def session_query(req: QueryRequest) -> dict:
             "similarity": round(row.get("similarity", 0.0), 3),
         })
 
-    # ── GraphRAG path: schedule + narrative live in the knowledge graph ────────
-    graph_loaded = load_graph(db, req.session_id)
+    graph = get_neo4j()
+    has_graph = _has_graph(graph, req.session_id)
 
-    if graph_loaded is None and not context_parts:
-        return {
-            "answer":  "No relevant content found in the uploaded documents.",
-            "sources": [],
-        }
+    primary  = ChatOpenAI(model=config.CHAT_MODEL, temperature=0, api_key=config.OPENAI_API_KEY)
+    fallback = ChatAnthropic(model=_ANTHROPIC_MODEL, anthropic_api_key=config.ANTHROPIC_API_KEY)
+    llm = primary.with_fallbacks([fallback])
 
-    llm = LLMClient()
+    if has_graph:
+        # ── GraphRAG path: schedule + narrative live in Neo4j, SP via tool ──────
+        digest = build_digest(graph, req.session_id)
+        graph_tools = build_tools(graph, llm, embeddings.embed_query, project_id=req.session_id)
+        sp_tool = build_sp_tool(db, embeddings.embed_query, project_id=req.session_id)
+        all_tools = graph_tools + [sp_tool]
 
-    if graph_loaded is not None:
-        graph, cpm_summary = graph_loaded
-        digest = build_digest(graph, cpm_summary)
-        context_parts.insert(0, f"[Graph] Project schedule/narrative digest\n{digest}")
+        system_prompt = _QA_SYSTEM_GRAPH + f"\n\n[Graph] Project schedule/narrative digest:\n{digest}"
+        if context_parts:
+            system_prompt += "\n\nPre-fetched context:\n" + "\n\n---\n\n".join(context_parts)
+
+        agent = create_agent(llm, all_tools, system_prompt=system_prompt)
+        result = agent.invoke({"messages": [{"role": "user", "content": req.question}]})
+
+        messages = result.get("messages", [])
+        answer = messages[-1].content if messages else "Not found in the provided documents."
+
         sources.insert(0, {"label": "Schedule Graph", "heading": "digest"})
-
-        context_text = "\n\n---\n\n".join(context_parts)
-        user_message = f"Context:\n{context_text}\n\nQuestion: {req.question}"
-
-        answer, tool_trace = run_tool_loop(
-            llm, _QA_SYSTEM_GRAPH, user_message,
-            tools=bind_graph_tools(graph, cpm_summary),
-        )
-        for t in tool_trace:
-            sources.append({"label": "Schedule Graph", "tool": t["tool"],
-                            "args": t["args"]})
+        for m in messages:
+            if type(m).__name__ == "ToolMessage":
+                sources.append({"label": "Schedule Graph", "tool": getattr(m, "name", "tool")})
     else:
+        # ── SP-only path: no graph for this session ─────────────────────────────
+        sp_rows = retrieve_sp_chunks(db, embeddings.embed_query, req.session_id, req.question,
+                                      match_count=req.match_count)
+        for row in sp_rows:
+            meta = row.get("metadata", {})
+            page = f"p.{meta['page_pdf']}" if meta.get("page_pdf") else ""
+            context_parts.append(f"[SP] {page}\n{row['content']}")
+            sources.append({
+                "label":      _DOC_LABEL.get("special_provision", "Special Provision"),
+                "page_pdf":   meta.get("page_pdf"),
+                "similarity": round(row.get("similarity", 0.0), 3),
+            })
+
+        if not context_parts:
+            return {"answer": "No relevant content found in the uploaded documents.", "sources": []}
+
         context_text = "\n\n---\n\n".join(context_parts)
         user_message = f"Context:\n{context_text}\n\nQuestion: {req.question}"
-        answer = llm.complete(_QA_SYSTEM, user_message)
+        response = llm.invoke([SystemMessage(content=_QA_SYSTEM), HumanMessage(content=user_message)])
+        answer = response.content
 
     # ── Persist messages (non-fatal) ───────────────────────────────────────────
     try:

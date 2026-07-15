@@ -8,7 +8,7 @@ internal quality signal, not part of the public contract.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -95,3 +95,49 @@ class DebugResponse(BaseModel):
     chunks:             List[DebugChunkItem]
     answer:             Optional[str]   # LLM answer for quality comparison
     response_time_ms:   int
+
+
+# ── Compliance checklist (app.compliance.eval_engine) ──────────────────────────
+
+class EvaluationSchema(BaseModel):
+    """Structured output shape enforced via ``.with_structured_output()`` for
+    each individual compliance-check LLM call."""
+
+    status:   Literal["Pass", "Fail", "Missing"]
+    evidence: str   # verbatim extraction or exact metric found
+    source:   str   # page number, document name, or Task ID
+
+
+class ReviewCheckResult(BaseModel):
+    """One evaluated check, with catalog identity attached to its EvaluationSchema result."""
+
+    id:       str
+    category: str
+    name:     str
+    status:   Literal["Pass", "Fail", "Missing"]
+    evidence: str
+    source:   str
+
+
+class ReviewResponse(BaseModel):
+    """Internal LangChain-native shape returned by ``app.compliance.eval_engine``.
+
+    ``app.api.review`` maps this to the frontend's existing contract (lowercase
+    ``pass``/``warning``/``fail`` status, ``reasoning``/``finding``/``evidence``
+    fields) via ``_to_frontend_shape()`` so ``DocumentReview.tsx`` needs no changes.
+    """
+
+    project_name:           str
+    project_duration_days:  int
+    summary:                Dict[str, int]
+    checks:                 List[ReviewCheckResult]
+    manual_review_items:    List[str] = []
+    model_used:             str
+    # Neo4j projectId == review_projects.id (once saved) — see graph_neo4j's
+    # multi-project isolation design. File paths are set only when the
+    # caller was authenticated (backend-led Storage upload); None for an
+    # anonymous review, which is never persisted.
+    project_id:                    str
+    schedule_file_path:            Optional[str] = None
+    narrative_pdf_path:            Optional[str] = None
+    special_provision_pdf_path:    Optional[str] = None

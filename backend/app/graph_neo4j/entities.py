@@ -1,25 +1,17 @@
-"""Designer-narrative integration into the knowledge graph.
+"""Narrative entity extraction and schedule-activity linking.
 
-The narrative participates in the graph two ways (pure GraphRAG — after the
-Phase-4 cutover the narrative is NOT embedded, so the graph must carry its
-full text):
-
-1. ``NarrativeSection`` nodes — one per ``chunk_narrative`` chunk, holding the
-   verbatim section text (id ``nsec:<chunk_index>``).
-2. ``NarrativeEntity`` nodes — LLM-extracted commitments, permits, utility
-   work, deadlines, stakeholders, phase mentions, and restrictions, each with
-   a supporting quote.  ``FROM_SECTION`` edges tie entities to their source
-   section; ``MENTIONS`` edges tie them to schedule activities with a match
-   method + confidence; ``RELATES_TO`` edges connect related entities.
+Ported unchanged (pure Python, backend-agnostic) from the retired
+``app.graph.narrative_graph`` module — only the final graph-write step differs
+(Cypher ``UNWIND``/``MERGE`` in ``seed.py`` instead of networkx mutation).
 
 Activity linking runs three tiers:
   id_exact (1.0)   — activity ID appears verbatim in the entity quote/text
-  name_fuzzy (≥.75)— difflib ratio between entity text and an activity name
-  date_keyword (.5)— entity date within ±3 days of activity start/finish AND
+  name_fuzzy (>=.75)— difflib ratio between entity text and an activity name
+  date_keyword (.5)— entity date within +/-3 days of activity start/finish AND
                      a shared content keyword
 
 Extraction is fail-safe: any LLM/JSON error skips that batch and the session
-continues with sections only.
+continues with chunks only.
 """
 
 from __future__ import annotations
@@ -30,8 +22,6 @@ import logging
 import re
 from datetime import date
 from typing import Any, Dict, List, Optional, Tuple
-
-import networkx as nx
 
 logger = logging.getLogger(__name__)
 
@@ -103,10 +93,10 @@ def _parse_json(raw: str) -> Optional[dict]:
             return None
 
 
-# ── Sections ───────────────────────────────────────────────────────────────────
+# ── Narrative chunks ─────────────────────────────────────────────────────────
 
 def narrative_to_sections(nar_chunks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Turn ``chunk_narrative`` output into NarrativeSection node payloads."""
+    """Turn ``chunk_narrative`` output into NarrativeChunk node payloads."""
     sections = []
     for chunk in nar_chunks:
         meta = chunk.get("metadata", {})
@@ -130,6 +120,7 @@ def extract_entities(
 
     Returns ``(entities, relations)``; entities carry ``id`` (``nar:<n>``),
     relations reference those ids.  Any batch failure is logged and skipped.
+    ``llm`` must expose ``.complete(system, user) -> str``.
     """
     entities: List[Dict[str, Any]] = []
     relations: List[Dict[str, Any]] = []
@@ -298,89 +289,3 @@ def link_entities(
                     })
 
     return [(eid, aid, attrs) for (eid, aid), attrs in links.items()]
-
-
-# ── Graph assembly ─────────────────────────────────────────────────────────────
-
-def add_narrative_to_graph(
-    graph: nx.MultiDiGraph,
-    nar_chunks: List[Dict[str, Any]],
-    activities: List[Dict[str, Any]],
-    llm: Any = None,
-) -> Dict[str, int]:
-    """Mutate ``graph`` with narrative sections, entities, and links.
-
-    ``llm`` may be None (or extraction may fail) — sections are still added
-    so the narrative text always lives in the graph.
-    """
-    sections = narrative_to_sections(nar_chunks)
-    for s in sections:
-        graph.add_node(s["id"], node_type="NarrativeSection",
-                       label=s["heading"] or "Narrative section",
-                       text=s["text"], heading=s["heading"],
-                       page_pdf=s["page_pdf"])
-
-    entities: List[Dict[str, Any]] = []
-    relations: List[Dict[str, Any]] = []
-    if llm is not None and sections:
-        entities, relations = extract_entities(sections, llm)
-
-    for ent in entities:
-        graph.add_node(ent["id"], node_type="NarrativeEntity",
-                       label=ent["text"], entity_type=ent["entity_type"],
-                       text=ent["text"], quote=ent["quote"],
-                       dates=ent["dates"])
-        if ent.get("section_id") and graph.has_node(ent["section_id"]):
-            graph.add_edge(ent["id"], ent["section_id"], edge_type="FROM_SECTION")
-
-    for rel in relations:
-        if graph.has_node(rel["from"]) and graph.has_node(rel["to"]):
-            graph.add_edge(rel["from"], rel["to"], edge_type="RELATES_TO",
-                           label=rel["label"])
-
-    mention_links = link_entities(entities, activities) if activities else []
-    for eid, aid, attrs in mention_links:
-        if graph.has_node(eid) and graph.has_node(aid):
-            graph.add_edge(eid, aid, edge_type="MENTIONS", **attrs)
-
-    stats = {
-        "sections": len(sections),
-        "entities": len(entities),
-        "relations": len(relations),
-        "mentions": len(mention_links),
-    }
-    graph.graph["narrative"] = stats
-    logger.info("add_narrative_to_graph: %s", stats)
-    return stats
-
-
-def narrative_links_chunk(graph: nx.MultiDiGraph) -> Optional[Dict[str, Any]]:
-    """Render high-confidence MENTIONS edges as one embeddable chunk.
-
-    Interim Phase-3 output so narrative↔schedule links are retrievable before
-    the GraphRAG Q&A cutover; returns None when there are no links.
-    """
-    lines: List[str] = []
-    for eid, aid, d in graph.edges(data=True):
-        if d.get("edge_type") != "MENTIONS" or d.get("confidence", 0) < 0.7:
-            continue
-        ent = graph.nodes[eid]
-        act = graph.nodes[aid]
-        computed = act.get("computed") or {}
-        crit = ""
-        if computed.get("total_float") is not None:
-            crit = (f" — critical, total float {computed['total_float']}"
-                    if computed.get("is_critical")
-                    else f" — total float {computed['total_float']}")
-        lines.append(
-            f"- {ent.get('entity_type', 'Entity')} \"{ent.get('text', '')}\" "
-            f"(narrative) is linked to schedule activity {aid} "
-            f"\"{act.get('label', '')}\"{crit}.")
-    if not lines:
-        return None
-    content = "## Narrative Links\n\n" + "\n".join(lines[:40])
-    return {
-        "content": content,
-        "metadata": {"doc_type": "xer_activities", "section": "narrative_links",
-                     "chunk_index": 0},
-    }
