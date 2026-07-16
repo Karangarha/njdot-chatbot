@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 import numpy as np
 from langchain_core.language_models import BaseLanguageModel

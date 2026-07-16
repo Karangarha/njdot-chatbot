@@ -31,9 +31,6 @@ class Config:
     CHAT_MODEL: str = os.getenv("CHAT_MODEL", "gpt-4o")
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai")  # "openai" | "anthropic"
-    USE_LOCAL_LLM: bool = os.getenv("USE_LOCAL_LLM", "false").lower() == "true"
-    OLLAMA_BASE_URL: str = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    OLLAMA_MODEL: str = os.getenv("OLLAMA_MODEL", "llama3.1:8b")
 
     # Environment
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
@@ -49,15 +46,9 @@ class Config:
     BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     DATA_DIR: str = os.path.join(BASE_DIR, "data")
     RAW_PDFS_DIR: str = os.path.join(DATA_DIR, "raw_pdfs")
-    PROCESSED_DIR: str = os.path.join(DATA_DIR, "processed")
-    
-    # Chunking settings
-    CHUNK_SIZE: int = 750  # tokens
-    CHUNK_OVERLAP: int = 100  # tokens
-    
+
     # Embedding settings
     EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMENSIONS: int = 1536
 
     # Neo4j (local Desktop instance — see backend/app/neo4j_client.py)
     NEO4J_URI: str = os.getenv("NEO4J_URI", "bolt://localhost:7687")
@@ -74,9 +65,8 @@ class Config:
             "NEO4J_URI": cls.NEO4J_URI,
             "NEO4J_USERNAME": cls.NEO4J_USERNAME,
             "NEO4J_PASSWORD": cls.NEO4J_PASSWORD,
+            "OPENAI_API_KEY": cls.OPENAI_API_KEY,
         }
-        if not cls.USE_LOCAL_LLM:
-            required["OPENAI_API_KEY"] = cls.OPENAI_API_KEY
 
         missing = [key for key, value in required.items() if not value]
 
@@ -93,14 +83,9 @@ class Config:
         print("\nCurrent Configuration:")
         print(f"   Environment: {cls.ENVIRONMENT}")
         print(f"   Supabase URL: {cls.SUPABASE_URL}")
-        print(f"   Local LLM: {'Enabled' if cls.USE_LOCAL_LLM else 'Disabled'}")
         print(f"   OpenAI Key: {'Set' if cls.OPENAI_API_KEY else 'Not set'}")
-        print(f"   Ollama URL: {cls.OLLAMA_BASE_URL}")
-        print(f"   Ollama Model: {cls.OLLAMA_MODEL}")
         print(f"   Data Directory: {cls.DATA_DIR}")
         print(f"   PDFs Directory: {cls.RAW_PDFS_DIR}")
-        print(f"   Chunk Size: {cls.CHUNK_SIZE} tokens")
-        print(f"   Chunk Overlap: {cls.CHUNK_OVERLAP} tokens")
         print()
 
 

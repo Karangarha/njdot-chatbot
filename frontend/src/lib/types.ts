@@ -30,16 +30,6 @@ export interface Conversation {
   updated_at: string
 }
 
-export interface ConversationMessage {
-  id: string
-  conversation_id: string
-  role: 'user' | 'assistant'
-  content: string
-  citations: CitationItem[]
-  bdc_alerts: BDCAlertItem[]
-  created_at: string
-}
-
 export interface ReviewProject {
   id: string
   session_id: string | null

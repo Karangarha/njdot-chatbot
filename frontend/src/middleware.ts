@@ -46,7 +46,7 @@ export async function middleware(request: NextRequest) {
 
   const { pathname } = request.nextUrl
 
-  // ── Always-public paths (e.g. /reset-password needs the token in the URL) ──
+  // ── Always-public paths (e.g. /update-password needs the token in the URL) ──
   if (ALWAYS_PUBLIC.some((p) => pathname.startsWith(p))) {
     return supabaseResponse
   }

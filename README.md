@@ -8,9 +8,10 @@ A RAG (Retrieval-Augmented Generation) chatbot for querying New Jersey Departmen
 
 - Python 3.11+
 - Node.js 18+
-- A Supabase project with the `pgvector` extension enabled
-- An OpenAI API key (for embeddings)
-- An Anthropic API key (for Claude LLM)
+- A Supabase project with the `pgvector` extension enabled (spec/BDC RAG, conversations, review projects, session chunks)
+- A Neo4j instance — local Neo4j Desktop or Aura (schedule compliance review + session GraphRAG Q&A)
+- An OpenAI API key (for embeddings, and as the default chat LLM)
+- An Anthropic API key (used as the LLM fallback for review/session chat)
 
 ---
 

@@ -23,14 +23,12 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import sys
 import time
 from collections import Counter
 from typing import Any, Dict, List, Optional, Set
 
 import debug  # noqa: F401 — bootstraps sys.path
-from app.config import config
-from debug import bold, cyan, dim, green, hr, red, section, status_badge, subsection, yellow
+from debug import bold, cyan, dim, green, red, section, subsection, yellow
 
 from app.database import get_db
 from app.retrieval.vector_search import VectorSearcher

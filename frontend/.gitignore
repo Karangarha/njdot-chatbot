@@ -32,6 +32,8 @@ yarn-error.log*
 
 # env files
 .env*
+# ...except the template (no secrets — placeholders only)
+!.env.local.example
 
 # vercel
 .vercel
