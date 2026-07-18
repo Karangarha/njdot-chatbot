@@ -35,7 +35,7 @@ from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
 from app.auth import user_id_from_token, user_id_from_token_optional
-from app.compliance.catalog import BUILTIN_CHECKS, CheckDef
+from app.compliance.catalog import BUILTIN_CHECKS, MANUAL_REVIEW_KEYS, CheckDef
 from app.compliance.eval_engine import evaluate_checks
 from app.config import config
 from app.database import get_db
@@ -206,7 +206,7 @@ def _summarize(results: List[ReviewCheckResult]) -> Dict[str, int]:
         "passed": sum(1 for r in results if r.status == "Pass"),
         "warnings": sum(1 for r in results if r.status == "Missing"),
         "failed": sum(1 for r in results if r.status == "Fail"),
-        "manual_review": sum(1 for r in results if r.category == "Manual Review"),
+        "manual_review": sum(1 for r in results if r.id in MANUAL_REVIEW_KEYS),
     }
 
 
@@ -350,7 +350,7 @@ def _run_review_pipeline(
         project_duration_days=duration_days,
         summary=_summarize(check_results),
         checks=check_results,
-        manual_review_items=[c.name for c in check_results if c.category == "Manual Review"],
+        manual_review_items=[c.name for c in check_results if c.id in MANUAL_REVIEW_KEYS],
         # .with_fallbacks() resolves per-call; a single top-level label can't
         # capture "some checks fell back to Claude" — reporting the primary
         # model here is a reasonable simplification for this metadata field.

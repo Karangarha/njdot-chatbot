@@ -50,29 +50,52 @@ interface DocumentReviewProps {
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
-const SECTION_CATEGORIES: Record<string, string[]> = {
-  'Administrative & Milestones': ['Administrative Dates', 'Completion Milestones'],
-  'Environmental, Landscape & Utilities': ['Environmental, Landscape & Utilities', 'Winter Restrictions', 'Weather Restrictions'],
-  'Working Drawings, Materials & ITS': ['Working Drawings, Materials & ITS'],
-  'Schedule Logic': ['Schedule Logic'],
-  "Designer's Narrative": ["Designer's Narrative"],
-  'Manual Review': ['Manual Review'],
-}
-
-const SECTION_ORDER = [
-  'Administrative & Milestones',
-  'Environmental, Landscape & Utilities',
-  'Working Drawings, Materials & ITS',
-  'Schedule Logic',
+// The checklist (backend/app/compliance/catalog.py) is mostly uncategorized —
+// only checks the source NJDOT document actually nests under one parent line
+// carry a `category`. Those four groups are the only ones the results view
+// (like the checklist editor) shows under a collapsible header; every other
+// check renders as a flat, unheaded list in catalog order.
+const HEADER_SECTIONS = [
+  'Utility Service Restrictions',
+  'Weather & Paving Restrictions',
+  'Material Fabrication Lead Times',
   "Designer's Narrative",
-  'Manual Review',
+]
+
+// Mirrors backend/app/compliance/catalog.py's MANUAL_REVIEW_KEYS — used only
+// as a defensive fallback for older saved review results whose stored
+// `summary` predates the `manual_review` field.
+const MANUAL_REVIEW_KEYS = [
+  'utility_alignment', 'environmental_permit', 'edq_items', 'traffic_control_staging',
+  'summer_shutdown', 'required_activities_present', 'multi_year_funding', 'nearby_projects',
+]
+
+// Purely descriptive topic labels for the pre-review "What gets checked" teaser.
+const WHAT_GETS_CHECKED = [
+  'Administrative Dates', 'Environmental, Landscape & Utilities', 'Weather & Materials',
+  'Schedule Logic', "Designer's Narrative", 'Manual Review',
 ]
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-function checksForSection(checks: CheckItem[], sectionName: string): CheckItem[] {
-  const cats = SECTION_CATEGORIES[sectionName] ?? []
-  return checks.filter(c => cats.includes(c.category))
+/**
+ * Groups checks into consecutive runs sharing the same non-empty category,
+ * preserving catalog order — mirrors ChecklistManager.tsx's groupSequential
+ * so the results view and the checklist editor group checks identically.
+ */
+function groupSequential(checks: CheckItem[]): { header: string | null; items: CheckItem[] }[] {
+  const runs: { header: string | null; items: CheckItem[] }[] = []
+  for (const c of checks) {
+    const last = runs[runs.length - 1]
+    if (c.category && last?.header === c.category) {
+      last.items.push(c)
+    } else if (!c.category && last?.header === null) {
+      last.items.push(c)
+    } else {
+      runs.push({ header: c.category || null, items: [c] })
+    }
+  }
+  return runs
 }
 
 // ── Sub-components ─────────────────────────────────────────────────────────────
@@ -155,8 +178,8 @@ function UploadZone({
 function CheckCard({ check }: { check: CheckItem }) {
   const styles = {
     pass:    { border: 'border-green-500', labelColor: 'text-green-600', label: 'COMPLIANT',    iconBg: 'bg-green-100' },
-    fail:    { border: 'border-amber-500', labelColor: 'text-amber-600', label: 'ISSUES FOUND', iconBg: 'bg-amber-100' },
-    warning: { border: 'border-red-500',   labelColor: 'text-red-600',   label: 'MISSING',      iconBg: 'bg-red-100' },
+    fail:    { border: 'border-red-500',   labelColor: 'text-red-600',   label: 'ISSUES FOUND', iconBg: 'bg-red-100' },
+    warning: { border: 'border-amber-500', labelColor: 'text-amber-600', label: 'MISSING',      iconBg: 'bg-amber-100' },
   }[check.status]
 
   return (
@@ -245,7 +268,7 @@ export default function DocumentReview({
   const [authToken,     setAuthToken]     = useState<string | undefined>(undefined)
   const [activeTab,     setActiveTab]     = useState<'review' | 'chat'>('review')
   const [expanded,      setExpanded]      = useState<Record<string, boolean>>(
-    Object.fromEntries(SECTION_ORDER.map(s => [s, true]))
+    Object.fromEntries(HEADER_SECTIONS.map(s => [s, true]))
   )
   const [effectiveChecks, setEffectiveChecks] = useState<ComplianceCheck[]>([])
   const [checklistOpen,   setChecklistOpen]   = useState(false)
@@ -546,7 +569,7 @@ export default function DocumentReview({
             </span>
             <span className="flex items-center gap-1.5 rounded-full bg-gray-100 px-3 py-1 text-[11px] font-bold text-gray-600">
               <span className="h-1.5 w-1.5 rounded-full bg-gray-400 inline-block" />
-              {summary.manual_review ?? checksForSection(checks, 'Manual Review').length} Manual Review
+              {summary.manual_review ?? checks.filter(c => MANUAL_REVIEW_KEYS.includes(c.id)).length} Manual Review
             </span>
           </div>
 
@@ -569,11 +592,17 @@ export default function DocumentReview({
         {activeTab === 'review' || !sessionId ? (
           <div className="flex-1 overflow-y-auto">
             <div className="mx-auto max-w-3xl px-5 py-6 space-y-3">
-              {SECTION_ORDER.map(sectionName => (
-                <CollapsibleSection key={sectionName} title={sectionName}
-                  checks={checksForSection(checks, sectionName)}
-                  expanded={expanded[sectionName]}
-                  onToggle={() => toggleSection(sectionName)} />
+              {groupSequential(checks).map((run, i) => (
+                run.header ? (
+                  <CollapsibleSection key={run.header} title={run.header}
+                    checks={run.items}
+                    expanded={expanded[run.header] ?? true}
+                    onToggle={() => toggleSection(run.header!)} />
+                ) : (
+                  <div key={i} className="space-y-2.5">
+                    {run.items.map(check => <CheckCard key={check.id} check={check} />)}
+                  </div>
+                )
               ))}
             </div>
           </div>
@@ -678,7 +707,7 @@ export default function DocumentReview({
           <div className="mt-8 rounded-2xl border border-[#E8E8E8] bg-white p-5 shadow-sm">
             <p className="mb-3 text-xs font-semibold uppercase tracking-wider text-gray-400">What gets checked</p>
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-              {SECTION_ORDER.map(s => (
+              {WHAT_GETS_CHECKED.map(s => (
                 <div key={s} className="rounded-lg bg-[#F5F5F5] px-3 py-2.5 text-center">
                   <p className="text-[11px] font-semibold text-gray-600 leading-tight">{s}</p>
                 </div>

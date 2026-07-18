@@ -140,14 +140,26 @@ const SOURCE_FILE_LABEL: Record<SourceFile, string> = {
   schedule: 'Schedule', narrative: 'Narrative', sp: 'Special Provision',
 }
 
-function groupByCategory(checks: ComplianceCheck[]): [string, ComplianceCheck[]][] {
-  const groups = new Map<string, ComplianceCheck[]>()
+/**
+ * Groups checks into consecutive runs sharing the same non-empty category,
+ * preserving the array's order. A blank category (`""`) starts no header —
+ * each such check renders on its own with `header: null`, wherever it falls
+ * in the sequence — while a run of checks sharing a real category (the doc's
+ * true nested groups, e.g. Designer's Narrative) renders under one header.
+ */
+function groupSequential(checks: ComplianceCheck[]): { header: string | null; items: ComplianceCheck[] }[] {
+  const runs: { header: string | null; items: ComplianceCheck[] }[] = []
   for (const c of checks) {
-    const arr = groups.get(c.category) ?? []
-    arr.push(c)
-    groups.set(c.category, arr)
+    const last = runs[runs.length - 1]
+    if (c.category && last?.header === c.category) {
+      last.items.push(c)
+    } else if (!c.category && last?.header === null) {
+      last.items.push(c)
+    } else {
+      runs.push({ header: c.category || null, items: [c] })
+    }
   }
-  return [...groups.entries()]
+  return runs
 }
 
 export default function ChecklistManager({ userId, onChange, onClose }: ChecklistManagerProps) {
@@ -181,7 +193,7 @@ export default function ChecklistManager({ userId, onChange, onClose }: Checklis
   }, [userId])
 
   const categories = useMemo(
-    () => [...new Set(checks.map(c => c.category))], [checks],
+    () => [...new Set(checks.map(c => c.category).filter(Boolean))], [checks],
   )
   const enabledCount = checks.filter(c => c.enabled).length
 
@@ -266,13 +278,16 @@ export default function ChecklistManager({ userId, onChange, onClose }: Checklis
           {loading ? (
             <p className="py-8 text-center text-sm text-gray-400">Loading checklist…</p>
           ) : (
-            groupByCategory(checks).map(([category, items]) => (
-              <div key={category}>
-                <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-gray-400">
-                  {category}
-                </p>
+            groupSequential(checks).map((run, runIndex) => (
+              <div key={runIndex}
+                className={run.header ? 'rounded-xl border border-[#1B3A6B]/15 bg-[#1B3A6B]/[0.02] p-3' : ''}>
+                {run.header && (
+                  <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-[#1B3A6B]">
+                    {run.header}
+                  </p>
+                )}
                 <div className="space-y-2">
-                  {items.map(c => (
+                  {run.items.map(c => (
                     editingKey === c.check_key ? (
                       <CheckForm key={c.check_key} initial={c} categories={categories}
                         onCancel={() => setEditingKey(null)}

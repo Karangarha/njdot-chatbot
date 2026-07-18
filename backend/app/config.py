@@ -35,6 +35,12 @@ class Config:
     # Environment
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 
+    # Max concurrent LLM calls when evaluating a review's checklist
+    # (app.compliance.eval_engine.evaluate_checks) — each check is one
+    # structured-output call; running several at once cuts wall-clock review
+    # time, but too high a value risks tripping provider rate limits.
+    REVIEW_CHECK_CONCURRENCY: int = int(os.getenv("REVIEW_CHECK_CONCURRENCY", "8"))
+
     # Frontend origin for CORS (set to Vercel URL in production)
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
 

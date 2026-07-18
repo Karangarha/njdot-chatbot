@@ -22,13 +22,16 @@ benefit, but it's a minority of the catalog.
 from __future__ import annotations
 
 import logging
-from typing import Callable, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Callable, Dict, List, Optional, Tuple
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.runnables import Runnable
 from langchain_neo4j import Neo4jGraph
 
 from app.compliance.catalog import CheckDef
+from app.config import config
 from app.models import EvaluationSchema, ReviewCheckResult
 
 logger = logging.getLogger(__name__)
@@ -215,6 +218,64 @@ def build_narrative_text(graph: Neo4jGraph, project_id: str = "default") -> str:
     return "DESIGNER'S NARRATIVE:\n\n" + "\n\n".join(parts)
 
 
+def _evaluate_one_check(
+    check: CheckDef,
+    structured_llm: Runnable,
+    schedule_facts: str,
+    narrative_text: str,
+    sp_search_fn: Optional[Callable[[str], str]],
+) -> Tuple[ReviewCheckResult, Dict[str, int]]:
+    """Evaluate a single check and return its result plus that call's token
+    usage. Touches no shared state — safe to run concurrently in a worker
+    thread (see ``evaluate_checks``'s ``ThreadPoolExecutor``).
+    """
+    usage_totals = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "llm_call_count": 0}
+    sources = check.source_files or ["schedule"]
+
+    if "sp" in sources and sp_search_fn is None:
+        return ReviewCheckResult(
+            id=check.check_key, category=check.category, name=check.name,
+            status="Missing", evidence="No Special Provision was uploaded for this review.",
+            source="no data provided",
+        ), usage_totals
+
+    evidence_parts: List[str] = []
+    if "schedule" in sources:
+        evidence_parts.append(schedule_facts)
+    if "narrative" in sources:
+        evidence_parts.append(narrative_text)
+    if "sp" in sources:
+        evidence_parts.append(sp_search_fn(check.instruction))
+    evidence = "\n\n".join(evidence_parts) if evidence_parts else schedule_facts
+
+    user_msg = f"{evidence}\n\nCHECK: {check.name}\n{check.instruction}"
+    try:
+        raw_result = structured_llm.invoke([
+            SystemMessage(content=_STATIC_SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ])
+        usage_totals["llm_call_count"] = 1
+        usage = getattr(raw_result.get("raw"), "usage_metadata", None) or {}
+        usage_totals["input_tokens"] = usage.get("input_tokens", 0) or 0
+        usage_totals["output_tokens"] = usage.get("output_tokens", 0) or 0
+        usage_totals["cached_tokens"] = (usage.get("input_token_details") or {}).get("cache_read", 0) or 0
+
+        result: Optional[EvaluationSchema] = raw_result.get("parsed")
+        if result is None:
+            raise ValueError(f"structured output parsing failed: {raw_result.get('parsing_error')}")
+    except Exception:
+        logger.exception("evaluate_checks: check %s failed", check.check_key)
+        result = EvaluationSchema(
+            status="Missing", evidence="Evaluation failed due to an internal error.",
+            source="error",
+        )
+
+    return ReviewCheckResult(
+        id=check.check_key, category=check.category, name=check.name,
+        status=result.status, evidence=result.evidence, source=result.source,
+    ), usage_totals
+
+
 def evaluate_checks(
     checks: List[CheckDef],
     graph: Neo4jGraph,
@@ -222,7 +283,8 @@ def evaluate_checks(
     sp_search_fn: Optional[Callable[[str], str]] = None,
     project_id: str = "default",
 ) -> List[ReviewCheckResult]:
-    """Run the batch checklist loop: one structured-output LLM call per check.
+    """Run the batch checklist: one structured-output LLM call per check, up
+    to ``config.REVIEW_CHECK_CONCURRENCY`` running at once.
 
     Each check's evidence is built from exactly the document(s) named in
     ``check.source_files`` — ``"schedule"`` and ``"narrative"`` are each
@@ -231,6 +293,12 @@ def evaluate_checks(
     ``retrieval_langchain.sp_retriever.retrieve_sp_chunks`` bound to a
     session). A check requesting ``"sp"`` when ``sp_search_fn`` is ``None``
     (no Special Provision uploaded) is marked "Missing" without an LLM call.
+
+    Checks are dispatched to a thread pool (bounded by
+    ``REVIEW_CHECK_CONCURRENCY`` to stay under LLM provider rate limits) and
+    reassembled in the original catalog order regardless of completion
+    order, since callers (the frontend's checklist grouping) depend on that
+    order.
 
     Logs a token-usage summary (input/output/total, plus any cached input
     tokens) to the server console when done — ``include_raw=True`` is needed
@@ -252,58 +320,29 @@ def evaluate_checks(
     ])
     narrative_text = build_narrative_text(graph, project_id)
 
-    results: List[ReviewCheckResult] = []
-    for check in checks:
-        sources = check.source_files or ["schedule"]
+    results_by_index: Dict[int, ReviewCheckResult] = {}
+    with ThreadPoolExecutor(max_workers=config.REVIEW_CHECK_CONCURRENCY) as executor:
+        future_to_index = {
+            executor.submit(
+                _evaluate_one_check, check, structured_llm, schedule_facts, narrative_text, sp_search_fn,
+            ): i
+            for i, check in enumerate(checks)
+        }
+        for future in as_completed(future_to_index):
+            i = future_to_index[future]
+            result, usage = future.result()
+            results_by_index[i] = result
+            total_input_tokens += usage["input_tokens"]
+            total_output_tokens += usage["output_tokens"]
+            total_cached_tokens += usage["cached_tokens"]
+            llm_call_count += usage["llm_call_count"]
 
-        if "sp" in sources and sp_search_fn is None:
-            results.append(ReviewCheckResult(
-                id=check.check_key, category=check.category, name=check.name,
-                status="Missing", evidence="No Special Provision was uploaded for this review.",
-                source="no data provided",
-            ))
-            continue
-
-        evidence_parts: List[str] = []
-        if "schedule" in sources:
-            evidence_parts.append(schedule_facts)
-        if "narrative" in sources:
-            evidence_parts.append(narrative_text)
-        if "sp" in sources:
-            evidence_parts.append(sp_search_fn(check.instruction))
-        evidence = "\n\n".join(evidence_parts) if evidence_parts else schedule_facts
-
-        user_msg = f"{evidence}\n\nCHECK: {check.name}\n{check.instruction}"
-        try:
-            raw_result = structured_llm.invoke([
-                SystemMessage(content=_STATIC_SYSTEM_PROMPT),
-                HumanMessage(content=user_msg),
-            ])
-            llm_call_count += 1
-            usage = getattr(raw_result.get("raw"), "usage_metadata", None) or {}
-            total_input_tokens += usage.get("input_tokens", 0) or 0
-            total_output_tokens += usage.get("output_tokens", 0) or 0
-            total_cached_tokens += (usage.get("input_token_details") or {}).get("cache_read", 0) or 0
-
-            result: Optional[EvaluationSchema] = raw_result.get("parsed")
-            if result is None:
-                raise ValueError(f"structured output parsing failed: {raw_result.get('parsing_error')}")
-        except Exception:
-            logger.exception("evaluate_checks: check %s failed", check.check_key)
-            result = EvaluationSchema(
-                status="Missing", evidence="Evaluation failed due to an internal error.",
-                source="error",
-            )
-
-        results.append(ReviewCheckResult(
-            id=check.check_key, category=check.category, name=check.name,
-            status=result.status, evidence=result.evidence, source=result.source,
-        ))
+    results = [results_by_index[i] for i in range(len(checks))]
 
     logger.info(
-        "evaluate_checks: %d checks evaluated (%d LLM calls) | tokens: %d in "
+        "evaluate_checks: %d checks evaluated (%d LLM calls, concurrency=%d) | tokens: %d in "
         "(%d cached) / %d out / %d total",
-        len(results), llm_call_count, total_input_tokens, total_cached_tokens,
-        total_output_tokens, total_input_tokens + total_output_tokens,
+        len(results), llm_call_count, config.REVIEW_CHECK_CONCURRENCY, total_input_tokens,
+        total_cached_tokens, total_output_tokens, total_input_tokens + total_output_tokens,
     )
     return results
