@@ -442,3 +442,92 @@ def seed_special_provision(
     stats = {"chunks": len(chunk_rows)}
     logger.info("seed_special_provision: %s", stats)
     return stats
+
+
+def seed_key_map(
+    graph: Neo4jGraph,
+    chunks: List[Dict[str, Any]],
+    vectors: List[List[float]],
+    extraction_json: Optional[str] = None,
+    project_id: str = "default",
+) -> Dict[str, int]:
+    """Seed key map chunks as KeyMapChunk nodes (mirroring
+    ``seed_special_provision``) plus one KeyMapDoc node carrying the
+    structured extraction (``ingestion.keymap_extractor.KeyMapExtraction``)
+    so a re-run can rehydrate it without repeating the extraction LLM call.
+
+    ``extraction_json`` must be a JSON *string* (``model_dump_json()``) —
+    Neo4j properties can't hold nested maps.
+    """
+    chunk_rows = [
+        {
+            "id": f"km-{i}",
+            "content": c.get("content", ""),
+            "pagePdf": (c.get("metadata") or {}).get("page_pdf"),
+            "embedding": vectors[i] if i < len(vectors) else None,
+        }
+        for i, c in enumerate(chunks)
+    ]
+    if chunk_rows:
+        graph.query(
+            "UNWIND $rows AS row "
+            "MERGE (k:KeyMapChunk {id: row.id, projectId: $projectId}) "
+            "SET k += row",
+            params={"rows": chunk_rows, "projectId": project_id},
+        )
+    if extraction_json:
+        graph.query(
+            "MERGE (d:KeyMapDoc {projectId: $projectId}) "
+            "SET d.extractionJson = $json",
+            params={"projectId": project_id, "json": extraction_json},
+        )
+
+    stats = {"chunks": len(chunk_rows), "extraction": 1 if extraction_json else 0}
+    logger.info("seed_key_map: %s", stats)
+    return stats
+
+
+def seed_estimate(
+    graph: Neo4jGraph,
+    chunks: List[Dict[str, Any]],
+    vectors: List[List[float]],
+    extraction_json: Optional[str] = None,
+    project_id: str = "default",
+) -> Dict[str, int]:
+    """Seed the cost estimate as EstimateChunk nodes plus one EstimateDoc
+    node carrying the structured extraction
+    (``ingestion.estimate_extractor.EstimateExtraction``).
+
+    Persisting the extraction matters more here than for the other documents:
+    DBE Goal Memos are scans, so rebuilding it means another vision call —
+    the most expensive single call in the review pipeline. A re-run reads it
+    back instead (see ``api.review._read_estimate_extraction_from_graph``).
+    ``extraction_json`` must be a JSON *string* (``model_dump_json()``) —
+    Neo4j properties can't hold nested maps.
+    """
+    chunk_rows = [
+        {
+            "id": f"est-{i}",
+            "content": c.get("content", ""),
+            "pagePdf": (c.get("metadata") or {}).get("page_pdf"),
+            "embedding": vectors[i] if i < len(vectors) else None,
+        }
+        for i, c in enumerate(chunks)
+    ]
+    if chunk_rows:
+        graph.query(
+            "UNWIND $rows AS row "
+            "MERGE (e:EstimateChunk {id: row.id, projectId: $projectId}) "
+            "SET e += row",
+            params={"rows": chunk_rows, "projectId": project_id},
+        )
+    if extraction_json:
+        graph.query(
+            "MERGE (d:EstimateDoc {projectId: $projectId}) "
+            "SET d.extractionJson = $json",
+            params={"projectId": project_id, "json": extraction_json},
+        )
+
+    stats = {"chunks": len(chunk_rows), "extraction": 1 if extraction_json else 0}
+    logger.info("seed_estimate: %s", stats)
+    return stats

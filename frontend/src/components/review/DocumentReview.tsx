@@ -37,6 +37,14 @@ interface ReviewResult {
   schedule_file_path?: string | null
   narrative_pdf_path?: string | null
   special_provision_pdf_path?: string | null
+  key_map_pdf_path?: string | null
+  // Full key map extraction (utilities, coordinates, sheet index, misc) +
+  // deterministic north/south-of-I-195 result — persisted for later use.
+  key_map?: { extraction: any; region: any } | null
+  estimate_pdf_path?: string | null
+  // Engineer's Estimate extraction + the deterministic Substantial-to-Final
+  // gap computation — persisted for later use.
+  estimate?: { extraction: any; cost_gap: any } | null
 }
 
 interface DocumentReviewProps {
@@ -62,18 +70,10 @@ const HEADER_SECTIONS = [
   "Designer's Narrative",
 ]
 
-// Mirrors backend/app/compliance/catalog.py's MANUAL_REVIEW_KEYS — used only
-// as a defensive fallback for older saved review results whose stored
-// `summary` predates the `manual_review` field.
-const MANUAL_REVIEW_KEYS = [
-  'utility_alignment', 'environmental_permit', 'edq_items', 'traffic_control_staging',
-  'summer_shutdown', 'required_activities_present', 'multi_year_funding', 'nearby_projects',
-]
-
 // Purely descriptive topic labels for the pre-review "What gets checked" teaser.
 const WHAT_GETS_CHECKED = [
   'Administrative Dates', 'Environmental, Landscape & Utilities', 'Weather & Materials',
-  'Schedule Logic', "Designer's Narrative", 'Manual Review',
+  'Schedule Logic', "Designer's Narrative", 'Project Location & Utility Alignment',
 ]
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
@@ -261,6 +261,8 @@ export default function DocumentReview({
   const [scheduleFile,  setScheduleFile]  = useState<File | null>(null)
   const [narrativeFile, setNarrativeFile] = useState<File | null>(null)
   const [spFile,        setSpFile]        = useState<File | null>(null)
+  const [keyMapFile,    setKeyMapFile]    = useState<File | null>(null)
+  const [estimateFile,  setEstimateFile]  = useState<File | null>(null)
   const [isLoading,     setIsLoading]     = useState(false)
   const [error,         setError]         = useState<string | null>(null)
   const [result,        setResult]        = useState<ReviewResult | null>(null)
@@ -270,6 +272,7 @@ export default function DocumentReview({
   const [expanded,      setExpanded]      = useState<Record<string, boolean>>(
     Object.fromEntries(HEADER_SECTIONS.map(s => [s, true]))
   )
+  const [statusFilter,  setStatusFilter]  = useState<CheckItem['status'] | null>(null)
   const [effectiveChecks, setEffectiveChecks] = useState<ComplianceCheck[]>([])
   const [checklistOpen,   setChecklistOpen]   = useState(false)
   const [isRerunning,     setIsRerunning]     = useState(false)
@@ -278,6 +281,8 @@ export default function DocumentReview({
   const scheduleRef       = useRef<HTMLInputElement>(null)
   const narrativeRef      = useRef<HTMLInputElement>(null)
   const spRef             = useRef<HTMLInputElement>(null)
+  const keyMapRef         = useRef<HTMLInputElement>(null)
+  const estimateRef       = useRef<HTMLInputElement>(null)
   const currentProjectRef = useRef<string | null>(null)
   // Synchronous re-entrancy guards — refs update instantly (unlike state),
   // so they catch a fast double-click that fires both `click` events before
@@ -296,8 +301,17 @@ export default function DocumentReview({
       setResult(null)
       setSessionId(null)
       setActiveTab('review')
+      setStatusFilter(null)
+      currentProjectRef.current = null
       return
     }
+    // Skip re-fetching if this project's data is already loaded live (e.g.
+    // runReview() just saved + selected it) — avoids a race where this
+    // effect's DB read (still showing the pre-update session_id: null row,
+    // before runReview()'s follow-up .update() call lands) stomps the
+    // freshly-set, correct sessionId with null, hiding the Compliance
+    // Results/Document Q&A tabs until the page is reloaded.
+    if (currentProjectRef.current === selectedProjectId) return
     const sb = createClient()
     sb.from('review_projects')
       .select('*')
@@ -308,6 +322,7 @@ export default function DocumentReview({
         setResult(data.review_result as ReviewResult)
         setSessionId(data.session_id ?? null)
         setActiveTab('review')
+        setStatusFilter(null)
         currentProjectRef.current = data.id
       })
   }, [selectedProjectId])
@@ -377,18 +392,17 @@ export default function DocumentReview({
       reviewForm.append('schedule_file', scheduleFile)
       reviewForm.append('narrative_pdf', narrativeFile)
       if (spFile) reviewForm.append('special_provision_pdf', spFile)
+      if (keyMapFile) reviewForm.append('key_map_pdf', keyMapFile)
+      if (estimateFile) reviewForm.append('estimate_pdf', estimateFile)
       if (specs.length > 0) reviewForm.append('checks', JSON.stringify(specs))
 
-      const sessionForm = new FormData()
-      sessionForm.append('narrative_pdf', narrativeFile)
-      sessionForm.append('xer_file', scheduleFile)
-      if (spFile) sessionForm.append('special_provision_pdf', spFile)
-
-      // ── Fire review + session upload in parallel ──────────────────────────
-      const [reviewRes, sessionRes] = await Promise.all([
-        fetch(`${API_BASE}/api/review`,         { method: 'POST', headers, body: reviewForm }),
-        fetch(`${API_BASE}/api/session/upload`, { method: 'POST', headers, body: sessionForm }),
-      ])
+      // /api/review already chunks, embeds, and stores the schedule/narrative/SP
+      // data under project_id. Session upload reuses that same data (passing
+      // project_id instead of re-uploading the files) rather than redoing the
+      // same parsing/embedding work a second time — see _process_session_reuse
+      // in backend/app/api/session.py. This necessarily runs after review
+      // resolves (project_id isn't known until then).
+      const reviewRes = await fetch(`${API_BASE}/api/review`, { method: 'POST', headers, body: reviewForm })
 
       if (!reviewRes.ok) {
         let detail = `Request failed with status ${reviewRes.status}`
@@ -398,6 +412,11 @@ export default function DocumentReview({
 
       const data = await reviewRes.json() as ReviewResult
       setResult(data)
+      setStatusFilter(null)
+
+      const sessionForm = new FormData()
+      sessionForm.append('project_id', data.project_id)
+      const sessionRes = await fetch(`${API_BASE}/api/session/upload`, { method: 'POST', headers, body: sessionForm })
 
       // ── Save review result to DB ──────────────────────────────────────────
       // The backend already uploaded the original files to Storage (when
@@ -419,6 +438,8 @@ export default function DocumentReview({
             schedule_file_path:          data.schedule_file_path ?? null,
             narrative_pdf_path:          data.narrative_pdf_path ?? null,
             special_provision_pdf_path:  data.special_provision_pdf_path ?? null,
+            key_map_pdf_path:            data.key_map_pdf_path ?? null,
+            estimate_pdf_path:           data.estimate_pdf_path ?? null,
           })
           .select()
           .single()
@@ -489,6 +510,7 @@ export default function DocumentReview({
         throw new Error(detail)
       }
       setResult(await res.json() as ReviewResult)
+      setStatusFilter(null)
     } catch (err) {
       setRerunError(err instanceof Error ? err.message : 'An unexpected error occurred.')
     } finally {
@@ -501,6 +523,7 @@ export default function DocumentReview({
 
   if (result) {
     const { summary, checks, project_name, project_duration_days, model_used } = result
+    const visibleChecks = statusFilter ? checks.filter(c => c.status === statusFilter) : checks
     return (
       <>
       <div className="h-full flex flex-col bg-[#F5F5F5]">
@@ -540,10 +563,10 @@ export default function DocumentReview({
                 </svg>
                 Download PDF
               </button>
-              <button onClick={() => { setResult(null); setSessionId(null); setRerunError(null); onNewReview?.() }}
+              <button onClick={() => { setResult(null); setSessionId(null); setRerunError(null); setStatusFilter(null); onNewReview?.() }}
                 className="flex items-center gap-1.5 rounded-lg border border-[#E8E8E8] bg-white px-3 py-2 text-xs font-semibold text-gray-600 shadow-sm hover:border-[#1B3A6B]/30 hover:text-[#1B3A6B] transition-colors">
-                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99" />
+                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
                 </svg>
                 New Review
               </button>
@@ -556,21 +579,32 @@ export default function DocumentReview({
             </div>
           )}
 
-          {/* Summary pills */}
-          <div className="mt-3 flex flex-wrap gap-2">
-            <span className="flex items-center gap-1.5 rounded-full bg-green-100 px-3 py-1 text-[11px] font-bold text-green-700">
+          {/* Summary pills — click to filter the list below, click again to clear */}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <button onClick={() => setStatusFilter(f => f === 'pass' ? null : 'pass')}
+              aria-pressed={statusFilter === 'pass'}
+              className={`flex items-center gap-1.5 rounded-full bg-green-100 px-3 py-1 text-[11px] font-bold text-green-700 transition-shadow ${
+                statusFilter === 'pass' ? 'ring-2 ring-green-500' : statusFilter ? 'opacity-50' : ''}`}>
               <span className="h-1.5 w-1.5 rounded-full bg-green-500 inline-block" />{summary.passed} Passed
-            </span>
-            <span className="flex items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-[11px] font-bold text-amber-700">
+            </button>
+            <button onClick={() => setStatusFilter(f => f === 'warning' ? null : 'warning')}
+              aria-pressed={statusFilter === 'warning'}
+              className={`flex items-center gap-1.5 rounded-full bg-amber-100 px-3 py-1 text-[11px] font-bold text-amber-700 transition-shadow ${
+                statusFilter === 'warning' ? 'ring-2 ring-amber-500' : statusFilter ? 'opacity-50' : ''}`}>
               <span className="h-1.5 w-1.5 rounded-full bg-amber-500 inline-block" />{summary.warnings} Warning{summary.warnings !== 1 ? 's' : ''}
-            </span>
-            <span className="flex items-center gap-1.5 rounded-full bg-red-100 px-3 py-1 text-[11px] font-bold text-red-700">
+            </button>
+            <button onClick={() => setStatusFilter(f => f === 'fail' ? null : 'fail')}
+              aria-pressed={statusFilter === 'fail'}
+              className={`flex items-center gap-1.5 rounded-full bg-red-100 px-3 py-1 text-[11px] font-bold text-red-700 transition-shadow ${
+                statusFilter === 'fail' ? 'ring-2 ring-red-500' : statusFilter ? 'opacity-50' : ''}`}>
               <span className="h-1.5 w-1.5 rounded-full bg-red-500 inline-block" />{summary.failed} Failed
-            </span>
-            <span className="flex items-center gap-1.5 rounded-full bg-gray-100 px-3 py-1 text-[11px] font-bold text-gray-600">
-              <span className="h-1.5 w-1.5 rounded-full bg-gray-400 inline-block" />
-              {summary.manual_review ?? checks.filter(c => MANUAL_REVIEW_KEYS.includes(c.id)).length} Manual Review
-            </span>
+            </button>
+            {statusFilter && (
+              <button onClick={() => setStatusFilter(null)}
+                className="text-[11px] font-semibold text-gray-400 hover:text-gray-600 underline">
+                Clear filter
+              </button>
+            )}
           </div>
 
           {/* Tabs (only when session exists) */}
@@ -592,18 +626,24 @@ export default function DocumentReview({
         {activeTab === 'review' || !sessionId ? (
           <div className="flex-1 overflow-y-auto">
             <div className="mx-auto max-w-3xl px-5 py-6 space-y-3">
-              {groupSequential(checks).map((run, i) => (
-                run.header ? (
-                  <CollapsibleSection key={run.header} title={run.header}
-                    checks={run.items}
-                    expanded={expanded[run.header] ?? true}
-                    onToggle={() => toggleSection(run.header!)} />
-                ) : (
-                  <div key={i} className="space-y-2.5">
-                    {run.items.map(check => <CheckCard key={check.id} check={check} />)}
-                  </div>
-                )
-              ))}
+              {visibleChecks.length === 0 ? (
+                <p className="py-8 text-center text-sm text-gray-400">
+                  No {statusFilter === 'pass' ? 'passed' : statusFilter === 'warning' ? 'warning' : 'failed'} checks.
+                </p>
+              ) : (
+                groupSequential(visibleChecks).map((run, i) => (
+                  run.header ? (
+                    <CollapsibleSection key={run.header} title={run.header}
+                      checks={run.items}
+                      expanded={expanded[run.header] ?? true}
+                      onToggle={() => toggleSection(run.header!)} />
+                  ) : (
+                    <div key={i} className="space-y-2.5">
+                      {run.items.map(check => <CheckCard key={check.id} check={check} />)}
+                    </div>
+                  )
+                ))
+              )}
             </div>
           </div>
         ) : (
@@ -646,8 +686,9 @@ export default function DocumentReview({
           </button>
         </div>
         <p className="mb-8 text-sm text-gray-500">
-          Upload the CPM schedule (.xer), designer narrative, and optionally a Special Provision PDF
-          to run an automated NJDOT compliance review and enable document Q&A.
+          Upload the CPM schedule (.xer), designer narrative, and optionally a Special Provision
+          PDF, key map sheet, and DBE Goal Memo to run an automated NJDOT compliance review and
+          enable document Q&A.
         </p>
 
         {/* Row 1: XER + Narrative */}
@@ -660,14 +701,34 @@ export default function DocumentReview({
             onSelect={setNarrativeFile} onRemove={() => setNarrativeFile(null)} />
         </div>
 
-        {/* Row 2: Special Provision */}
+        {/* Row 2: Special Provision + Key Map + Estimate */}
         <div className="mb-6">
-          <UploadZone label="Special Provision PDF" file={spFile} inputRef={spRef}
-            accept="application/pdf" acceptValidationText="PDF only · ~200 pages"
-            optional onSelect={setSpFile} onRemove={() => setSpFile(null)} />
+          <div className="flex flex-col gap-4 sm:flex-row sm:flex-wrap">
+            <UploadZone label="Special Provision PDF" file={spFile} inputRef={spRef}
+              accept="application/pdf" acceptValidationText="PDF only · ~200 pages"
+              optional onSelect={setSpFile} onRemove={() => setSpFile(null)} />
+            <UploadZone label="Key Map Sheet PDF" file={keyMapFile} inputRef={keyMapRef}
+              accept="application/pdf" acceptValidationText="PDF only · 1-3 sheets"
+              optional onSelect={setKeyMapFile} onRemove={() => setKeyMapFile(null)} />
+            <UploadZone label="DBE Goal Memo / Estimate PDF" file={estimateFile} inputRef={estimateRef}
+              accept="application/pdf" acceptValidationText="PDF only · first page"
+              optional onSelect={setEstimateFile} onRemove={() => setEstimateFile(null)} />
+          </div>
           {spFile && (
             <p className="mt-1.5 text-[11px] text-gray-400">
               Special Provision will be indexed in the background for Document Q&A.
+            </p>
+          )}
+          {keyMapFile && (
+            <p className="mt-1.5 text-[11px] text-gray-400">
+              Key map is used for utility cross-checks, project location (north/south of I-195),
+              and Document Q&A.
+            </p>
+          )}
+          {estimateFile && (
+            <p className="mt-1.5 text-[11px] text-gray-400">
+              First page only — the Engineer&apos;s Estimate drives the 60/90-day
+              Substantial-to-Final completion gap rule.
             </p>
           )}
         </div>
@@ -690,7 +751,7 @@ export default function DocumentReview({
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
             <span className="text-sm font-medium text-[#1B3A6B]">
-              Analyzing documents… this may take up to 30 seconds
+              Analyzing documents… this may take up to 1 min 30 seconds
             </span>
           </div>
         ) : (

@@ -41,12 +41,14 @@ class CheckDef:
     """One compliance check definition.
 
     ``instruction`` is the natural-language rule injected into the LLM prompt.
-    Every check is evaluated the same way, in one ``/api/review`` LLM call that
-    receives the schedule markdown, the full narrative PDF, the full Special
-    Provision PDF (when uploaded), and keyword-searched Construction Scheduling
-    Manual excerpts relevant to the enabled checks. ``check_type`` is kept as
-    descriptive metadata (currently always ``"llm"``) for forward compatibility;
-    nothing branches on it.
+    ``check_type`` selects the evaluation path in
+    ``app.compliance.eval_engine._evaluate_one_check``: ``"llm"`` (default,
+    one structured-output LLM call over the check's evidence) or one of the
+    deterministic types in that module's ``_DETERMINISTIC_EVALUATORS``
+    registry, which compute their result in Python and make no LLM call —
+    ``"geo"`` (north/south of I-195 from the key map's coordinates, see
+    ``app.compliance.geo``) and ``"cost_gap"`` (Substantial-to-Final day gap
+    from the Engineer's Estimate, see ``app.compliance.cost``).
     """
 
     check_key: str
@@ -57,10 +59,11 @@ class CheckDef:
     # Which document(s) app.compliance.eval_engine.evaluate_checks() should
     # draw evidence from for this check: any combination of "schedule"
     # (CPM facts + milestones + activity roster, from Neo4j), "narrative"
-    # (full designer-narrative text, from Neo4j), and "sp" (Special
-    # Provision retrieval). Explicit per-check — set by the user when they
-    # add a custom check ("select the file(s)"), defaulted by category for
-    # built-ins.
+    # (full designer-narrative text, from Neo4j), "sp" (Special Provision
+    # retrieval), "keymap" (key map facts extracted from the key sheet),
+    # "spec"/"csm" (static reference collections). Explicit per-check — set
+    # by the user when they add a custom check ("select the file(s)"),
+    # defaulted by category for built-ins.
     source_files: List[str] = field(default_factory=lambda: ["schedule"])
 
     def as_dict(self) -> dict:
@@ -74,13 +77,20 @@ class CheckDef:
 # Fabrication Lead Times, Designer's Narrative) carry a category, which the
 # checklist editor renders as a header. Everything else is uncategorized.
 BUILTIN_CHECKS: List[CheckDef] = [
-    # ── Manual Review: utility alignment vs. Key-Map / Special Provisions ──────
+    # ── Utility alignment: key map vs. Special Provisions ─────────────────────
     CheckDef(
         "utility_alignment", CAT_NONE,
         "Utility Alignments Match Key Sheet and Special Provisions",
-        "Cross-check utility alignments against the Special Provisions attached "
-        "above. Mark warning if the Special Provision was not provided.",
-        source_files=["sp"],
+        "The KEY MAP FACTS section lists the utility owners/departments shown "
+        "on the project key map. Compare that list against the utility "
+        "companies named in the Special Provisions excerpts. Pass if the two "
+        "agree — allow name variations for the same company (e.g. 'PSE&G' vs "
+        "'Public Service Electric & Gas', 'NJAW' vs 'New Jersey American "
+        "Water'). Fail and list every utility that appears on the key map but "
+        "is never mentioned in the Special Provisions, or is named in the "
+        "Special Provisions but absent from the key map. Mark Missing if "
+        "either document contains no utility information.",
+        source_files=["keymap", "sp"],
     ),
 
     # ── Administrative Dates ──────────────────────────────────────────────────
@@ -140,7 +150,7 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Assess environmental permit compliance using the narrative and the "
         "attached Special Provision / Scheduling Manual excerpts beyond what the "
         "narrative alone asserts.",
-        source_files=["sp"],
+        source_files=["sp", "csm"],
     ),
     CheckDef(
         "landscape_season", CAT_NONE,
@@ -215,12 +225,14 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Cold Weather Concreting per Section 504.03.02.C is applied and the winter "
         "work is identified in the narrative. Mark warning if no winter concrete work "
         "is present.",
+        source_files=["schedule", "spec"],
     ),
     CheckDef(
         "concrete_cure_time", CAT_WEATHER_PAVING,
         "Concrete Cure Time Accounted For (507.03.02.J)",
         "Verify the schedule accounts for concrete cure time per Section 507.03.02.J "
         "(cure durations reflected before dependent activities begin).",
+        source_files=["schedule", "spec"],
     ),
     CheckDef(
         "no_paving_winter", CAT_WEATHER_PAVING,
@@ -237,11 +249,25 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "December 15 and March 15.",
     ),
     CheckDef(
+        "project_region_i195", CAT_NONE,
+        "Project Location North/South of I-195 (from Key Map Coordinates)",
+        "Deterministic: computed from the key map's latitude/longitude against "
+        "the I-195 alignment — no AI judgement involved. Reports whether the "
+        "project is NORTH or SOUTH of I-195.",
+        check_type="geo",
+        source_files=["keymap"],
+    ),
+    CheckDef(
         "substantial_regional_deadlines", CAT_NONE,
         "Substantial Completion Before Oct 1 (North/Central NJ) or Oct 15 (South NJ)",
-        "Determine the project geography. Substantial Completion must be before "
-        "October 1 for projects North or Central Jersey, and before October 15 for "
-        "projects South Jersey. Mark warning if the geography is unknown.",
+        "The KEY MAP FACTS section contains a deterministic 'GEOGRAPHY' line "
+        "stating whether the project is NORTH or SOUTH of I-195. NORTH of "
+        "I-195 (North/Central NJ): the Substantial Completion milestone must "
+        "fall before October 1. SOUTH of I-195 (South NJ): before October 15. "
+        "Compare the Substantial Completion milestone date from the schedule "
+        "facts against the applicable deadline. Mark Missing if the geography "
+        "line is unresolved or the milestone date is absent.",
+        source_files=["schedule", "keymap"],
     ),
 
     # ── Working Drawings, Materials & ITS ─────────────────────────────────────
@@ -250,6 +276,7 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Working Drawing Review Durations (30/45 Days)",
         "Verify that working-drawing review activities allow the required review "
         "durations (30 or 45 days, as applicable to the submittal type).",
+        source_files=["schedule", "spec"],
     ),
 
     # ── Material Fabrication Lead Times (nested under one parent line in the
@@ -311,10 +338,13 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "substantial_to_final", CAT_NONE,
         "Substantial to Final Completion Gap (60 Days <= $50M / 90 Days > $50M)",
-        "Determine the project budget, then verify the calendar-day gap between "
-        "Substantial Completion and Final Completion: at least 60 days for projects "
-        "$50M or less, at least 90 days for projects over $50M. Mark warning if the "
-        "budget is unknown.",
+        "Deterministic: the Engineer's Estimate is read from the uploaded DBE "
+        "Goal Memo and the Substantial/Final Completion milestone dates from "
+        "the schedule; the calendar-day gap is computed in code and compared "
+        "against 60 days ($50M or less) or 90 days (over $50M). No AI "
+        "judgement involved.",
+        check_type="cost_gap",
+        source_files=["schedule", "estimate"],
     ),
 
     # ── Manual Review: EDQ items ───────────────────────────────────────────────
@@ -504,8 +534,11 @@ BUILTIN_CHECKS: List[CheckDef] = [
 # carry no `category` of their own (see CAT_NONE above) since the checklist UI
 # no longer groups by category except for the four true nested sub-check
 # groups — this set is check_key-based so it stays correct independent of that.
+# "utility_alignment" left this set when the key map upload was added — it is
+# now a real LLM-evaluated comparison (key map utilities vs. Special
+# Provisions) rather than a cross-reference the reviewer must do by hand.
 MANUAL_REVIEW_KEYS = frozenset({
-    "utility_alignment", "environmental_permit", "edq_items",
+    "environmental_permit", "edq_items",
     "traffic_control_staging", "summer_shutdown", "required_activities_present",
     "multi_year_funding", "nearby_projects",
 })

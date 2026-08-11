@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import MarkdownAnswer from '@/components/MarkdownAnswer'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -53,6 +54,8 @@ function SourcePill({ source }: { source: Source }) {
   const tagColors: Record<string, string> = {
     'Designer Narrative':             'bg-blue-100 text-blue-700',
     'Special Provision':              'bg-purple-100 text-purple-700',
+    'Key Map':                        'bg-teal-100 text-teal-700',
+    'Estimate':                       'bg-rose-100 text-rose-700',
     'Schedule Activities':            'bg-amber-100 text-amber-700',
     'Construction Scheduling Manual': 'bg-green-100 text-green-700',
   }
@@ -86,7 +89,7 @@ function MessageBubble({ msg }: { msg: Message }) {
               : 'bg-white text-gray-800 shadow-sm ring-1 ring-black/5 rounded-bl-sm'
           }`}
         >
-          {msg.content}
+          {isUser ? msg.content : <MarkdownAnswer content={msg.content} />}
         </div>
         {msg.sources && msg.sources.length > 0 && (
           <div className="flex flex-wrap gap-1 px-1">
@@ -257,6 +260,8 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
         {[
           { label: 'Designer Narrative',             color: 'bg-blue-100 text-blue-700' },
           { label: 'Special Provision',              color: 'bg-purple-100 text-purple-700' },
+          { label: 'Key Map',                        color: 'bg-teal-100 text-teal-700' },
+          { label: 'Estimate',                       color: 'bg-rose-100 text-rose-700' },
           { label: 'Schedule Activities',            color: 'bg-amber-100 text-amber-700' },
           { label: 'Construction Scheduling Manual', color: 'bg-green-100 text-green-700' },
         ].map(s => (
@@ -287,7 +292,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
             <div>
               <p className="text-sm font-semibold text-gray-700">Documents ready</p>
               <p className="mt-0.5 text-xs text-gray-400">
-                Ask anything about the narrative, special provisions, or schedule.
+                Ask anything about the narrative, special provisions, key map, or schedule.
               </p>
             </div>
           </div>

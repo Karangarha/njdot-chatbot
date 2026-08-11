@@ -141,3 +141,5 @@ class ReviewResponse(BaseModel):
     schedule_file_path:            Optional[str] = None
     narrative_pdf_path:            Optional[str] = None
     special_provision_pdf_path:    Optional[str] = None
+    key_map_pdf_path:              Optional[str] = None
+    estimate_pdf_path:             Optional[str] = None

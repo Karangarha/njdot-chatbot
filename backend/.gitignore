@@ -18,6 +18,7 @@
 !app/
 !app/auth.py
 !app/neo4j_client.py
+!app/observability.py
 !app/compliance/
 !app/compliance/*
 !app/graph_neo4j/

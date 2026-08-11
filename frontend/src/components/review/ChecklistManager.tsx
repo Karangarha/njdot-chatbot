@@ -21,6 +21,10 @@ const SOURCE_FILE_OPTIONS: { value: SourceFile; label: string }[] = [
   { value: 'schedule', label: 'Schedule' },
   { value: 'narrative', label: 'Narrative' },
   { value: 'sp', label: 'Special Provision' },
+  { value: 'keymap', label: 'Key Map' },
+  { value: 'estimate', label: 'Cost Estimate' },
+  { value: 'spec', label: 'Standard Specification' },
+  { value: 'csm', label: 'Scheduling Manual' },
 ]
 
 function SourceFilePicker({
@@ -138,6 +142,8 @@ function CheckForm({
 
 const SOURCE_FILE_LABEL: Record<SourceFile, string> = {
   schedule: 'Schedule', narrative: 'Narrative', sp: 'Special Provision',
+  keymap: 'Key Map', estimate: 'Cost Estimate',
+  spec: 'Standard Specification', csm: 'Scheduling Manual',
 }
 
 /**

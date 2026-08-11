@@ -38,12 +38,17 @@ export interface ReviewProject {
   schedule_file_path?: string | null
   narrative_pdf_path?: string | null
   special_provision_pdf_path?: string | null
+  key_map_pdf_path?: string | null
+  estimate_pdf_path?: string | null
   created_at: string
   updated_at: string
 }
 
 // Which document(s) a check draws evidence from — any combination.
-export type SourceFile = 'schedule' | 'narrative' | 'sp'
+// "spec"/"csm" are static, pre-ingested reference collections (Standard
+// Specifications / Construction Scheduling Manual) rather than per-review
+// uploads — see backend/scripts/ingest_specs.py.
+export type SourceFile = 'schedule' | 'narrative' | 'sp' | 'keymap' | 'estimate' | 'spec' | 'csm'
 
 export interface ComplianceCheck {
   id: string
@@ -62,10 +67,13 @@ export interface ComplianceCheck {
 }
 
 // Enabled-only payload sent as the `checks` form field on POST /api/review.
+// check_type must round-trip ("llm" | "geo") — the backend branches on it
+// for deterministic checks (project_region_i195).
 export interface CheckSpec {
   check_key: string
   category: string
   name: string
   instruction: string
+  check_type: string
   source_files: SourceFile[]
 }

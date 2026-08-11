@@ -7,6 +7,7 @@ import { askQuestion } from '@/lib/api'
 import { createClient } from '@/lib/supabase/client'
 import type { BDCAlertItem, CitationItem, Conversation, ReviewProject } from '@/lib/types'
 import DocumentReview from '@/components/review/DocumentReview'
+import MarkdownAnswer from '@/components/MarkdownAnswer'
 
 // ── Local types ────────────────────────────────────────────────────────────────
 
@@ -678,7 +679,7 @@ function SpecAssistantView({
                     }`}
                     style={{ border: '1px solid #e2e8f0', borderLeft: '3px solid #CC2529' }}
                   >
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                    <MarkdownAnswer content={msg.content} />
                   </div>
                   {msg.response_time_ms != null && (
                     <p className="mt-1 pl-1 text-[10px] text-gray-400">

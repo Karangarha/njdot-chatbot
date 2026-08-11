@@ -71,3 +71,8 @@ langchain-openai==1.3.5
 langchain-anthropic==1.4.8
 langchain-neo4j==0.10.0
 numpy
+
+# Observability — traces every LangChain .invoke() call (review + chat) to a
+# self-hosted Langfuse instance for debugging/visualization. No-op if
+# LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY aren't set — see app/observability.py.
+langfuse

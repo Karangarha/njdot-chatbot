@@ -32,6 +32,12 @@ class Config:
     ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
     LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "openai")  # "openai" | "anthropic"
 
+    # Key map north/south-of-I-195 classification (app.compliance.geo).
+    # "hardcoded" = built-in I-195 polyline; "hybrid_google" is reserved for a
+    # later Google-Geocoding sanity check and currently falls back to hardcoded.
+    GEO_REGION_VALIDATION: str = os.getenv("GEO_REGION_VALIDATION", "hardcoded")
+    GOOGLE_MAPS_API_KEY: str = os.getenv("GOOGLE_MAPS_API_KEY", "")  # unused until hybrid
+
     # Environment
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 

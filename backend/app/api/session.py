@@ -36,7 +36,7 @@ import tempfile
 import uuid
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
@@ -55,6 +55,9 @@ from app.ingestion.session_chunker   import (
     chunk_special_provision,
 )
 from app.neo4j_client import get_neo4j
+from app.observability import get_langfuse_handler
+from app.retrieval_langchain.estimate_retriever import build_estimate_tool
+from app.retrieval_langchain.keymap_retriever import build_keymap_tool
 from app.retrieval_langchain.sp_retriever import build_sp_tool, retrieve_sp_chunks
 from app.scheduling import (
     build_calendars,
@@ -280,6 +283,141 @@ def _process_session(
         _set_progress(session_id, status="error", message=str(exc))
 
 
+def _process_session_reuse(session_id: str) -> None:
+    """Populate a chat session by reusing an already-seeded ``/api/review``
+    project's data instead of re-parsing/re-embedding the same PDFs.
+
+    ``session_id`` is literally the review's ``project_id`` — same Neo4j
+    namespace, so the schedule (``Activity``/``WBS``/``Calendar``/``Project``
+    nodes) is already fully seeded and needs no action here. This function
+    only does the two things a review doesn't: narrative entity extraction
+    (review seeds ``NarrativeChunk`` nodes with ``llm=None``, skipping
+    entities — chat needs them for its tool-calling agent) and copying the
+    already-embedded ``SPChunk``/``KeyMapChunk``/``EstimateChunk`` Neo4j rows
+    into Supabase ``session_chunks`` (needed for chat's hybrid-RAG retrieval;
+    review only persists them to Neo4j). No PDF parsing, no CPM, no embedding calls —
+    everything reused here was already computed and stored by
+    ``_run_review_pipeline``.
+
+    Unlike ``_process_session``, this never calls ``clear_project`` — doing
+    so would delete everything the review just seeded under this same id.
+    """
+    try:
+        db = get_db()
+        graph = get_neo4j()
+        graph_saved = False
+        all_chunks: List[Dict[str, Any]] = []
+
+        _set_progress(session_id, status="parsing", message="Linking to review data…")
+
+        # ── Narrative entity extraction, reconstructed from already-seeded
+        # NarrativeChunk nodes (content + embedding already computed by the
+        # review pipeline — no re-parsing, no re-embedding) ────────────────
+        nar_rows = graph.query(
+            "MATCH (c:NarrativeChunk {projectId: $pid}) "
+            "RETURN c.id AS id, c.heading AS heading, c.pagePdf AS pagePdf, "
+            "       c.text AS text, c.embedding AS embedding ORDER BY c.id",
+            params={"pid": session_id},
+        )
+        if nar_rows:
+            _set_progress(session_id, status="parsing", message="Extracting narrative entities…")
+            nar_chunks = [
+                {
+                    "content": row["text"],
+                    "metadata": {
+                        "chunk_index": int(row["id"].split(":")[1]),
+                        "section_heading": row["heading"],
+                        "page_pdf": row["pagePdf"],
+                    },
+                }
+                for row in nar_rows
+            ]
+            nar_vectors = [row["embedding"] for row in nar_rows]
+            activities = graph.query(
+                "MATCH (a:Activity {projectId: $pid}) "
+                "RETURN a.taskId AS activity_id, a.name AS activity_name",
+                params={"pid": session_id},
+            )
+            seed_narrative(graph, nar_chunks, nar_vectors, activities,
+                            project_id=session_id, llm=_extraction_llm())
+            graph_saved = True
+
+        # ── SP + key map: copy already-embedded SPChunk/KeyMapChunk nodes
+        # into session_chunks (no re-parsing, no re-embedding — just a data
+        # copy/reshape) ────────────────────────────────────────────────────
+        sp_rows = graph.query(
+            "MATCH (s:SPChunk {projectId: $pid}) "
+            "RETURN s.id AS id, s.pagePdf AS pagePdf, s.content AS content, "
+            "       s.embedding AS embedding",
+            params={"pid": session_id},
+        )
+        all_chunks.extend(
+            {
+                "content": row["content"],
+                "embedding": row["embedding"],
+                "metadata": {
+                    "doc_type": "special_provision",
+                    "page_pdf": row["pagePdf"],
+                    "chunk_index": int(row["id"].split("-")[1]),
+                },
+            }
+            for row in sp_rows
+        )
+        km_rows = graph.query(
+            "MATCH (k:KeyMapChunk {projectId: $pid}) "
+            "RETURN k.id AS id, k.pagePdf AS pagePdf, k.content AS content, "
+            "       k.embedding AS embedding",
+            params={"pid": session_id},
+        )
+        all_chunks.extend(
+            {
+                "content": row["content"],
+                "embedding": row["embedding"],
+                "metadata": {
+                    "doc_type": "key_map",
+                    "page_pdf": row["pagePdf"],
+                    "chunk_index": int(row["id"].split("-")[1]),
+                },
+            }
+            for row in km_rows
+        )
+        est_rows = graph.query(
+            "MATCH (e:EstimateChunk {projectId: $pid}) "
+            "RETURN e.id AS id, e.pagePdf AS pagePdf, e.content AS content, "
+            "       e.embedding AS embedding",
+            params={"pid": session_id},
+        )
+        all_chunks.extend(
+            {
+                "content": row["content"],
+                "embedding": row["embedding"],
+                "metadata": {
+                    "doc_type": "estimate",
+                    "page_pdf": row["pagePdf"],
+                    "chunk_index": int(row["id"].split("-")[1]),
+                },
+            }
+            for row in est_rows
+        )
+        if all_chunks:
+            _set_progress(session_id, status="storing", message="Storing chunks…")
+            _insert_chunks(db, session_id, all_chunks)
+
+        _set_progress(
+            session_id,
+            status="ready",
+            message="Documents ready. You can now ask questions.",
+            chunk_count=len(all_chunks),
+            has_graph=graph_saved or _has_graph(graph, session_id),
+        )
+        logger.info("Session %s (reused from review): %d chunks stored, graph=%s",
+                    session_id, len(all_chunks), graph_saved)
+
+    except Exception as exc:
+        logger.exception("Session %s (reuse) failed", session_id)
+        _set_progress(session_id, status="error", message=str(exc))
+
+
 # ── Upload endpoint ────────────────────────────────────────────────────────────
 
 @router.post("/upload", summary="Upload project documents for session Q&A")
@@ -288,11 +426,27 @@ async def upload_session(
     narrative_pdf:         Optional[UploadFile] = File(None, description="Designer narrative PDF"),
     special_provision_pdf: Optional[UploadFile] = File(None, description="Special provision PDF (~200 pages)"),
     xer_file:              Optional[UploadFile] = File(None, description="Primavera P6 XER schedule file"),
+    project_id:            Optional[str] = Form(
+        None,
+        description="Reuse an already-seeded /api/review project's data instead of "
+                     "re-uploading/re-processing files. When set, all file fields are ignored.",
+    ),
 ) -> dict:
     """
     Accept project documents and start background ingestion.
     Returns a session_id immediately; poll /status/{session_id} for progress.
+
+    When ``project_id`` is provided, skips file processing entirely and reuses
+    that project's already-seeded Neo4j/SP data instead (see
+    ``_process_session_reuse``) — this is the normal path from the review
+    flow, which already chunked/embedded/stored everything via ``/api/review``.
     """
+    if project_id:
+        session_id = project_id
+        _set_progress(session_id, status="queued", message="Linking session to review…")
+        background_tasks.add_task(_process_session_reuse, session_id)
+        return {"session_id": session_id, "status": "processing"}
+
     if not any([narrative_pdf, special_provision_pdf, xer_file]):
         raise HTTPException(status_code=400, detail="At least one file must be provided.")
 
@@ -375,7 +529,18 @@ async def session_status(session_id: str) -> StreamingResponse:
 _DOC_LABEL: Dict[str, str] = {
     "designer_narrative": "Designer Narrative",
     "special_provision":  "Special Provision",
+    "key_map":            "Key Map",
+    "estimate":           "Estimate",
     "xer_activities":     "Schedule Activities",
+}
+
+# ToolMessage name -> the source label shown in the chat UI's source pills.
+# Anything unlisted (the Cypher/graph tools) is the schedule graph.
+_TOOL_SOURCE_LABEL: Dict[str, str] = {
+    "search_special_provisions": "Special Provision",
+    "search_key_map":            "Key Map",
+    "search_estimate":           "Estimate",
+    "search_narrative":          "Designer Narrative",
 }
 
 _QA_SYSTEM = """\
@@ -415,6 +580,12 @@ You have access to:
       this instead of query_schedule_graph for critical-path questions.
     - search_narrative: semantic search over the designer narrative's full text.
     - search_special_provisions: search the project's Special Provision text.
+    - search_key_map: search the project's key map (key sheet) — utility
+      owners, project location (latitude/longitude), route/municipality,
+      contract numbers, the index of sheets. Cite as [KeyMap].
+    - search_estimate: search the project's DBE Goal Memo / Engineer's
+      Estimate — total estimated construction cost, DBE/ESBE goal, and
+      project identifiers. Cite as [Estimate].
 
 A digest of the project's schedule (data date, computed finish, critical
 path, milestones, phases, cross-check findings) is included below — read it
@@ -495,19 +666,35 @@ async def session_query(req: QueryRequest) -> dict:
     fallback = ChatAnthropic(model=_ANTHROPIC_MODEL, anthropic_api_key=config.ANTHROPIC_API_KEY)
     llm = primary.with_fallbacks([fallback])
 
+    langfuse_handler = get_langfuse_handler()
+    invoke_config = {
+        "callbacks": [langfuse_handler] if langfuse_handler else [],
+        # Verb-first, low-cardinality name (no session_id/question text) so
+        # traces group meaningfully in the Langfuse UI instead of each
+        # question minting a distinct name — see langfuse/skills'
+        # instrumentation best practices on naming conventions.
+        "run_name": "chat-agent-response" if has_graph else "chat-sp-response",
+        "metadata": {
+            "langfuse_session_id": req.session_id,
+            "langfuse_tags": ["chat_agent" if has_graph else "chat_sp_only"],
+        },
+    }
+
     if has_graph:
         # ── GraphRAG path: schedule + narrative live in Neo4j, SP via tool ──────
         digest = build_digest(graph, req.session_id)
         graph_tools = build_tools(graph, llm, embeddings.embed_query, project_id=req.session_id)
         sp_tool = build_sp_tool(db, embeddings.embed_query, project_id=req.session_id)
-        all_tools = graph_tools + [sp_tool]
+        keymap_tool = build_keymap_tool(db, embeddings.embed_query, project_id=req.session_id)
+        estimate_tool = build_estimate_tool(db, embeddings.embed_query, project_id=req.session_id)
+        all_tools = graph_tools + [sp_tool, keymap_tool, estimate_tool]
 
         system_prompt = _QA_SYSTEM_GRAPH + f"\n\n[Graph] Project schedule/narrative digest:\n{digest}"
         if context_parts:
             system_prompt += "\n\nPre-fetched context:\n" + "\n\n---\n\n".join(context_parts)
 
         agent = create_agent(llm, all_tools, system_prompt=system_prompt)
-        result = agent.invoke({"messages": [{"role": "user", "content": req.question}]})
+        result = agent.invoke({"messages": [{"role": "user", "content": req.question}]}, config=invoke_config)
 
         messages = result.get("messages", [])
         answer = messages[-1].content if messages else "Not found in the provided documents."
@@ -515,7 +702,11 @@ async def session_query(req: QueryRequest) -> dict:
         sources.insert(0, {"label": "Schedule Graph", "heading": "digest"})
         for m in messages:
             if type(m).__name__ == "ToolMessage":
-                sources.append({"label": "Schedule Graph", "tool": getattr(m, "name", "tool")})
+                tool_name = getattr(m, "name", "tool")
+                sources.append({
+                    "label": _TOOL_SOURCE_LABEL.get(tool_name, "Schedule Graph"),
+                    "tool": tool_name,
+                })
     else:
         # ── SP-only path: no graph for this session ─────────────────────────────
         sp_rows = retrieve_sp_chunks(db, embeddings.embed_query, req.session_id, req.question,
@@ -535,7 +726,10 @@ async def session_query(req: QueryRequest) -> dict:
 
         context_text = "\n\n---\n\n".join(context_parts)
         user_message = f"Context:\n{context_text}\n\nQuestion: {req.question}"
-        response = llm.invoke([SystemMessage(content=_QA_SYSTEM), HumanMessage(content=user_message)])
+        response = llm.invoke(
+            [SystemMessage(content=_QA_SYSTEM), HumanMessage(content=user_message)],
+            config=invoke_config,
+        )
         answer = response.content
 
     # ── Persist messages (non-fatal) ───────────────────────────────────────────

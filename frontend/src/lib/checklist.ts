@@ -125,7 +125,7 @@ export async function resetToDefaults(userId: string): Promise<void> {
 export function toCheckSpecs(checks: ComplianceCheck[]): CheckSpec[] {
   return checks
     .filter(c => c.enabled)
-    .map(({ check_key, category, name, instruction, source_files }) => ({
-      check_key, category, name, instruction, source_files,
+    .map(({ check_key, category, name, instruction, check_type, source_files }) => ({
+      check_key, category, name, instruction, check_type, source_files,
     }))
 }
