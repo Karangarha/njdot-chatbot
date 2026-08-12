@@ -1,0 +1,7 @@
+# The backfill migrations under backend/migrations/ guard their UPDATEs on
+# verbatim instruction/text values that can contain embedded newlines.
+# core.autocrlf is commonly true on Windows checkouts, so without this rule a
+# CRLF checkout would make Postgres compare "...\r\n..." against a stored
+# "...\n...", and a guard would silently match zero rows — never erroring,
+# just doing nothing.
+*.sql text eol=lf

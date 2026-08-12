@@ -3,6 +3,15 @@
 # Un-ignore the debug instrumentation package
 !debug/
 !debug/*
+# Un-ignore the backend test suite (same pattern as !debug/ above) — needed so
+# tests/test_cost.py, tests/test_geo.py, and this branch's new
+# tests/test_chunk_store.py are actually trackable.
+!tests/
+!tests/*
+# Un-ignore the SQL migrations (same pattern) — needed for this branch's new
+# 009_review_projects_sp_keymap_estimate_supabase_only.sql.
+!migrations/
+!migrations/*
 # Un-ignore the configurable-checklist migration/seed scripts
 !scripts/
 !scripts/migrate_compliance_checks.sql
@@ -10,6 +19,8 @@
 # Un-ignore the review re-run file-persistence migrations
 !scripts/migrate_review_projects_add_file_paths.sql
 !scripts/migrate_review_files_storage.sql
+# Un-ignore this branch's new one-time backfill script
+!scripts/backfill_sp_keymap_estimate_to_supabase.py
 # Un-ignore core app modules the blanket rule above missed — the Neo4j/
 # LangChain migration package, the compliance engine, and a couple of
 # top-level app/ files. app/ itself must be un-ignored first or git won't
@@ -27,6 +38,13 @@
 !app/retrieval_langchain/*
 !app/scheduling/
 !app/scheduling/cpm_cache.py
+# Un-ignore this branch's new shared session_chunks writer. app/ingestion/
+# itself must be un-ignored first (like !app/compliance/ etc. above) or git
+# never looks inside it to evaluate the file-level exception — a lone
+# `!app/ingestion/chunk_store.py` with no `!app/ingestion/` silently does
+# nothing, since a parent directory is still excluded.
+!app/ingestion/
+!app/ingestion/chunk_store.py
 # Un-ignore pre-existing migration scripts that were never added to git
 !scripts/fix_conversations_rls.sql
 !scripts/migrate_session_no_expiry.sql
