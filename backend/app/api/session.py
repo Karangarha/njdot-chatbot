@@ -48,6 +48,7 @@ from app.config   import config
 from app.database import get_db
 from app.generation.llm_client       import LLMClient
 from app.graph_neo4j import build_digest, build_tools, clear_project, seed_narrative, seed_schedule
+from app.ingestion.chunk_store       import insert_session_chunks
 from app.ingestion.embedder          import Embedder
 from app.ingestion.pdf_parser        import PDFParser
 from app.ingestion.session_chunker   import (
@@ -70,7 +71,6 @@ from app.scheduling import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/session", tags=["session"])
 
-_DB_BATCH = 50
 _ANTHROPIC_MODEL = "claude-sonnet-5"
 
 # ── In-process progress store ──────────────────────────────────────────────────
@@ -120,21 +120,6 @@ def _extraction_llm() -> Optional[LLMClient]:
     except Exception as exc:
         logger.warning("Narrative extraction disabled (no LLM client): %s", exc)
         return None
-
-
-def _insert_chunks(db: Any, session_id: str, chunks: List[Dict[str, Any]]) -> None:
-    rows = [
-        {
-            "session_id": session_id,
-            "doc_type":   c["metadata"]["doc_type"],
-            "content":    c["content"],
-            "embedding":  c["embedding"],
-            "metadata":   c["metadata"],
-        }
-        for c in chunks
-    ]
-    for i in range(0, len(rows), _DB_BATCH):
-        db.table("session_chunks").insert(rows[i : i + _DB_BATCH]).execute()
 
 
 def _has_graph(graph: Any, session_id: str) -> bool:
@@ -266,7 +251,7 @@ def _process_session(
             embedder.embed_parallel(all_chunks, max_workers=3, on_progress=_on_progress)
 
             _set_progress(session_id, status="storing", message="Storing chunks…")
-            _insert_chunks(db, session_id, all_chunks)
+            insert_session_chunks(db, session_id, all_chunks)
 
         _set_progress(
             session_id,
@@ -401,7 +386,7 @@ def _process_session_reuse(session_id: str) -> None:
         )
         if all_chunks:
             _set_progress(session_id, status="storing", message="Storing chunks…")
-            _insert_chunks(db, session_id, all_chunks)
+            insert_session_chunks(db, session_id, all_chunks)
 
         _set_progress(
             session_id,
