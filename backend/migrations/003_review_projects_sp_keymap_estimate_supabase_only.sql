@@ -1,4 +1,4 @@
--- 009: Special Provision / Key Map / Estimate become Supabase-only.
+-- 003: Special Provision / Key Map / Estimate become Supabase-only.
 -- Run once in the Supabase SQL Editor.
 --
 -- Adds review_projects.key_map_extraction and .estimate_extraction (jsonb) --
@@ -12,7 +12,7 @@
 -- The raw chunk text + embeddings for these three documents move to the
 -- existing session_chunks table (doc_type IN ('special_provision','key_map',
 -- 'estimate')) -- no schema change needed there; doc_type is unconstrained
--- TEXT (see migration 005's note).
+-- TEXT, so the new values insert as-is.
 --
 -- Pre-existing rows keep NULL until the backfill script
 -- (scripts/backfill_sp_keymap_estimate_to_supabase.py, Task 6) runs.
