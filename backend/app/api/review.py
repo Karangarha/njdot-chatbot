@@ -58,6 +58,7 @@ from app.graph_neo4j.seed import (
     seed_special_provision,
 )
 from app.graph_neo4j.tools import search_special_provision
+from app.ingestion.chunk_store import insert_session_chunks
 from app.ingestion.estimate_extractor import (
     EstimateExtraction,
     extract_estimate,
@@ -257,29 +258,30 @@ def _read_keymap_extraction_from_graph(graph: Any, project_id: str) -> Optional[
         return None
 
 
-def _extract_and_seed_keymap(
-    graph: Any,
+def _extract_and_store_keymap(
+    db: Any,
     embeddings: OpenAIEmbeddings,
     llm: Any,
     keymap_bytes: bytes,
     project_id: str,
     user_id: Optional[str],
 ) -> Optional[KeyMapExtraction]:
-    """Structured-extract the key map, then persist chunks + extraction to
-    Neo4j (``KeyMapChunk``/``KeyMapDoc``) so re-runs and chat can reuse them.
-    Returns the extraction (``None`` for scanned/unextractable sheets — the
-    review proceeds and keymap checks go "Missing")."""
+    """Structured-extract the key map, then persist chunks to Supabase
+    ``session_chunks`` so re-runs and chat can reuse them without
+    re-parsing. Returns the extraction (``None`` for scanned/unextractable
+    sheets -- the review proceeds and keymap checks go "Missing").
+
+    The extraction JSON itself is NOT persisted here -- it's already in this
+    function's return value, which the caller includes in the API response
+    (see ``_run_review_pipeline``'s ``shaped["key_map"]``); the frontend
+    writes it onto ``review_projects.key_map_extraction`` from there.
+    """
     keymap_extraction = extract_key_map(keymap_bytes, llm, project_id=project_id, user_id=user_id)
     km_chunks = _bytes_to_keymap_chunks(keymap_bytes)
-    km_vectors = (
-        embeddings.embed_documents([c["content"] for c in km_chunks]) if km_chunks else []
-    )
-    if km_chunks or keymap_extraction is not None:
-        seed_key_map(
-            graph, km_chunks, km_vectors,
-            extraction_json=keymap_extraction.model_dump_json() if keymap_extraction else None,
-            project_id=project_id,
-        )
+    if km_chunks:
+        km_vectors = embeddings.embed_documents([c["content"] for c in km_chunks])
+        merged = [{**c, "embedding": v} for c, v in zip(km_chunks, km_vectors)]
+        insert_session_chunks(db, project_id, merged)
     return keymap_extraction
 
 
@@ -301,8 +303,8 @@ def _read_estimate_extraction_from_graph(graph: Any, project_id: str) -> Optiona
         return None
 
 
-def _extract_and_seed_estimate(
-    graph: Any,
+def _extract_and_store_estimate(
+    db: Any,
     embeddings: OpenAIEmbeddings,
     llm: Any,
     estimate_bytes: bytes,
@@ -310,21 +312,20 @@ def _extract_and_seed_estimate(
     user_id: Optional[str],
 ) -> Optional[EstimateExtraction]:
     """Vision-extract page 1 of the estimate, then persist the transcription
-    chunks + extraction to Neo4j so re-runs and chat can reuse them without
-    another vision call. ``None`` for unreadable pages — the review proceeds
-    and the gap check reports "Missing"."""
+    chunk to Supabase ``session_chunks``. ``None`` for unreadable pages --
+    the review proceeds and the gap check reports "Missing".
+
+    Extraction JSON is not persisted here -- see
+    ``_extract_and_store_keymap``'s docstring for why.
+    """
     estimate_extraction = extract_estimate(estimate_bytes, llm, project_id=project_id, user_id=user_id)
     if estimate_extraction is None:
         return None
     est_chunks = _estimate_chunks_from_extraction(estimate_extraction)
-    est_vectors = (
-        embeddings.embed_documents([c["content"] for c in est_chunks]) if est_chunks else []
-    )
-    seed_estimate(
-        graph, est_chunks, est_vectors,
-        extraction_json=estimate_extraction.model_dump_json(),
-        project_id=project_id,
-    )
+    if est_chunks:
+        est_vectors = embeddings.embed_documents([c["content"] for c in est_chunks])
+        merged = [{**c, "embedding": v} for c, v in zip(est_chunks, est_vectors)]
+        insert_session_chunks(db, project_id, merged)
     return estimate_extraction
 
 
@@ -494,6 +495,7 @@ def _run_review_pipeline(
     logger.info("=== Review started at %s ===", start_time.isoformat(timespec="seconds"))
 
     graph = get_neo4j()
+    db = get_db()
     embeddings = OpenAIEmbeddings(model=config.EMBEDDING_MODEL, api_key=config.OPENAI_API_KEY)
 
     # Built before the seed branches (not just before check evaluation)
@@ -543,27 +545,28 @@ def _run_review_pipeline(
 
         # Chunk + embed the SP PDF (with table extraction) exactly once, and
         # share the result between the immediate compliance-check search
-        # closure and Neo4j persistence — also persisted so a later re-run
-        # can reuse them via search_special_provision instead of recreating
+        # closure and Supabase persistence — also persisted so a later
+        # re-run can reuse them via retrieve_sp_chunks instead of recreating
         # them here.
         sp_search_fn = None
         if sp_bytes:
             sp_chunks = _bytes_to_sp_chunks(sp_bytes)
             if sp_chunks:
                 sp_vectors = embeddings.embed_documents([c["content"] for c in sp_chunks])
-                seed_special_provision(graph, sp_chunks, sp_vectors, project_id=project_id)
+                merged_sp = [{**c, "embedding": v} for c, v in zip(sp_chunks, sp_vectors)]
+                insert_session_chunks(db, project_id, merged_sp)
                 sp_search_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
 
         keymap_extraction: Optional[KeyMapExtraction] = None
         if keymap_bytes:
-            keymap_extraction = _extract_and_seed_keymap(
-                graph, embeddings, llm, keymap_bytes, project_id, user_id,
+            keymap_extraction = _extract_and_store_keymap(
+                db, embeddings, llm, keymap_bytes, project_id, user_id,
             )
 
         estimate_extraction: Optional[EstimateExtraction] = None
         if estimate_bytes:
-            estimate_extraction = _extract_and_seed_estimate(
-                graph, embeddings, llm, estimate_bytes, project_id, user_id,
+            estimate_extraction = _extract_and_store_estimate(
+                db, embeddings, llm, estimate_bytes, project_id, user_id,
             )
 
         project_name = (project or {}).get("project_name") or "Unknown"
@@ -579,13 +582,13 @@ def _run_review_pipeline(
             # Key map stored but never seeded (e.g. a pre-key-map-feature
             # project re-run after the file landed in Storage) — extract and
             # seed now, mirroring the reseed self-healing above.
-            keymap_extraction = _extract_and_seed_keymap(
-                graph, embeddings, llm, keymap_bytes, project_id, user_id,
+            keymap_extraction = _extract_and_store_keymap(
+                db, embeddings, llm, keymap_bytes, project_id, user_id,
             )
         estimate_extraction = _read_estimate_extraction_from_graph(graph, project_id)
         if estimate_extraction is None and estimate_bytes:
-            estimate_extraction = _extract_and_seed_estimate(
-                graph, embeddings, llm, estimate_bytes, project_id, user_id,
+            estimate_extraction = _extract_and_store_estimate(
+                db, embeddings, llm, estimate_bytes, project_id, user_id,
             )
 
     # Geo and the cost gap are recomputed on every run (both are pure
