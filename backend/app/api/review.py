@@ -75,6 +75,7 @@ from app.ingestion.session_chunker import chunk_narrative, chunk_special_provisi
 from app.models import ReviewCheckResult, ReviewResponse
 from app.neo4j_client import get_neo4j
 from app.retrieval.vector_search import VectorSearcher
+from app.retrieval_langchain.sp_retriever import retrieve_sp_chunks
 from app.scheduling import build_calendars, build_network, cross_check, run_cpm
 # Re-exported for backward compatibility (session.py and debug scripts import
 # these from app.api.review); canonical implementations live in app.scheduling.
@@ -212,47 +213,47 @@ def _build_sp_search_fn(
     return _search
 
 
-def _build_sp_search_fn_from_graph(
-    graph: Any, embeddings: OpenAIEmbeddings, project_id: str,
+def _build_sp_search_fn_from_supabase(
+    db: Any, embeddings: OpenAIEmbeddings, project_id: str,
 ) -> Optional[Callable[[str], str]]:
-    """Special Provision search backed by persisted ``SPChunk`` nodes (see
-    ``graph_neo4j.seed.seed_special_provision``) — the ``reseed=False`` fast
-    path's equivalent of ``_build_sp_search_fn``, without re-parsing,
-    re-chunking, or re-embedding the PDF. Only ``embeddings.embed_query``
-    runs per check. Returns ``None`` if this project has no SP chunks
-    (matches "no SP uploaded" behavior).
+    """Special Provision search backed by ``session_chunks`` -- the
+    ``reseed=False`` fast path's equivalent of ``_build_sp_search_fn``,
+    without re-parsing, re-chunking, or re-embedding the PDF. Reuses the same
+    ``retrieve_sp_chunks`` chat already calls, so review and chat can never
+    disagree about how SP retrieval works. Returns ``None`` if this project
+    has no SP chunks (matches "no SP uploaded" behavior).
     """
-    existing = graph.query(
-        "MATCH (s:SPChunk {projectId: $pid}) RETURN count(s) AS c LIMIT 1",
-        params={"pid": project_id},
+    existing = (
+        db.table("session_chunks").select("id", count="exact")
+        .eq("session_id", project_id).eq("doc_type", "special_provision")
+        .limit(1).execute()
     )
-    if not existing or not existing[0]["c"]:
+    if not existing.count:
         return None
 
-    def _search(query: str, top_k: int = 5) -> str:
-        q_vec = embeddings.embed_query(query)
-        result = search_special_provision(graph, q_vec, project_id, top_k)
-        chunks = result.get("chunks", [])
-        if not chunks:
+    def _search(query: str) -> str:
+        rows = retrieve_sp_chunks(db, embeddings.embed_query, project_id, query)
+        if not rows:
             return "No matching Special Provision text found."
-        return "\n\n---\n\n".join(c["content"] for c in chunks)
+        return "\n\n---\n\n".join(r["content"] for r in rows)
 
     return _search
 
 
-def _read_keymap_extraction_from_graph(graph: Any, project_id: str) -> Optional[KeyMapExtraction]:
-    """Rehydrate the key map extraction persisted by ``seed_key_map`` — the
-    ``reseed=False`` fast path's way to skip re-running the extraction LLM
-    call on re-runs. Returns ``None`` if this project has no ``KeyMapDoc``
-    (no key map uploaded, or a pre-key-map-feature project)."""
-    rows = graph.query(
-        "MATCH (d:KeyMapDoc {projectId: $pid}) RETURN d.extractionJson AS jsonStr LIMIT 1",
-        params={"pid": project_id},
-    )
-    if not rows or not rows[0].get("jsonStr"):
+def _read_keymap_extraction_from_supabase(db: Any, project_id: str) -> Optional[KeyMapExtraction]:
+    """Rehydrate the key map extraction from
+    ``review_projects.key_map_extraction`` -- the ``reseed=False`` fast
+    path's way to skip re-running the extraction LLM call on re-runs.
+    Returns ``None`` if this project never had a key map, or the column is
+    still unpopulated (pre-migration project awaiting backfill)."""
+    rows = (
+        db.table("review_projects").select("key_map_extraction")
+        .eq("id", project_id).limit(1).execute()
+    ).data
+    if not rows or not rows[0].get("key_map_extraction"):
         return None
     try:
-        return KeyMapExtraction.model_validate_json(rows[0]["jsonStr"])
+        return KeyMapExtraction.model_validate(rows[0]["key_map_extraction"])
     except Exception:
         logger.exception("Failed to parse persisted key map extraction for project_id=%s", project_id)
         return None
@@ -285,19 +286,19 @@ def _extract_and_store_keymap(
     return keymap_extraction
 
 
-def _read_estimate_extraction_from_graph(graph: Any, project_id: str) -> Optional[EstimateExtraction]:
-    """Rehydrate the estimate extraction persisted by ``seed_estimate`` — the
-    ``reseed=False`` fast path's way to skip re-running the vision call (the
-    most expensive single call in the pipeline). ``None`` when this project
-    has no ``EstimateDoc``."""
-    rows = graph.query(
-        "MATCH (d:EstimateDoc {projectId: $pid}) RETURN d.extractionJson AS jsonStr LIMIT 1",
-        params={"pid": project_id},
-    )
-    if not rows or not rows[0].get("jsonStr"):
+def _read_estimate_extraction_from_supabase(db: Any, project_id: str) -> Optional[EstimateExtraction]:
+    """Rehydrate the estimate extraction from
+    ``review_projects.estimate_extraction`` -- the ``reseed=False`` fast
+    path's way to skip re-running the vision call (the most expensive single
+    call in the pipeline). ``None`` when the column is unset."""
+    rows = (
+        db.table("review_projects").select("estimate_extraction")
+        .eq("id", project_id).limit(1).execute()
+    ).data
+    if not rows or not rows[0].get("estimate_extraction"):
         return None
     try:
-        return EstimateExtraction.model_validate_json(rows[0]["jsonStr"])
+        return EstimateExtraction.model_validate(rows[0]["estimate_extraction"])
     except Exception:
         logger.exception("Failed to parse persisted estimate extraction for project_id=%s", project_id)
         return None
@@ -576,16 +577,16 @@ def _run_review_pipeline(
     else:
         # ── Fast path: project already seeded — reuse existing chunks ───────
         project_name, duration_days = _read_project_summary(graph, project_id)
-        sp_search_fn = _build_sp_search_fn_from_graph(graph, embeddings, project_id)
-        keymap_extraction = _read_keymap_extraction_from_graph(graph, project_id)
+        sp_search_fn = _build_sp_search_fn_from_supabase(db, embeddings, project_id)
+        keymap_extraction = _read_keymap_extraction_from_supabase(db, project_id)
         if keymap_extraction is None and keymap_bytes:
-            # Key map stored but never seeded (e.g. a pre-key-map-feature
+            # Key map stored but never persisted (e.g. a pre-key-map-feature
             # project re-run after the file landed in Storage) — extract and
-            # seed now, mirroring the reseed self-healing above.
+            # store now, mirroring the reseed self-healing above.
             keymap_extraction = _extract_and_store_keymap(
                 db, embeddings, llm, keymap_bytes, project_id, user_id,
             )
-        estimate_extraction = _read_estimate_extraction_from_graph(graph, project_id)
+        estimate_extraction = _read_estimate_extraction_from_supabase(db, project_id)
         if estimate_extraction is None and estimate_bytes:
             estimate_extraction = _extract_and_store_estimate(
                 db, embeddings, llm, estimate_bytes, project_id, user_id,
