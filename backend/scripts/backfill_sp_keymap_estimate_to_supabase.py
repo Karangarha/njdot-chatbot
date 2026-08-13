@@ -14,8 +14,14 @@ POST /api/session/upload with project_id right after every review completes
 data. This script is the safety net for rows where that call failed, was
 skipped, or the project predates the chat feature.
 
-Idempotent: skips any (project, doc_type) pair that already has session_chunks
-rows, and any review_projects row whose extraction column is already set.
+Idempotent: skips any (project, doc_type) pair whose session_chunks row count
+already matches (or exceeds) the Neo4j source count, and any review_projects
+row whose extraction column is already set. A pair with a nonzero but
+incomplete session_chunks count (from a prior run that crashed mid-batch) is
+NOT silently skipped or blindly re-copied -- insert_session_chunks has no
+dedup/upsert key, so a blind re-copy would duplicate the rows already
+committed. Instead it is reported as a mismatch requiring manual review; see
+the "MISMATCHES REQUIRING MANUAL REVIEW" summary at the end of a run.
 
 Usage
 -----
@@ -52,17 +58,51 @@ _DOC_TYPES = {
 }
 
 
-def _copy_chunks(graph, db, project_id: str, label: str, doc_type: str, dry_run: bool) -> int:
+def _copy_chunks(
+    graph, db, project_id: str, label: str, doc_type: str, dry_run: bool
+) -> tuple[int, dict | None]:
+    """Copy SP/KeyMap/Estimate chunks for one (project, doc_type) pair.
+
+    Returns ``(n_copied, mismatch)``. ``mismatch`` is ``None`` unless Supabase
+    already holds a nonzero-but-incomplete number of rows for this pair (i.e.
+    a prior run crashed mid-way through ``insert_session_chunks``'s batched
+    writes) -- in that case this function does NOT call
+    ``insert_session_chunks`` (which has no dedup/upsert key and would create
+    duplicate rows for the chunks that already made it in) and instead
+    returns a dict describing the mismatch for the caller to report and skip.
+    """
     rows = graph.query(
         f"MATCH (c:{label} {{projectId: $pid}}) "
         "RETURN c.id AS id, c.pagePdf AS pagePdf, c.content AS content, "
         "       c.embedding AS embedding ORDER BY c.id",
         params={"pid": project_id},
     )
-    if not rows:
-        return 0
+    neo4j_count = len(rows)
+    if not neo4j_count:
+        return 0, None
+
+    existing = (
+        db.table("session_chunks").select("id", count="exact")
+        .eq("session_id", project_id).eq("doc_type", doc_type).execute()
+    )
+    supabase_count = existing.count or 0
+
+    if supabase_count >= neo4j_count:
+        return 0, None  # already fully copied (e.g. via the reuse-copy path)
+
+    if supabase_count > 0:
+        # Partial copy from a prior crashed run -- re-running insert would
+        # duplicate the rows already committed. Surface it instead.
+        return 0, {
+            "project_id": project_id,
+            "doc_type": doc_type,
+            "neo4j_count": neo4j_count,
+            "supabase_count": supabase_count,
+        }
+
     if dry_run:
-        return len(rows)
+        return neo4j_count, None
+
     chunks = [
         {
             "content": r["content"],
@@ -72,7 +112,7 @@ def _copy_chunks(graph, db, project_id: str, label: str, doc_type: str, dry_run:
         for r in rows
     ]
     insert_session_chunks(db, project_id, chunks)
-    return len(chunks)
+    return len(chunks), None
 
 
 def _copy_extraction(graph, db, project_id: str, doc_label: str, column: str, dry_run: bool) -> bool:
@@ -106,19 +146,23 @@ def main() -> None:
     print(f"-- {len(projects)} review_projects rows")
     chunk_copies = 0
     extraction_copies = 0
+    mismatches: list[dict] = []
 
     for p in projects:
         pid = p["id"]
         for path_col, (doc_type, label) in _DOC_TYPES.items():
             if not p.get(path_col):
                 continue  # document was never uploaded for this project
-            existing = (
-                db.table("session_chunks").select("id", count="exact")
-                .eq("session_id", pid).eq("doc_type", doc_type).limit(1).execute()
-            )
-            if existing.count:
-                continue  # already in Supabase (e.g. via the reuse-copy path)
-            n = _copy_chunks(graph, db, pid, label, doc_type, args.dry_run)
+            n, mismatch = _copy_chunks(graph, db, pid, label, doc_type, args.dry_run)
+            if mismatch:
+                mismatches.append(mismatch)
+                print(
+                    f"   [!!] [{pid}] {doc_type}: MISMATCH -- Neo4j has "
+                    f"{mismatch['neo4j_count']} rows, Supabase has "
+                    f"{mismatch['supabase_count']} (partial prior copy) -- "
+                    "skipping, requires manual review"
+                )
+                continue
             if n:
                 chunk_copies += n
                 verb = "would copy" if args.dry_run else "copied"
@@ -140,6 +184,22 @@ def main() -> None:
     print(f"\n{verb} {chunk_copies} chunks and {extraction_copies} extraction documents.")
     if args.dry_run:
         print("-- dry run: no changes written")
+
+    if mismatches:
+        print("\n-- MISMATCHES REQUIRING MANUAL REVIEW --")
+        print(
+            "-- The following (project, doc_type) pairs have a nonzero but "
+            "incomplete row count in Supabase, indicating a prior run crashed "
+            "mid-copy. Auto re-running was skipped to avoid duplicate rows. "
+            "Investigate and either delete the partial rows and re-run this "
+            "script, or manually complete the copy."
+        )
+        for m in mismatches:
+            print(
+                f"   [{m['project_id']}] {m['doc_type']}: "
+                f"Neo4j={m['neo4j_count']} rows, Supabase={m['supabase_count']} rows "
+                f"({m['neo4j_count'] - m['supabase_count']} missing)"
+            )
 
 
 if __name__ == "__main__":
