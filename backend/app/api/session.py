@@ -270,19 +270,17 @@ def _process_session(
 
 def _process_session_reuse(session_id: str) -> None:
     """Populate a chat session by reusing an already-seeded ``/api/review``
-    project's data instead of re-parsing/re-embedding the same PDFs.
+    project's narrative entities instead of re-extracting them.
 
     ``session_id`` is literally the review's ``project_id`` — same Neo4j
     namespace, so the schedule (``Activity``/``WBS``/``Calendar``/``Project``
-    nodes) is already fully seeded and needs no action here. This function
-    only does the two things a review doesn't: narrative entity extraction
-    (review seeds ``NarrativeChunk`` nodes with ``llm=None``, skipping
-    entities — chat needs them for its tool-calling agent) and copying the
-    already-embedded ``SPChunk``/``KeyMapChunk``/``EstimateChunk`` Neo4j rows
-    into Supabase ``session_chunks`` (needed for chat's hybrid-RAG retrieval;
-    review only persists them to Neo4j). No PDF parsing, no CPM, no embedding calls —
-    everything reused here was already computed and stored by
-    ``_run_review_pipeline``.
+    nodes) is already fully seeded and needs no action here. SP/KeyMap/
+    Estimate chunks and extraction JSON are already in Supabase from review
+    ingestion time (see ``api.review``'s ``_extract_and_store_keymap`` etc.)
+    — nothing to copy. This function's only remaining job is narrative
+    entity extraction: review seeds ``NarrativeChunk`` nodes with
+    ``llm=None``, skipping entities; chat needs them for its tool-calling
+    agent.
 
     Unlike ``_process_session``, this never calls ``clear_project`` — doing
     so would delete everything the review just seeded under this same id.
@@ -291,7 +289,6 @@ def _process_session_reuse(session_id: str) -> None:
         db = get_db()
         graph = get_neo4j()
         graph_saved = False
-        all_chunks: List[Dict[str, Any]] = []
 
         _set_progress(session_id, status="parsing", message="Linking to review data…")
 
@@ -327,76 +324,19 @@ def _process_session_reuse(session_id: str) -> None:
                             project_id=session_id, llm=_extraction_llm())
             graph_saved = True
 
-        # ── SP + key map: copy already-embedded SPChunk/KeyMapChunk nodes
-        # into session_chunks (no re-parsing, no re-embedding — just a data
-        # copy/reshape) ────────────────────────────────────────────────────
-        sp_rows = graph.query(
-            "MATCH (s:SPChunk {projectId: $pid}) "
-            "RETURN s.id AS id, s.pagePdf AS pagePdf, s.content AS content, "
-            "       s.embedding AS embedding",
-            params={"pid": session_id},
-        )
-        all_chunks.extend(
-            {
-                "content": row["content"],
-                "embedding": row["embedding"],
-                "metadata": {
-                    "doc_type": "special_provision",
-                    "page_pdf": row["pagePdf"],
-                    "chunk_index": int(row["id"].split("-")[1]),
-                },
-            }
-            for row in sp_rows
-        )
-        km_rows = graph.query(
-            "MATCH (k:KeyMapChunk {projectId: $pid}) "
-            "RETURN k.id AS id, k.pagePdf AS pagePdf, k.content AS content, "
-            "       k.embedding AS embedding",
-            params={"pid": session_id},
-        )
-        all_chunks.extend(
-            {
-                "content": row["content"],
-                "embedding": row["embedding"],
-                "metadata": {
-                    "doc_type": "key_map",
-                    "page_pdf": row["pagePdf"],
-                    "chunk_index": int(row["id"].split("-")[1]),
-                },
-            }
-            for row in km_rows
-        )
-        est_rows = graph.query(
-            "MATCH (e:EstimateChunk {projectId: $pid}) "
-            "RETURN e.id AS id, e.pagePdf AS pagePdf, e.content AS content, "
-            "       e.embedding AS embedding",
-            params={"pid": session_id},
-        )
-        all_chunks.extend(
-            {
-                "content": row["content"],
-                "embedding": row["embedding"],
-                "metadata": {
-                    "doc_type": "estimate",
-                    "page_pdf": row["pagePdf"],
-                    "chunk_index": int(row["id"].split("-")[1]),
-                },
-            }
-            for row in est_rows
-        )
-        if all_chunks:
-            _set_progress(session_id, status="storing", message="Storing chunks…")
-            insert_session_chunks(db, session_id, all_chunks)
-
+        chunk_count = (
+            db.table("session_chunks").select("id", count="exact")
+            .eq("session_id", session_id).limit(1).execute()
+        ).count or 0
         _set_progress(
             session_id,
             status="ready",
             message="Documents ready. You can now ask questions.",
-            chunk_count=len(all_chunks),
+            chunk_count=chunk_count,
             has_graph=graph_saved or _has_graph(graph, session_id),
         )
-        logger.info("Session %s (reused from review): %d chunks stored, graph=%s",
-                    session_id, len(all_chunks), graph_saved)
+        logger.info("Session %s (reused from review): %d chunks already indexed, graph=%s",
+                    session_id, chunk_count, graph_saved)
 
     except Exception as exc:
         logger.exception("Session %s (reuse) failed", session_id)
