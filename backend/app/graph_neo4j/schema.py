@@ -38,14 +38,6 @@ _CONSTRAINTS = [
     "FOR (c:Constraint) REQUIRE (c.projectId, c.constraintId) IS UNIQUE",
     "CREATE CONSTRAINT narrative_entity_id_per_project IF NOT EXISTS "
     "FOR (e:NarrativeEntity) REQUIRE (e.projectId, e.id) IS UNIQUE",
-    "CREATE CONSTRAINT keymap_chunk_id_per_project IF NOT EXISTS "
-    "FOR (k:KeyMapChunk) REQUIRE (k.projectId, k.id) IS UNIQUE",
-    "CREATE CONSTRAINT keymap_doc_per_project IF NOT EXISTS "
-    "FOR (d:KeyMapDoc) REQUIRE d.projectId IS UNIQUE",
-    "CREATE CONSTRAINT estimate_chunk_id_per_project IF NOT EXISTS "
-    "FOR (e:EstimateChunk) REQUIRE (e.projectId, e.id) IS UNIQUE",
-    "CREATE CONSTRAINT estimate_doc_per_project IF NOT EXISTS "
-    "FOR (d:EstimateDoc) REQUIRE d.projectId IS UNIQUE",
     "CREATE CONSTRAINT project_id IF NOT EXISTS "
     "FOR (p:Project) REQUIRE p.projectId IS UNIQUE",
 ]

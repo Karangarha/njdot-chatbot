@@ -205,42 +205,6 @@ def search_narrative(
             "note": "Ranked by in-process cosine similarity over NarrativeChunk embeddings."}
 
 
-# ── Deterministic tool: Special Provision search (in-process cosine ranking) ─
-
-def search_special_provision(
-    graph: Neo4jGraph,
-    query_embedding: List[float],
-    project_id: str = "default",
-    top_k: int = 5,
-) -> Dict[str, Any]:
-    """Rank SPChunk nodes by cosine similarity to a query embedding.
-
-    Structurally identical to ``search_narrative`` — reads chunks/embeddings
-    persisted once by ``graph_neo4j.seed.seed_special_provision`` instead of
-    re-parsing/re-chunking/re-embedding the SP PDF on every call (the old
-    ``review._build_sp_search_fn`` behavior, still used for a project's
-    first seed).
-    """
-    rows = graph.query(
-        "MATCH (s:SPChunk {projectId: $projectId}) "
-        "RETURN s.id AS id, s.pagePdf AS pagePdf, s.content AS content, "
-        "       s.embedding AS embedding",
-        params={"projectId": project_id},
-    )
-    scored = [
-        (r, _cosine(query_embedding, r["embedding"]))
-        for r in rows if r.get("embedding")
-    ]
-    scored.sort(key=lambda x: -x[1])
-    results = [
-        {"chunk_id": r["id"], "page_pdf": r["pagePdf"],
-         "score": round(score, 4), "content": r["content"]}
-        for r, score in scored[:top_k]
-    ]
-    return {"chunks": results,
-            "note": "Ranked by in-process cosine similarity over SPChunk embeddings."}
-
-
 # ── LangChain Tool wrappers ──────────────────────────────────────────────────
 
 def build_tools(
