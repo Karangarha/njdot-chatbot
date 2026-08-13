@@ -440,6 +440,8 @@ export default function DocumentReview({
             special_provision_pdf_path:  data.special_provision_pdf_path ?? null,
             key_map_pdf_path:            data.key_map_pdf_path ?? null,
             estimate_pdf_path:           data.estimate_pdf_path ?? null,
+            key_map_extraction:          data.key_map?.extraction ?? null,
+            estimate_extraction:         data.estimate?.extraction ?? null,
           })
           .select()
           .single()
