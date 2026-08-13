@@ -22,8 +22,10 @@ POST /api/session/query
     context) plus a tool-calling agent with access to the Neo4j knowledge
     graph and Special Provision retrieval. Returns {answer, sources}.
 
-Required setup — run migrate_session_chunks.sql once (Supabase); Neo4j
-Desktop must be running (see app.neo4j_client).
+Required setup — the ``session_chunks`` table must already exist in
+Supabase (no tracked migration defines its DDL; see
+``retrieval_langchain.sp_retriever``'s module docstring); Neo4j Desktop
+must be running (see app.neo4j_client).
 """
 
 from __future__ import annotations
