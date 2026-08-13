@@ -1,4 +1,8 @@
--- 003: Special Provision / Key Map / Estimate become Supabase-only.
+-- 009: Special Provision / Key Map / Estimate become Supabase-only.
+-- (Untracked-on-disk migrations 003-006/008 already exist in the real
+-- checkout -- see backend/.gitignore's blanket-ignore for why `git
+-- ls-tree` alone can't be trusted to enumerate them. 009 is the first
+-- free number.)
 -- Run once in the Supabase SQL Editor.
 --
 -- Adds review_projects.key_map_extraction and .estimate_extraction (jsonb) --

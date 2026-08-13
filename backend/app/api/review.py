@@ -11,17 +11,23 @@ Pydantic-structured LLM call per check (GPT-4o primary, Claude fallback via
 LangChain's ``.with_fallbacks()``), replacing the old single-mega-prompt +
 manual JSON parsing.
 
-The Special Provision (if uploaded) is chunked and embedded in-process only
-— no persistence needed for a one-shot review, unlike the session-scoped
-Supabase retrieval Phase 6 uses for Document Q&A. The key map (if uploaded)
-gets one structured LLM extraction (``ingestion.keymap_extractor``) whose
-result feeds the utility-alignment comparison and the deterministic
-north/south-of-I-195 geography check (``app.compliance.geo``), and is
-persisted to Neo4j (``KeyMapDoc``/``KeyMapChunk``) for re-runs and chat. The
-DBE Goal Memo (if uploaded) is a scan, so page 1 is transcribed by a vision
-call (``ingestion.estimate_extractor``); the Engineer's Estimate it yields
-drives the deterministic Substantial-to-Final completion-gap check
-(``app.compliance.cost``) and is likewise persisted for re-runs and chat.
+The Special Provision (if uploaded) is chunked, embedded, and persisted to
+Supabase ``session_chunks`` (``app.ingestion.chunk_store.insert_session_chunks``)
+so re-runs and chat can reuse it via ``retrieval_langchain.sp_retriever``
+without re-parsing. The key map (if uploaded) gets one structured LLM
+extraction (``ingestion.keymap_extractor``) whose result feeds the
+utility-alignment comparison and the deterministic north/south-of-I-195
+geography check (``app.compliance.geo``); its chunks go to
+``session_chunks`` and its extraction JSON to
+``review_projects.key_map_extraction`` (written by the frontend on initial
+insert, this endpoint's rerun path, or the one-time backfill script) for
+re-runs and chat. The DBE Goal Memo (if uploaded) is a scan, so page 1 is
+transcribed by a vision call (``ingestion.estimate_extractor``); the
+Engineer's Estimate it yields drives the deterministic Substantial-to-Final
+completion-gap check (``app.compliance.cost``) and is likewise persisted to
+Supabase (``session_chunks`` for chunks, ``review_projects.estimate_extraction``
+for the extraction). Neo4j holds only the CPM schedule and Designer's
+narrative for these reviews — none of the three document types above.
 
 Returns the frontend's pre-existing JSON contract via ``_to_frontend_shape``
 so ``DocumentReview.tsx`` needs no changes — only this adapter must track
@@ -188,13 +194,10 @@ def _build_sp_search_fn(
 
     Takes precomputed ``sp_chunks``/``sp_vectors`` rather than raw bytes so
     the caller (``_run_review_pipeline``) can chunk/embed the SP PDF exactly
-    once and share the result with both this search closure and
-    ``seed_special_provision``'s Neo4j persistence — previously each computed
-    its own chunks/embeddings independently, doubling SP embedding calls on
-    every fresh review. No persistence needed here beyond that shared Neo4j
-    write — unlike Phase 6's session-scoped Supabase retrieval
-    (``retrieval_langchain.sp_retriever``), used for Document Q&A where a
-    session_id already exists.
+    once and share the result with both this search closure and the
+    ``insert_session_chunks`` call that persists them to Supabase
+    ``session_chunks`` — previously each computed its own chunks/embeddings
+    independently, doubling SP embedding calls on every fresh review.
     """
     if not sp_chunks:
         return None
@@ -574,6 +577,19 @@ def _run_review_pipeline(
         # ── Fast path: project already seeded — reuse existing chunks ───────
         project_name, duration_days = _read_project_summary(graph, project_id)
         sp_search_fn = _build_sp_search_fn_from_supabase(db, embeddings, project_id)
+        if sp_search_fn is None and sp_bytes:
+            # SP chunks stored but never persisted to Supabase (e.g. a
+            # pre-migration project awaiting backfill, or a partial prior
+            # run) — chunk/embed/store now, mirroring the keymap/estimate
+            # self-healing below. Without this, a genuinely-uploaded SP
+            # would be misreported as "not uploaded for this review" by
+            # eval_engine's missing-sources check.
+            sp_chunks = _bytes_to_sp_chunks(sp_bytes)
+            if sp_chunks:
+                sp_vectors = embeddings.embed_documents([c["content"] for c in sp_chunks])
+                merged_sp = [{**c, "embedding": v} for c, v in zip(sp_chunks, sp_vectors)]
+                insert_session_chunks(db, project_id, merged_sp)
+                sp_search_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
         keymap_extraction = _read_keymap_extraction_from_supabase(db, project_id)
         if keymap_extraction is None and keymap_bytes:
             # Key map stored but never persisted (e.g. a pre-key-map-feature
@@ -818,10 +834,23 @@ async def review_rerun_endpoint(
         selected_checks, project_id, reseed=False, user_id=user_id,
     )
 
-    db.table("review_projects").update({
+    update_fields: Dict[str, Any] = {
         "review_result": result,
         "project_name": result.get("project_name") or row.get("project_name"),
         "updated_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", project_id).execute()
+    }
+    # Persist any extraction the self-heal path in _run_review_pipeline just
+    # computed (row.get(...) was NULL going in) -- otherwise a rerun keeps
+    # re-running the extraction LLM/vision call every single time instead of
+    # caching it, exactly the cost _read_keymap_extraction_from_supabase/
+    # _read_estimate_extraction_from_supabase exist to avoid.
+    new_km_extraction = (result.get("key_map") or {}).get("extraction")
+    if not row.get("key_map_extraction") and new_km_extraction:
+        update_fields["key_map_extraction"] = new_km_extraction
+    new_est_extraction = (result.get("estimate") or {}).get("extraction")
+    if not row.get("estimate_extraction") and new_est_extraction:
+        update_fields["estimate_extraction"] = new_est_extraction
+
+    db.table("review_projects").update(update_fields).eq("id", project_id).execute()
 
     return result

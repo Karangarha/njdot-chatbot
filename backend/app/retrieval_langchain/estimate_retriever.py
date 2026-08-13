@@ -3,8 +3,8 @@
 Mirror of ``sp_retriever``/``keymap_retriever`` for the project's DBE Goal
 Memo. The indexed text is the vision transcription of page 1 (DBE Goal Memos
 are scans with no text layer — see ``app.ingestion.estimate_extractor``),
-copied into ``session_chunks`` (``doc_type='estimate'``) from the review's
-Neo4j ``EstimateChunk`` nodes by ``app.api.session``'s reuse path.
+written directly into ``session_chunks`` (``doc_type='estimate'``) at
+review-ingestion time — see ``app.api.review``'s ``_extract_and_store_estimate``.
 """
 
 from __future__ import annotations

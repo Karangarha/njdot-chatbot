@@ -362,9 +362,10 @@ async def upload_session(
     Returns a session_id immediately; poll /status/{session_id} for progress.
 
     When ``project_id`` is provided, skips file processing entirely and reuses
-    that project's already-seeded Neo4j/SP data instead (see
-    ``_process_session_reuse``) — this is the normal path from the review
-    flow, which already chunked/embedded/stored everything via ``/api/review``.
+    that project's already-seeded data instead (see ``_process_session_reuse``)
+    — this is the normal path from the review flow, which already
+    chunked/embedded/stored everything via ``/api/review`` (SP/KeyMap/Estimate
+    chunks + extractions in Supabase, schedule/narrative in Neo4j).
     """
     if project_id:
         session_id = project_id

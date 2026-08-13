@@ -3,8 +3,11 @@
 Wraps the existing ``match_session_chunks`` RPC (same call
 ``app.api.session.session_query`` already makes) as a LangChain ``Tool``,
 rather than forcing a ``SupabaseVectorStore`` fit against a custom RPC
-signature. See ``backend/scripts/migrate_session_chunks.sql`` for the table
-this reads (``session_chunks``, ``doc_type='special_provision'``, 24h TTL).
+signature. The table this reads is ``session_chunks`` (``doc_type='special_provision'``).
+Despite the name, rows written by review ingestion and the backfill script
+default ``expires_at`` to 10 years out, not a short session TTL — confirmed
+against the live column default (``now() + '10 years'::interval``); no
+tracked migration file defines this table's DDL.
 """
 
 from __future__ import annotations

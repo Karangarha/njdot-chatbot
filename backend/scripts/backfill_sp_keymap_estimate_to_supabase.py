@@ -27,10 +27,20 @@ Usage
 -----
     python scripts/backfill_sp_keymap_estimate_to_supabase.py [--dry-run]
 
-Run AFTER migration 003 and AFTER Tasks 3-5 are deployed (so new reviews stop
-needing this path), BEFORE Task 7 deletes the Neo4j read paths and Task 8
-deletes the Neo4j SPChunk/KeyMapChunk/KeyMapDoc/EstimateChunk/EstimateDoc data
--- this script is what reads that data one last time.
+Deployment order for this environment:
+  1. Apply migration backend/migrations/009_review_projects_sp_keymap_estimate_supabase_only.sql.
+  2. Deploy the backend + frontend from this branch (new reviews write
+     straight to Supabase from here on; Neo4j is no longer touched for
+     SP/KeyMap/Estimate).
+  3. Run this script with --dry-run, resolve any rows under
+     "MISMATCHES REQUIRING MANUAL REVIEW" in the output, then run it for
+     real. Neo4j must still be up and hold the pre-migration data at this
+     step -- this script is what reads it one last time.
+  4. Only after step 3 is clean in every environment: optionally delete the
+     now-orphaned SPChunk/KeyMapChunk/KeyMapDoc/EstimateChunk/EstimateDoc
+     Neo4j nodes. Not required -- they are inert once nothing writes or
+     reads them -- but safe to reclaim once nothing depends on them,
+     including this script.
 """
 
 from __future__ import annotations

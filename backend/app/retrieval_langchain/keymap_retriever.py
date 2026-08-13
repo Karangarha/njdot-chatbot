@@ -2,8 +2,8 @@
 
 Mirror of ``sp_retriever`` for the key map (key sheet) document: wraps the
 ``match_session_chunks`` RPC as a LangChain ``Tool`` filtered to
-``doc_type='key_map'`` rows (seeded by ``app.api.session``'s reuse path from
-the review's Neo4j ``KeyMapChunk`` nodes).
+``doc_type='key_map'`` rows (written directly to Supabase at review-ingestion
+time — see ``app.api.review``'s ``_extract_and_store_keymap``).
 """
 
 from __future__ import annotations
