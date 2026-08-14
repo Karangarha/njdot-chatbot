@@ -263,6 +263,7 @@ export default function DocumentReview({
   const [spFile,        setSpFile]        = useState<File | null>(null)
   const [keyMapFile,    setKeyMapFile]    = useState<File | null>(null)
   const [estimateFile,  setEstimateFile]  = useState<File | null>(null)
+  const [utilityPlanFile, setUtilityPlanFile] = useState<File | null>(null)
   const [isLoading,     setIsLoading]     = useState(false)
   const [error,         setError]         = useState<string | null>(null)
   const [result,        setResult]        = useState<ReviewResult | null>(null)
@@ -283,6 +284,7 @@ export default function DocumentReview({
   const spRef             = useRef<HTMLInputElement>(null)
   const keyMapRef         = useRef<HTMLInputElement>(null)
   const estimateRef       = useRef<HTMLInputElement>(null)
+  const utilityPlanRef    = useRef<HTMLInputElement>(null)
   const currentProjectRef = useRef<string | null>(null)
   // Synchronous re-entrancy guards — refs update instantly (unlike state),
   // so they catch a fast double-click that fires both `click` events before
@@ -416,6 +418,9 @@ export default function DocumentReview({
 
       const sessionForm = new FormData()
       sessionForm.append('project_id', data.project_id)
+      // Not part of the /api/review submission (test feature) -- sent
+      // alongside project_id so _process_session_reuse can still ingest it.
+      if (utilityPlanFile) sessionForm.append('utility_plan_pdf', utilityPlanFile)
       const sessionRes = await fetch(`${API_BASE}/api/session/upload`, { method: 'POST', headers, body: sessionForm })
 
       // ── Save review result to DB ──────────────────────────────────────────
@@ -715,6 +720,9 @@ export default function DocumentReview({
             <UploadZone label="DBE Goal Memo / Estimate PDF" file={estimateFile} inputRef={estimateRef}
               accept="application/pdf" acceptValidationText="PDF only · first page"
               optional onSelect={setEstimateFile} onRemove={() => setEstimateFile(null)} />
+            <UploadZone label="Utility Agreement Plan PDF (test)" file={utilityPlanFile} inputRef={utilityPlanRef}
+              accept="application/pdf" acceptValidationText="PDF only · first page"
+              optional onSelect={setUtilityPlanFile} onRemove={() => setUtilityPlanFile(null)} />
           </div>
           {spFile && (
             <p className="mt-1.5 text-[11px] text-gray-400">
@@ -731,6 +739,11 @@ export default function DocumentReview({
             <p className="mt-1.5 text-[11px] text-gray-400">
               First page only — the Engineer&apos;s Estimate drives the 60/90-day
               Substantial-to-Final completion gap rule.
+            </p>
+          )}
+          {utilityPlanFile && (
+            <p className="mt-1.5 text-[11px] text-gray-400">
+              Test feature — indexed for Document Q&A only, not yet part of the compliance checklist.
             </p>
           )}
         </div>

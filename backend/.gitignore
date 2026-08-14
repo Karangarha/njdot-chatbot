@@ -50,6 +50,7 @@
 # scripts below. Un-ignored here so Task 3 can import and modify them.
 !app/ingestion/keymap_extractor.py
 !app/ingestion/estimate_extractor.py
+!app/ingestion/utility_plan_extractor.py
 # Un-ignore pre-existing migration scripts that were never added to git
 !scripts/fix_conversations_rls.sql
 !scripts/migrate_session_no_expiry.sql

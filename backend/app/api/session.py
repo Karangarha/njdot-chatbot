@@ -7,11 +7,12 @@ narrative are served by GraphRAG — a CPM-computed knowledge graph in Neo4j
 digest plus a LangChain tool-calling agent (``create_agent``).
 
 POST /api/session/upload
-    Accepts narrative_pdf, special_provision_pdf, and/or xer_file.
-    SP is chunked+embedded into Supabase; XER runs through the deterministic
-    CPM engine and is seeded into Neo4j; the narrative is sectioned +
-    entity-extracted into the same graph. Returns {session_id, status:
-    "processing"} immediately.
+    Accepts narrative_pdf, special_provision_pdf, xer_file, and/or
+    utility_plan_pdf (test — see ingestion.utility_plan_extractor).
+    SP and utility_plan are chunked+embedded into Supabase; XER runs through
+    the deterministic CPM engine and is seeded into Neo4j; the narrative is
+    sectioned + entity-extracted into the same graph. Returns {session_id,
+    status: "processing"} immediately.
 
 GET /api/session/status/{session_id}
     SSE stream of ingestion progress events.
@@ -59,9 +60,11 @@ from app.ingestion.session_chunker   import (
 )
 from app.neo4j_client import get_neo4j
 from app.observability import get_langfuse_handler
+from app.ingestion.utility_plan_extractor import extract_utility_plan, render_utility_plan_facts
 from app.retrieval_langchain.estimate_retriever import build_estimate_tool
 from app.retrieval_langchain.keymap_retriever import build_keymap_tool
 from app.retrieval_langchain.sp_retriever import build_sp_tool, retrieve_sp_chunks
+from app.retrieval_langchain.utility_plan_retriever import build_utility_plan_tool, retrieve_utility_plan_chunks
 from app.scheduling import (
     build_calendars,
     build_network,
@@ -115,6 +118,26 @@ def _bytes_to_sp_chunks(raw: bytes) -> List[Dict[str, Any]]:
         os.unlink(tmp_path)
 
 
+def _ingest_utility_plan(session_id: str, utility_plan_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """Vision-extract a Utility Agreement Plan sheet and return its
+    session_chunks chunk dict (content + metadata, not yet embedded), or
+    ``None`` on extraction failure. Shared by both ``_process_session``
+    (fresh upload) and ``_process_session_reuse`` (adding one alongside an
+    already-seeded review)."""
+    primary = ChatOpenAI(model=config.CHAT_MODEL, temperature=0, api_key=config.OPENAI_API_KEY)
+    fallback = ChatAnthropic(model=_ANTHROPIC_MODEL, anthropic_api_key=config.ANTHROPIC_API_KEY)
+    extraction = extract_utility_plan(utility_plan_bytes, primary.with_fallbacks([fallback]),
+                                       project_id=session_id)
+    if extraction is None:
+        logger.warning("Session %s: utility plan extraction failed", session_id)
+        return None
+    logger.info("Session %s: utility plan extracted (owner=%s)", session_id, extraction.utility_owner)
+    return {
+        "content": render_utility_plan_facts(extraction),
+        "metadata": {"doc_type": "utility_plan", "utility_owner": extraction.utility_owner},
+    }
+
+
 def _extraction_llm() -> Optional[LLMClient]:
     """LLM for narrative entity extraction; None disables extraction gracefully."""
     try:
@@ -140,6 +163,7 @@ def _process_session(
     narrative_bytes: Optional[bytes],
     sp_bytes:        Optional[bytes],
     xer_bytes:       Optional[bytes],
+    utility_plan_bytes: Optional[bytes] = None,
 ) -> None:
     """
     Hybrid ingestion:
@@ -147,6 +171,8 @@ def _process_session(
       - Schedule (XER) + Designer Narrative -> CPM engine + Neo4j knowledge
         graph (project_id = session_id); Q&A reads them via the graph digest
         and a LangChain tool-calling agent.
+      - Utility Agreement Plan (test) -> vision extraction -> Supabase
+        session_chunks, same hybrid RAG path as SP.
     Updates _progress at each stage so the SSE stream stays current.
     """
     try:
@@ -226,6 +252,13 @@ def _process_session(
             all_chunks.extend(sp_chunks)
             logger.info("Session %s: SP → %d chunks", session_id, len(sp_chunks))
 
+        # ── 3b. Utility Agreement Plan (test; hybrid RAG path) ──────────────────
+        if utility_plan_bytes:
+            _set_progress(session_id, status="parsing", message="Reading utility agreement plan…")
+            chunk = _ingest_utility_plan(session_id, utility_plan_bytes)
+            if chunk:
+                all_chunks.append(chunk)
+
         if not all_chunks and not graph_saved:
             _set_progress(session_id, status="error", message="No content extracted from uploaded files.")
             return
@@ -270,7 +303,7 @@ def _process_session(
         _set_progress(session_id, status="error", message=str(exc))
 
 
-def _process_session_reuse(session_id: str) -> None:
+def _process_session_reuse(session_id: str, utility_plan_bytes: Optional[bytes] = None) -> None:
     """Populate a chat session by reusing an already-seeded ``/api/review``
     project's narrative entities instead of re-extracting them.
 
@@ -279,10 +312,11 @@ def _process_session_reuse(session_id: str) -> None:
     nodes) is already fully seeded and needs no action here. SP/KeyMap/
     Estimate chunks and extraction JSON are already in Supabase from review
     ingestion time (see ``api.review``'s ``_extract_and_store_keymap`` etc.)
-    — nothing to copy. This function's only remaining job is narrative
-    entity extraction: review seeds ``NarrativeChunk`` nodes with
-    ``llm=None``, skipping entities; chat needs them for its tool-calling
-    agent.
+    — nothing to copy. This function's remaining jobs are narrative entity
+    extraction (review seeds ``NarrativeChunk`` nodes with ``llm=None``,
+    skipping entities; chat needs them for its tool-calling agent) and,
+    optionally, ingesting a Utility Agreement Plan sheet uploaded alongside
+    the reuse request (test — see ``_ingest_utility_plan``).
 
     Unlike ``_process_session``, this never calls ``clear_project`` — doing
     so would delete everything the review just seeded under this same id.
@@ -326,6 +360,16 @@ def _process_session_reuse(session_id: str) -> None:
                             project_id=session_id, llm=_extraction_llm())
             graph_saved = True
 
+        # ── Utility Agreement Plan (test) — uploaded alongside the reuse
+        # request, not part of the original /api/review submission ────────
+        if utility_plan_bytes:
+            _set_progress(session_id, status="parsing", message="Reading utility agreement plan…")
+            chunk = _ingest_utility_plan(session_id, utility_plan_bytes)
+            if chunk:
+                embeddings = OpenAIEmbeddings(model=config.EMBEDDING_MODEL, api_key=config.OPENAI_API_KEY)
+                chunk["embedding"] = embeddings.embed_documents([chunk["content"]])[0]
+                insert_session_chunks(db, session_id, [chunk])
+
         chunk_count = (
             db.table("session_chunks").select("id", count="exact")
             .eq("session_id", session_id).limit(1).execute()
@@ -353,29 +397,35 @@ async def upload_session(
     narrative_pdf:         Optional[UploadFile] = File(None, description="Designer narrative PDF"),
     special_provision_pdf: Optional[UploadFile] = File(None, description="Special provision PDF (~200 pages)"),
     xer_file:              Optional[UploadFile] = File(None, description="Primavera P6 XER schedule file"),
+    utility_plan_pdf:      Optional[UploadFile] = File(None, description="Utility Agreement Plan sheet PDF (test)"),
     project_id:            Optional[str] = Form(
         None,
         description="Reuse an already-seeded /api/review project's data instead of "
-                     "re-uploading/re-processing files. When set, all file fields are ignored.",
+                     "re-uploading/re-processing files. When set, narrative_pdf/"
+                     "special_provision_pdf/xer_file are ignored; utility_plan_pdf "
+                     "(test) is still processed if given.",
     ),
 ) -> dict:
     """
     Accept project documents and start background ingestion.
     Returns a session_id immediately; poll /status/{session_id} for progress.
 
-    When ``project_id`` is provided, skips file processing entirely and reuses
-    that project's already-seeded data instead (see ``_process_session_reuse``)
-    — this is the normal path from the review flow, which already
-    chunked/embedded/stored everything via ``/api/review`` (SP/KeyMap/Estimate
-    chunks + extractions in Supabase, schedule/narrative in Neo4j).
+    When ``project_id`` is provided, skips file processing for the three
+    review-owned fields and reuses that project's already-seeded data instead
+    (see ``_process_session_reuse``) — this is the normal path from the
+    review flow, which already chunked/embedded/stored everything via
+    ``/api/review`` (SP/KeyMap/Estimate chunks + extractions in Supabase,
+    schedule/narrative in Neo4j). ``utility_plan_pdf`` (test) is not part of
+    that flow yet, so it's still read and ingested here if provided.
     """
     if project_id:
         session_id = project_id
+        utility_plan_bytes = await utility_plan_pdf.read() if utility_plan_pdf else None
         _set_progress(session_id, status="queued", message="Linking session to review…")
-        background_tasks.add_task(_process_session_reuse, session_id)
+        background_tasks.add_task(_process_session_reuse, session_id, utility_plan_bytes)
         return {"session_id": session_id, "status": "processing"}
 
-    if not any([narrative_pdf, special_provision_pdf, xer_file]):
+    if not any([narrative_pdf, special_provision_pdf, xer_file, utility_plan_pdf]):
         raise HTTPException(status_code=400, detail="At least one file must be provided.")
 
     session_id = str(uuid.uuid4())
@@ -384,6 +434,7 @@ async def upload_session(
     nar_bytes = await narrative_pdf.read()         if narrative_pdf         else None
     sp_bytes  = await special_provision_pdf.read() if special_provision_pdf else None
     xer_bytes = await xer_file.read()              if xer_file              else None
+    utility_plan_bytes = await utility_plan_pdf.read() if utility_plan_pdf  else None
 
     background_tasks.add_task(
         _process_session,
@@ -391,6 +442,7 @@ async def upload_session(
         nar_bytes,
         sp_bytes,
         xer_bytes,
+        utility_plan_bytes,
     )
 
     return {"session_id": session_id, "status": "processing"}
@@ -460,6 +512,7 @@ _DOC_LABEL: Dict[str, str] = {
     "key_map":            "Key Map",
     "estimate":           "Estimate",
     "xer_activities":     "Schedule Activities",
+    "utility_plan":       "Utility Agreement Plan",
 }
 
 # ToolMessage name -> the source label shown in the chat UI's source pills.
@@ -468,6 +521,7 @@ _TOOL_SOURCE_LABEL: Dict[str, str] = {
     "search_special_provisions": "Special Provision",
     "search_key_map":            "Key Map",
     "search_estimate":           "Estimate",
+    "search_utility_plans":      "Utility Agreement Plan",
     "search_narrative":          "Designer Narrative",
 }
 
@@ -615,7 +669,8 @@ async def session_query(req: QueryRequest) -> dict:
         sp_tool = build_sp_tool(db, embeddings.embed_query, project_id=req.session_id)
         keymap_tool = build_keymap_tool(db, embeddings.embed_query, project_id=req.session_id)
         estimate_tool = build_estimate_tool(db, embeddings.embed_query, project_id=req.session_id)
-        all_tools = graph_tools + [sp_tool, keymap_tool, estimate_tool]
+        utility_plan_tool = build_utility_plan_tool(db, embeddings.embed_query, project_id=req.session_id)
+        all_tools = graph_tools + [sp_tool, keymap_tool, estimate_tool, utility_plan_tool]
 
         system_prompt = _QA_SYSTEM_GRAPH + f"\n\n[Graph] Project schedule/narrative digest:\n{digest}"
         if context_parts:
@@ -646,6 +701,18 @@ async def session_query(req: QueryRequest) -> dict:
             sources.append({
                 "label":      _DOC_LABEL.get("special_provision", "Special Provision"),
                 "page_pdf":   meta.get("page_pdf"),
+                "similarity": round(row.get("similarity", 0.0), 3),
+            })
+
+        # Utility plan chunks (test) — same no-graph fallback as SP.
+        util_rows = retrieve_utility_plan_chunks(db, embeddings.embed_query, req.session_id, req.question,
+                                                  match_count=req.match_count)
+        for row in util_rows:
+            meta = row.get("metadata", {})
+            owner = meta.get("utility_owner") or ""
+            context_parts.append(f"[UtilityPlan] {owner}\n{row['content']}")
+            sources.append({
+                "label":      _DOC_LABEL.get("utility_plan", "Utility Agreement Plan"),
                 "similarity": round(row.get("similarity", 0.0), 3),
             })
 
