@@ -8,10 +8,11 @@ digest plus a LangChain tool-calling agent (``create_agent``).
 
 POST /api/session/upload
     Accepts narrative_pdf, special_provision_pdf, xer_file, and/or
-    utility_plan_pdf (test — see ingestion.utility_plan_extractor).
-    SP and utility_plan are chunked+embedded into Supabase; XER runs through
-    the deterministic CPM engine and is seeded into Neo4j; the narrative is
-    sectioned + entity-extracted into the same graph. Returns {session_id,
+    utility_plan_pdfs (test, repeatable — one per utility — see
+    ingestion.utility_plan_extractor). SP and each utility plan are
+    chunked+embedded into Supabase; XER runs through the deterministic
+    CPM engine and is seeded into Neo4j; the narrative is sectioned +
+    entity-extracted into the same graph. Returns {session_id,
     status: "processing"} immediately.
 
 GET /api/session/status/{session_id}
@@ -163,7 +164,7 @@ def _process_session(
     narrative_bytes: Optional[bytes],
     sp_bytes:        Optional[bytes],
     xer_bytes:       Optional[bytes],
-    utility_plan_bytes: Optional[bytes] = None,
+    utility_plan_bytes_list: Optional[List[bytes]] = None,
 ) -> None:
     """
     Hybrid ingestion:
@@ -252,12 +253,14 @@ def _process_session(
             all_chunks.extend(sp_chunks)
             logger.info("Session %s: SP → %d chunks", session_id, len(sp_chunks))
 
-        # ── 3b. Utility Agreement Plan (test; hybrid RAG path) ──────────────────
-        if utility_plan_bytes:
-            _set_progress(session_id, status="parsing", message="Reading utility agreement plan…")
-            chunk = _ingest_utility_plan(session_id, utility_plan_bytes)
-            if chunk:
-                all_chunks.append(chunk)
+        # ── 3b. Utility Agreement Plans (test; hybrid RAG path; one per utility) ─
+        if utility_plan_bytes_list:
+            _set_progress(session_id, status="parsing",
+                          message=f"Reading {len(utility_plan_bytes_list)} utility agreement plan(s)…")
+            for b in utility_plan_bytes_list:
+                chunk = _ingest_utility_plan(session_id, b)
+                if chunk:
+                    all_chunks.append(chunk)
 
         if not all_chunks and not graph_saved:
             _set_progress(session_id, status="error", message="No content extracted from uploaded files.")
@@ -303,7 +306,7 @@ def _process_session(
         _set_progress(session_id, status="error", message=str(exc))
 
 
-def _process_session_reuse(session_id: str, utility_plan_bytes: Optional[bytes] = None) -> None:
+def _process_session_reuse(session_id: str, utility_plan_bytes_list: Optional[List[bytes]] = None) -> None:
     """Populate a chat session by reusing an already-seeded ``/api/review``
     project's narrative entities instead of re-extracting them.
 
@@ -360,15 +363,20 @@ def _process_session_reuse(session_id: str, utility_plan_bytes: Optional[bytes] 
                             project_id=session_id, llm=_extraction_llm())
             graph_saved = True
 
-        # ── Utility Agreement Plan (test) — uploaded alongside the reuse
-        # request, not part of the original /api/review submission ────────
-        if utility_plan_bytes:
-            _set_progress(session_id, status="parsing", message="Reading utility agreement plan…")
-            chunk = _ingest_utility_plan(session_id, utility_plan_bytes)
-            if chunk:
+        # ── Utility Agreement Plans (test) — uploaded alongside the reuse
+        # request, not part of the original /api/review submission; one per
+        # utility (gas, water/sewer, electric, telecom, ...) ────────────────
+        if utility_plan_bytes_list:
+            _set_progress(session_id, status="parsing",
+                          message=f"Reading {len(utility_plan_bytes_list)} utility agreement plan(s)…")
+            chunks = [c for b in utility_plan_bytes_list
+                      if (c := _ingest_utility_plan(session_id, b)) is not None]
+            if chunks:
                 embeddings = OpenAIEmbeddings(model=config.EMBEDDING_MODEL, api_key=config.OPENAI_API_KEY)
-                chunk["embedding"] = embeddings.embed_documents([chunk["content"]])[0]
-                insert_session_chunks(db, session_id, [chunk])
+                vectors = embeddings.embed_documents([c["content"] for c in chunks])
+                for c, v in zip(chunks, vectors):
+                    c["embedding"] = v
+                insert_session_chunks(db, session_id, chunks)
 
         chunk_count = (
             db.table("session_chunks").select("id", count="exact")
@@ -397,12 +405,13 @@ async def upload_session(
     narrative_pdf:         Optional[UploadFile] = File(None, description="Designer narrative PDF"),
     special_provision_pdf: Optional[UploadFile] = File(None, description="Special provision PDF (~200 pages)"),
     xer_file:              Optional[UploadFile] = File(None, description="Primavera P6 XER schedule file"),
-    utility_plan_pdf:      Optional[UploadFile] = File(None, description="Utility Agreement Plan sheet PDF (test)"),
+    utility_plan_pdfs:     Optional[List[UploadFile]] = File(
+        None, description="Utility Agreement Plan sheet PDFs (test) — one per utility (gas, water/sewer, electric, telecom, ...)."),
     project_id:            Optional[str] = Form(
         None,
         description="Reuse an already-seeded /api/review project's data instead of "
                      "re-uploading/re-processing files. When set, narrative_pdf/"
-                     "special_provision_pdf/xer_file are ignored; utility_plan_pdf "
+                     "special_provision_pdf/xer_file are ignored; utility_plan_pdfs "
                      "(test) is still processed if given.",
     ),
 ) -> dict:
@@ -415,17 +424,18 @@ async def upload_session(
     (see ``_process_session_reuse``) — this is the normal path from the
     review flow, which already chunked/embedded/stored everything via
     ``/api/review`` (SP/KeyMap/Estimate chunks + extractions in Supabase,
-    schedule/narrative in Neo4j). ``utility_plan_pdf`` (test) is not part of
-    that flow yet, so it's still read and ingested here if provided.
+    schedule/narrative in Neo4j). ``utility_plan_pdfs`` (test) is not part of
+    that flow yet, so they're still read and ingested here if provided.
     """
+    utility_plan_bytes_list = [await f.read() for f in (utility_plan_pdfs or [])]
+
     if project_id:
         session_id = project_id
-        utility_plan_bytes = await utility_plan_pdf.read() if utility_plan_pdf else None
         _set_progress(session_id, status="queued", message="Linking session to review…")
-        background_tasks.add_task(_process_session_reuse, session_id, utility_plan_bytes)
+        background_tasks.add_task(_process_session_reuse, session_id, utility_plan_bytes_list)
         return {"session_id": session_id, "status": "processing"}
 
-    if not any([narrative_pdf, special_provision_pdf, xer_file, utility_plan_pdf]):
+    if not any([narrative_pdf, special_provision_pdf, xer_file, utility_plan_bytes_list]):
         raise HTTPException(status_code=400, detail="At least one file must be provided.")
 
     session_id = str(uuid.uuid4())
@@ -434,7 +444,6 @@ async def upload_session(
     nar_bytes = await narrative_pdf.read()         if narrative_pdf         else None
     sp_bytes  = await special_provision_pdf.read() if special_provision_pdf else None
     xer_bytes = await xer_file.read()              if xer_file              else None
-    utility_plan_bytes = await utility_plan_pdf.read() if utility_plan_pdf  else None
 
     background_tasks.add_task(
         _process_session,
@@ -442,7 +451,7 @@ async def upload_session(
         nar_bytes,
         sp_bytes,
         xer_bytes,
-        utility_plan_bytes,
+        utility_plan_bytes_list,
     )
 
     return {"session_id": session_id, "status": "processing"}
