@@ -396,6 +396,7 @@ export default function DocumentReview({
       if (spFile) reviewForm.append('special_provision_pdf', spFile)
       if (keyMapFile) reviewForm.append('key_map_pdf', keyMapFile)
       if (estimateFile) reviewForm.append('estimate_pdf', estimateFile)
+      utilityPlanFiles.forEach(f => reviewForm.append('utility_plan_pdfs', f))
       if (specs.length > 0) reviewForm.append('checks', JSON.stringify(specs))
 
       // /api/review already chunks, embeds, and stores the schedule/narrative/SP
@@ -418,9 +419,10 @@ export default function DocumentReview({
 
       const sessionForm = new FormData()
       sessionForm.append('project_id', data.project_id)
-      // Not part of the /api/review submission (test feature) -- sent
-      // alongside project_id so _process_session_reuse can still ingest them.
-      utilityPlanFiles.forEach(f => sessionForm.append('utility_plan_pdfs', f))
+      // Utility plans are sent with the /api/review submission above now
+      // (so compliance checks can see them) -- session.py's project_id-reuse
+      // path can still accept more later (e.g. attaching one after the
+      // fact), just not needed on this initial submission anymore.
       const sessionRes = await fetch(`${API_BASE}/api/session/upload`, { method: 'POST', headers, body: sessionForm })
 
       // ── Save review result to DB ──────────────────────────────────────────
@@ -740,10 +742,10 @@ export default function DocumentReview({
           )}
         </div>
 
-        {/* Row 3: Utility Agreement Plans — one per utility (test) */}
+        {/* Row 3: Utility Agreement Plans — one per utility */}
         <div className="mb-6">
           <p className="mb-1.5 text-xs font-semibold text-gray-700">
-            Utility Agreement Plans (test){' '}
+            Utility Agreement Plans{' '}
             <span className="text-gray-400 font-normal">(optional — add one per utility: gas, water/sewer, electric, telecom, etc.)</span>
           </p>
           <div className="space-y-2">
@@ -781,7 +783,8 @@ export default function DocumentReview({
             }} />
           {utilityPlanFiles.length > 0 && (
             <p className="mt-1.5 text-[11px] text-gray-400">
-              Test feature — indexed for Document Q&A only, not yet part of the compliance checklist.
+              Cross-referenced by the utility-related checks (alignment, service interruptions,
+              work hours) and indexed for Document Q&A.
             </p>
           )}
         </div>

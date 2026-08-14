@@ -307,6 +307,7 @@ def _evaluate_one_check(
     csm_search_fn: Optional[Callable[[str], str]],
     keymap_facts: Optional[str],
     estimate_facts: Optional[str],
+    utility_plan_search_fn: Optional[Callable[[str], str]],
     deterministic: "_DeterministicContext",
     project_id: str,
     user_id: Optional[str],
@@ -326,6 +327,13 @@ def _evaluate_one_check(
     # a missing search_fn for either signals an infra problem rather than a
     # normal "not uploaded" case — still degrades to "Missing" either way
     # rather than silently evaluating with partial evidence.
+    #
+    # "utility_plan" is deliberately NOT included here: it's a cross-reference
+    # bonus (checks like gas_interruption worked fine off "schedule" alone
+    # before this source existed), not a requirement — a review without one
+    # uploaded must keep evaluating exactly as it did before, not degrade to
+    # Missing. See the evidence-gathering block below for how it's included
+    # only when actually available.
     missing_sources = []
     if "sp" in sources and sp_search_fn is None:
         missing_sources.append("Special Provision (not uploaded for this review)")
@@ -364,6 +372,8 @@ def _evaluate_one_check(
         evidence_parts.append(spec_search_fn(check.instruction))
     if "csm" in sources:
         evidence_parts.append(csm_search_fn(check.instruction))
+    if "utility_plan" in sources and utility_plan_search_fn is not None:
+        evidence_parts.append(utility_plan_search_fn(check.instruction))
     evidence = "\n\n".join(evidence_parts) if evidence_parts else schedule_facts
 
     user_msg = f"{evidence}\n\nCHECK: {check.name}\n{check.instruction}"
@@ -414,6 +424,7 @@ def evaluate_checks(
     keymap_geo: Optional[RegionResult] = None,
     estimate_facts: Optional[str] = None,
     cost_gap: Optional[CostGapResult] = None,
+    utility_plan_search_fn: Optional[Callable[[str], str]] = None,
     project_id: str = "default",
     user_id: Optional[str] = None,
 ) -> List[ReviewCheckResult]:
@@ -495,6 +506,7 @@ def evaluate_checks(
                 executor.submit(
                     _evaluate_one_check, check, structured_llm, schedule_facts, narrative_text,
                     sp_search_fn, spec_search_fn, csm_search_fn, keymap_facts, estimate_facts,
+                    utility_plan_search_fn,
                     deterministic_ctx, project_id, user_id, langfuse_handler,
                 ): i
                 for i, check in enumerate(checks)

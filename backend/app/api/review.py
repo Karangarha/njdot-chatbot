@@ -74,10 +74,12 @@ from app.ingestion.keymap_extractor import (
 )
 from app.ingestion.pdf_parser import PDFParser
 from app.ingestion.session_chunker import chunk_narrative, chunk_special_provision
+from app.ingestion.utility_plan_extractor import extract_utility_plan, render_utility_plan_facts
 from app.models import ReviewCheckResult, ReviewResponse
 from app.neo4j_client import get_neo4j
 from app.retrieval.vector_search import VectorSearcher
 from app.retrieval_langchain.sp_retriever import retrieve_sp_chunks
+from app.retrieval_langchain.utility_plan_retriever import retrieve_utility_plan_chunks
 from app.scheduling import build_calendars, build_network, cross_check, run_cpm
 # Re-exported for backward compatibility (session.py and debug scripts import
 # these from app.api.review); canonical implementations live in app.scheduling.
@@ -234,6 +236,51 @@ def _build_sp_search_fn_from_supabase(
         rows = retrieve_sp_chunks(db, embeddings.embed_query, project_id, query)
         if not rows:
             return "No matching Special Provision text found."
+        return "\n\n---\n\n".join(r["content"] for r in rows)
+
+    return _search
+
+
+def _build_utility_plan_search_fn(
+    chunks: List[Dict[str, Any]], vectors: List[List[float]], embeddings: OpenAIEmbeddings,
+) -> Optional[Callable[[str], str]]:
+    """In-process cosine-ranked Utility Agreement Plan search, mirroring
+    ``_build_sp_search_fn`` exactly. ``chunks``/``vectors`` are pooled across
+    every utility plan sheet uploaded for this review (one per utility), so a
+    check searches all of them together."""
+    if not chunks:
+        return None
+    texts = [c["content"] for c in chunks]
+
+    def _search(query: str, top_k: int = 5) -> str:
+        q_vec = embeddings.embed_query(query)
+        scored = sorted(zip(texts, vectors), key=lambda tv: -_cosine(q_vec, tv[1]))
+        top = [t for t, _ in scored[:top_k]]
+        return "\n\n---\n\n".join(top) if top else "No matching Utility Agreement Plan text found."
+
+    return _search
+
+
+def _build_utility_plan_search_fn_from_supabase(
+    db: Any, embeddings: OpenAIEmbeddings, project_id: str,
+) -> Optional[Callable[[str], str]]:
+    """Utility Agreement Plan search backed by ``session_chunks`` -- the
+    ``reseed=False`` fast path's equivalent of ``_build_utility_plan_search_fn``.
+    Reuses the same ``retrieve_utility_plan_chunks`` chat already calls.
+    Returns ``None`` if this project has no utility plan chunks (matches "none
+    uploaded" behavior -- this source is optional, see eval_engine)."""
+    existing = (
+        db.table("session_chunks").select("id", count="exact")
+        .eq("session_id", project_id).eq("doc_type", "utility_plan")
+        .limit(1).execute()
+    )
+    if not existing.count:
+        return None
+
+    def _search(query: str) -> str:
+        rows = retrieve_utility_plan_chunks(db, embeddings.embed_query, project_id, query)
+        if not rows:
+            return "No matching Utility Agreement Plan text found."
         return "\n\n---\n\n".join(r["content"] for r in rows)
 
     return _search
@@ -473,6 +520,7 @@ def _run_review_pipeline(
     project_id: str,
     reseed: bool = True,
     user_id: Optional[str] = None,
+    utility_plan_bytes_list: Optional[List[bytes]] = None,
 ) -> dict:
     """Parse -> CPM -> seed Neo4j -> evaluate the checklist -> frontend shape.
 
@@ -569,6 +617,30 @@ def _run_review_pipeline(
                 db, embeddings, llm, estimate_bytes, project_id, user_id,
             )
 
+        # Utility Agreement Plan sheets (one per utility -- gas, water/sewer,
+        # electric, telecom, ...). Mirrors the SP block: vision-extract each,
+        # embed once, share between the immediate search closure and Supabase
+        # persistence. Optional cross-reference evidence -- see eval_engine's
+        # missing_sources handling for why an absent one never blocks a check.
+        utility_plan_search_fn = None
+        if utility_plan_bytes_list:
+            utility_plan_chunks = []
+            for b in utility_plan_bytes_list:
+                extraction = extract_utility_plan(b, llm, project_id=project_id, user_id=user_id)
+                if extraction is not None:
+                    utility_plan_chunks.append({
+                        "content": render_utility_plan_facts(extraction),
+                        "metadata": {"doc_type": "utility_plan", "utility_owner": extraction.utility_owner},
+                    })
+            if utility_plan_chunks:
+                utility_plan_vectors = embeddings.embed_documents(
+                    [c["content"] for c in utility_plan_chunks])
+                merged_utility_plans = [
+                    {**c, "embedding": v} for c, v in zip(utility_plan_chunks, utility_plan_vectors)]
+                insert_session_chunks(db, project_id, merged_utility_plans)
+                utility_plan_search_fn = _build_utility_plan_search_fn(
+                    utility_plan_chunks, utility_plan_vectors, embeddings)
+
         project_name = (project or {}).get("project_name") or "Unknown"
         duration_days = 0
         if cpm is not None and cpm.data_date and cpm.project_finish:
@@ -590,6 +662,10 @@ def _run_review_pipeline(
                 merged_sp = [{**c, "embedding": v} for c, v in zip(sp_chunks, sp_vectors)]
                 insert_session_chunks(db, project_id, merged_sp)
                 sp_search_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+        # No self-heal here: unlike SP, utility plan bytes are never uploaded
+        # to Storage, so a rerun has no way to re-fetch them if missing --
+        # only whatever was chunked at the original submission is available.
+        utility_plan_search_fn = _build_utility_plan_search_fn_from_supabase(db, embeddings, project_id)
         keymap_extraction = _read_keymap_extraction_from_supabase(db, project_id)
         if keymap_extraction is None and keymap_bytes:
             # Key map stored but never persisted (e.g. a pre-key-map-feature
@@ -631,6 +707,7 @@ def _run_review_pipeline(
             sp_search_fn=sp_search_fn, spec_search_fn=spec_search_fn, csm_search_fn=csm_search_fn,
             keymap_facts=keymap_facts, keymap_geo=keymap_geo,
             estimate_facts=estimate_facts, cost_gap=cost_gap,
+            utility_plan_search_fn=utility_plan_search_fn,
             project_id=project_id, user_id=user_id,
         )
     except Exception as exc:
@@ -705,6 +782,9 @@ async def review_endpoint(
         None, description="Optional NJDOT key map (key sheet) PDF"),
     estimate_pdf: Optional[UploadFile] = File(
         None, description="Optional DBE Goal Memo / Engineer's Estimate PDF (page 1 is read)"),
+    utility_plan_pdfs: Optional[List[UploadFile]] = File(
+        None, description="Optional Utility Agreement Plan sheet PDFs -- one per utility "
+                           "(gas, water/sewer, electric, telecom, ...)."),
     checks: Optional[str] = Form(
         None,
         description="Optional JSON array of the checks to run "
@@ -733,6 +813,7 @@ async def review_endpoint(
         sp_bytes = await special_provision_pdf.read() if special_provision_pdf else None
         keymap_bytes = await key_map_pdf.read() if key_map_pdf else None
         estimate_bytes = await estimate_pdf.read() if estimate_pdf else None
+        utility_plan_bytes_list = [await f.read() for f in (utility_plan_pdfs or [])]
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Failed to read uploaded files: {exc}") from exc
 
@@ -765,6 +846,7 @@ async def review_endpoint(
     result = _run_review_pipeline(
         schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
         selected_checks, project_id, user_id=user_id,
+        utility_plan_bytes_list=utility_plan_bytes_list,
     )
     result["schedule_file_path"] = schedule_path
     result["narrative_pdf_path"] = narrative_path

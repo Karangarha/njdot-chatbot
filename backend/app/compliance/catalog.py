@@ -89,8 +89,10 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Water'). Fail and list every utility that appears on the key map but "
         "is never mentioned in the Special Provisions, or is named in the "
         "Special Provisions but absent from the key map. Mark Missing if "
-        "either document contains no utility information.",
-        source_files=["keymap", "sp"],
+        "either document contains no utility information. If Utility "
+        "Agreement Plan sheets are attached, cross-reference their utility "
+        "owner/type against the same list — flag any disagreement.",
+        source_files=["keymap", "sp", "utility_plan"],
     ),
 
     # ── Administrative Dates ──────────────────────────────────────────────────
@@ -166,21 +168,33 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "No Gas Service Interruptions Oct 1 to Apr 1",
         "Check if any gas activity is scheduled, if yes, verify that no gas service "
         "interruption activities are scheduled between October 1 and April 1. Pass, "
-        "if no gas activity is scheduled.",
+        "if no gas activity is scheduled. Evaluate this from the schedule alone; a "
+        "Utility Agreement Plan lane-closure schedule below (if any is shown) is "
+        "extra cross-reference evidence only — its absence is normal and must never "
+        "by itself be a reason to answer Missing.",
+        source_files=["schedule", "utility_plan"],
     ),
     CheckDef(
         "water_interruption", CAT_UTILITY_RESTRICTIONS,
         "No Water Service Interruptions Apr 1 to Sep 30",
         "Check if any water activity is scheduled, if yes, then verify that no water "
         "service interruption activities are scheduled between April 1 and "
-        "September 30. Pass, if no water activity scheduled.",
+        "September 30. Pass, if no water activity scheduled. Evaluate this from the "
+        "schedule alone; a Utility Agreement Plan lane-closure schedule below (if any "
+        "is shown) is extra cross-reference evidence only — its absence is normal and "
+        "must never by itself be a reason to answer Missing.",
+        source_files=["schedule", "utility_plan"],
     ),
     CheckDef(
         "electric_interruption", CAT_UTILITY_RESTRICTIONS,
         "No Electric Service Interruptions Jun 1 to Sep 30",
         "Check if any Electric activity is scheduled, if yes, then verify that no "
         "electric service interruption activities are scheduled between June 1 and "
-        "September 30. if no electricity activity is scheduled then pass.",
+        "September 30. if no electricity activity is scheduled then pass. Evaluate "
+        "this from the schedule alone; a Utility Agreement Plan lane-closure schedule "
+        "below (if any is shown) is extra cross-reference evidence only — its absence "
+        "is normal and must never by itself be a reason to answer Missing.",
+        source_files=["schedule", "utility_plan"],
     ),
     CheckDef(
         "utility_work_hours", CAT_UTILITY_RESTRICTIONS,
@@ -188,7 +202,11 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Utility companies typically do not work nights or weekends. Where utility "
         "relocations or other utility work are proposed, verify the schedule accounts "
         "for this (no assumed night/weekend utility production) and allows adequate "
-        "duration.",
+        "duration. Evaluate this from the schedule alone; a Utility Agreement Plan "
+        "lane-closure schedule below (if any is shown) is extra cross-reference "
+        "evidence only — its absence is normal and must never by itself be a reason "
+        "to answer Missing.",
+        source_files=["schedule", "utility_plan"],
     ),
     CheckDef(
         "railroad_restrictions", CAT_UTILITY_RESTRICTIONS,
