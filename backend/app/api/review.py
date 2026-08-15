@@ -386,22 +386,34 @@ def _seed_edq_items_if_needed(
     estimate_bytes: Optional[bytes],
     project_id: str,
     user_id: Optional[str],
+    reseed: bool,
 ) -> None:
-    """Extract -> match -> seed EDQ items into Neo4j, but only the first
-    time this project needs it.
+    """Extract -> match -> seed EDQ items into Neo4j.
 
-    Gated on "does EdqItem data already exist for this projectId" (a cheap
-    count() query), not on reseed/rerun -- this makes reruns of an
+    ``reseed=False``: gated on "does EdqItem data already exist for this
+    projectId" (a cheap count() query) -- this makes reruns of an
     already-seeded project a no-op (evaluate_edq_coverage reads the durable
     graph directly), and self-heals projects reviewed before this feature
-    existed, in one code path.
+    existed.
+
+    ``reseed=True``: an explicit rerun against possibly-revised source
+    documents (e.g. a corrected XER schedule meant to close a previously
+    -flagged EDQ gap) -- existing EdqItem nodes for this project are deleted
+    first so the whole extract/match/seed pass runs fresh. No-op delete for
+    a genuinely new project.
     """
-    existing = graph.query(
-        "MATCH (e:EdqItem {projectId: $pid}) RETURN count(e) AS c LIMIT 1",
-        params={"pid": project_id},
-    )
-    if existing and existing[0]["c"]:
-        return
+    if reseed:
+        graph.query(
+            "MATCH (e:EdqItem {projectId: $pid}) DETACH DELETE e",
+            params={"pid": project_id},
+        )
+    else:
+        existing = graph.query(
+            "MATCH (e:EdqItem {projectId: $pid}) RETURN count(e) AS c LIMIT 1",
+            params={"pid": project_id},
+        )
+        if existing and existing[0]["c"]:
+            return
     if not estimate_bytes:
         return
     extraction = extract_edq_items(estimate_bytes, llm, project_id=project_id, user_id=user_id)
@@ -421,6 +433,8 @@ def _seed_edq_items_if_needed(
     } for i, it in enumerate(extraction.items)]
     matches = match_edq_items_to_activities(
         items, activities, llm, embeddings, project_id=project_id, user_id=user_id)
+    if matches is None:
+        return  # matching failed -- don't seed a false "all uncovered" state; retry next run
     seed_edq_items(graph, items, matches, project_id=project_id)
 
 
@@ -728,7 +742,7 @@ def _run_review_pipeline(
                 db, embeddings, llm, estimate_bytes, project_id, user_id,
             )
 
-    _seed_edq_items_if_needed(graph, llm, embeddings, estimate_bytes, project_id, user_id)
+    _seed_edq_items_if_needed(graph, llm, embeddings, estimate_bytes, project_id, user_id, reseed=reseed)
 
     # Geo and the cost gap are recomputed on every run (both are pure
     # in-process computations) so polyline/parser/threshold fixes apply to

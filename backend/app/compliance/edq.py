@@ -128,15 +128,22 @@ def match_edq_items_to_activities(
     project_id: Optional[str] = None,
     user_id: Optional[str] = None,
     top_k: int = _TOP_K_CANDIDATES,
-) -> List[Dict[str, Any]]:
+) -> Optional[List[Dict[str, Any]]]:
     """One structured-output call: EDQ items, each paired with its own
     embedding-pre-filtered candidate activities, -> proposed matches.
 
     Returns flattened ``[{edqItemId, taskId, confidence, rationale}, ...]``
     rows (task_ids exploded; an item with an empty match list contributes no
-    rows). ``[]`` on any failure -- fail-soft like every other LLM call in
-    this codebase; an empty result just means every item ends up
-    "uncovered" in ``evaluate_edq_coverage``.
+    rows).
+
+    Two distinct "nothing" outcomes, and callers must not conflate them:
+    - ``[]`` means the matching pass ran successfully and legitimately found
+      no matches (or there was nothing to match) -- a normal, seedable
+      result.
+    - ``None`` means the matching pass itself failed (embedding call or LLM
+      call raised) -- the caller must NOT treat this as "everything is
+      uncovered" and seed a false Fail; it should skip seeding and let a
+      future rerun retry.
     """
     if not items or not activities:
         return []
@@ -146,7 +153,7 @@ def match_edq_items_to_activities(
         activity_vecs = embeddings.embed_documents([_activity_text(a) for a in activities])
     except Exception:
         logger.exception("match_edq_items_to_activities: embedding failed")
-        return []
+        return None
 
     prompt_lines: List[str] = []
     for item, ivec in zip(items, item_vecs):
@@ -182,7 +189,7 @@ def match_edq_items_to_activities(
         )
     except Exception:
         logger.exception("match_edq_items_to_activities: structured matching failed")
-        return []
+        return None
 
     rows: List[Dict[str, Any]] = []
     for m in result.matches:

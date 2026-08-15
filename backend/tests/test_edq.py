@@ -18,6 +18,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from app.compliance.edq import build_edq_coverage_tool, get_edq_item_details   # noqa: E402
+from app.compliance.edq import evaluate_edq_coverage   # noqa: E402
 
 
 class _FakeGraph:
@@ -119,6 +120,37 @@ def test_edq_coverage_tool_strips_whitespace_input():
     assert "error" not in result
 
 
+def test_evaluate_edq_coverage_all_covered_is_pass():
+    graph = _FakeGraph(coverage_rows=[
+        {"id": "edq:1", "jobId": "0001", "category": "0001", "itemDescription": "MOBILIZATION", "bestConfidence": 0.9},
+        {"id": "edq:2", "jobId": "0002", "category": "0001", "itemDescription": "TRAINEES", "bestConfidence": 0.75},
+    ])
+    result = evaluate_edq_coverage(graph, "proj-1")
+    assert result.status == "Pass"
+    assert result.uncovered == 0
+    assert result.low_confidence == 0
+    assert result.fully_covered == 2
+
+
+def test_evaluate_edq_coverage_low_confidence_is_missing():
+    graph = _FakeGraph(coverage_rows=[
+        {"id": "edq:1", "jobId": "0001", "category": "0001", "itemDescription": "MOBILIZATION", "bestConfidence": 0.9},
+        {"id": "edq:2", "jobId": "0002", "category": "0001", "itemDescription": "TRAINEES", "bestConfidence": 0.3},
+    ])
+    result = evaluate_edq_coverage(graph, "proj-1")
+    assert result.status == "Missing"
+    assert result.uncovered == 0
+    assert result.low_confidence == 1
+    assert "TRAINEES" in result.detail
+
+
+def test_evaluate_edq_coverage_no_rows_is_none_status():
+    graph = _FakeGraph(coverage_rows=[])
+    result = evaluate_edq_coverage(graph, "proj-1")
+    assert result.status is None
+    assert result.total_items == 0
+
+
 if __name__ == "__main__":
     test_get_edq_item_details_found_with_matches()
     test_get_edq_item_details_not_found()
@@ -127,4 +159,7 @@ if __name__ == "__main__":
     test_edq_coverage_tool_summary_on_empty_input()
     test_edq_coverage_tool_per_item_on_nonempty_input()
     test_edq_coverage_tool_strips_whitespace_input()
+    test_evaluate_edq_coverage_all_covered_is_pass()
+    test_evaluate_edq_coverage_low_confidence_is_missing()
+    test_evaluate_edq_coverage_no_rows_is_none_status()
     print("All tests passed!")
