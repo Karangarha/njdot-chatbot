@@ -403,3 +403,41 @@ def seed_narrative(
     }
     logger.info("seed_narrative: %s", stats)
     return stats
+
+
+def seed_edq_items(
+    graph: Neo4jGraph,
+    items: List[Dict[str, Any]],
+    matches: List[Dict[str, Any]],
+    project_id: str = "default",
+) -> Dict[str, int]:
+    """Seed EdqItem nodes and COVERED_BY edges to Activity.
+
+    ``items`` need only ``id`` plus whatever descriptive properties to set
+    (jobId, category, itemDescription, ...). ``matches`` are
+    ``{edqItemId, taskId, confidence, rationale}`` rows — an item with no
+    corresponding match rows intentionally ends up with zero COVERED_BY
+    edges; that absence is the "uncovered" signal
+    ``app.compliance.edq.evaluate_edq_coverage`` keys off, not a gap to fill
+    with placeholder edges.
+    """
+    ensure_constraints(graph)
+    if items:
+        graph.query(
+            "UNWIND $rows AS row "
+            "MERGE (e:EdqItem {id: row.id, projectId: $projectId}) "
+            "SET e += row",
+            params={"rows": items, "projectId": project_id},
+        )
+    if matches:
+        graph.query(
+            "UNWIND $rows AS row "
+            "MATCH (e:EdqItem {id: row.edqItemId, projectId: $projectId}), "
+            "      (a:Activity {taskId: row.taskId, projectId: $projectId}) "
+            "MERGE (e)-[r:COVERED_BY]->(a) "
+            "SET r.confidence = row.confidence, r.rationale = row.rationale",
+            params={"rows": matches, "projectId": project_id},
+        )
+    stats = {"edq_items": len(items), "covered_by_edges": len(matches)}
+    logger.info("seed_edq_items: %s", stats)
+    return stats

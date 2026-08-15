@@ -27,9 +27,10 @@ caching benefit, but it's a minority of the catalog.
 
 Checks whose ``check_type`` appears in ``_DETERMINISTIC_EVALUATORS``
 short-circuit the LLM entirely and are computed in Python: ``"geo"``
-(north/south of I-195 from key map coordinates, ``app.compliance.geo``) and
+(north/south of I-195 from key map coordinates, ``app.compliance.geo``),
 ``"cost_gap"`` (Substantial-to-Final day gap from the Engineer's Estimate,
-``app.compliance.cost``).
+``app.compliance.cost``), and ``"edq_coverage"`` (EDQ line item -> schedule
+activity graph coverage, ``app.compliance.edq``).
 """
 
 from __future__ import annotations
@@ -47,6 +48,7 @@ from langchain_neo4j import Neo4jGraph
 
 from app.compliance.catalog import CheckDef
 from app.compliance.cost import CostGapResult
+from app.compliance.edq import EdqCoverageResult
 from app.compliance.geo import RegionResult
 from app.config import config
 from app.models import EvaluationSchema, ReviewCheckResult
@@ -280,6 +282,28 @@ def _evaluate_cost_gap_check(check: CheckDef, ctx: "_DeterministicContext") -> R
     return _result(check, "Pass" if gap.satisfied else "Fail", gap.detail, source)
 
 
+def _evaluate_edq_coverage_check(check: CheckDef, ctx: "_DeterministicContext") -> ReviewCheckResult:
+    """Deterministic EDQ item -> Activity graph coverage — maps the
+    precomputed ``EdqCoverageResult`` onto a ``ReviewCheckResult``, no LLM
+    call. ``status is None`` means no EDQ items could be read from the
+    estimate document at all (reported as "Missing"); otherwise ``status``
+    is already one of Pass/Fail/Missing (a low-confidence-but-present match
+    reports "Missing" too, distinct from "Fail" for a genuinely uncovered
+    item — see ``app.compliance.edq``'s module docstring)."""
+    edq = ctx.edq_coverage
+    if edq is None or edq.status is None:
+        return _result(
+            check, "Missing",
+            edq.detail if edq is not None
+            else "No EDQ items could be read from the uploaded estimate document.",
+            "estimate document",
+        )
+    return _result(
+        check, edq.status, edq.detail,
+        "estimate document + schedule graph (deterministic EDQ coverage)",
+    )
+
+
 @dataclass
 class _DeterministicContext:
     """Precomputed inputs for the non-LLM check types. Grouping them keeps
@@ -287,6 +311,7 @@ class _DeterministicContext:
 
     keymap_geo: Optional[RegionResult] = None
     cost_gap: Optional[CostGapResult] = None
+    edq_coverage: Optional[EdqCoverageResult] = None
 
 
 # check_type -> evaluator. A check_type absent from this registry takes the
@@ -294,6 +319,7 @@ class _DeterministicContext:
 _DETERMINISTIC_EVALUATORS: Dict[str, Callable[[CheckDef, _DeterministicContext], ReviewCheckResult]] = {
     "geo": _evaluate_geo_check,
     "cost_gap": _evaluate_cost_gap_check,
+    "edq_coverage": _evaluate_edq_coverage_check,
 }
 
 
@@ -424,6 +450,7 @@ def evaluate_checks(
     keymap_geo: Optional[RegionResult] = None,
     estimate_facts: Optional[str] = None,
     cost_gap: Optional[CostGapResult] = None,
+    edq_coverage: Optional[EdqCoverageResult] = None,
     utility_plan_search_fn: Optional[Callable[[str], str]] = None,
     project_id: str = "default",
     user_id: Optional[str] = None,
@@ -459,7 +486,9 @@ def evaluate_checks(
     doesn't carry it.
     """
     structured_llm = llm.with_structured_output(EvaluationSchema, include_raw=True)
-    deterministic_ctx = _DeterministicContext(keymap_geo=keymap_geo, cost_gap=cost_gap)
+    deterministic_ctx = _DeterministicContext(
+        keymap_geo=keymap_geo, cost_gap=cost_gap, edq_coverage=edq_coverage,
+    )
     total_input_tokens = 0
     total_output_tokens = 0
     total_cached_tokens = 0

@@ -40,6 +40,8 @@ _CONSTRAINTS = [
     "FOR (e:NarrativeEntity) REQUIRE (e.projectId, e.id) IS UNIQUE",
     "CREATE CONSTRAINT project_id IF NOT EXISTS "
     "FOR (p:Project) REQUIRE p.projectId IS UNIQUE",
+    "CREATE CONSTRAINT edq_item_id_per_project IF NOT EXISTS "
+    "FOR (e:EdqItem) REQUIRE (e.projectId, e.id) IS UNIQUE",
 ]
 
 

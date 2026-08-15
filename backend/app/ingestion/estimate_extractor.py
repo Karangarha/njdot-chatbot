@@ -109,14 +109,16 @@ read — never invent or infer a digit.
 """
 
 
-def render_page1_png(raw: bytes, dpi: int = _DEFAULT_DPI) -> bytes:
-    """Render page 1 to PNG bytes, stepping the DPI down if the result is too
-    large to send comfortably."""
+def render_page_png(raw: bytes, page_index: int = 0, dpi: int = _DEFAULT_DPI) -> bytes:
+    """Render one 0-indexed page to PNG bytes, stepping the DPI down if the
+    result is too large to send comfortably."""
     doc = fitz.open(stream=raw, filetype="pdf")
     try:
         if doc.page_count == 0:
             raise ValueError("PDF has no pages")
-        page = doc[0]
+        if page_index >= doc.page_count:
+            raise ValueError(f"page_index {page_index} out of range ({doc.page_count} pages)")
+        page = doc[page_index]
         ladder = (dpi,) + tuple(d for d in _DPI_LADDER if d < dpi)
         png = b""
         for step in ladder:
@@ -125,29 +127,52 @@ def render_page1_png(raw: bytes, dpi: int = _DEFAULT_DPI) -> bytes:
             if len(png) <= _MAX_PNG_BYTES and max(pix.width, pix.height) <= _MAX_EDGE_PX:
                 return png
             logger.info(
-                "render_page1_png: %d dpi gave %dx%d (%d bytes) — stepping down",
-                step, pix.width, pix.height, len(png),
+                "render_page_png: page %d, %d dpi gave %dx%d (%d bytes) — stepping down",
+                page_index, step, pix.width, pix.height, len(png),
             )
         return png  # last (smallest) attempt
     finally:
         doc.close()
 
 
-def _text_layer_hint(raw: bytes) -> Optional[str]:
-    """Page 1's text layer, when the PDF has one. Scanned memos return None."""
+def render_page1_png(raw: bytes, dpi: int = _DEFAULT_DPI) -> bytes:
+    """Render page 1 to PNG bytes, stepping the DPI down if the result is too
+    large to send comfortably."""
+    return render_page_png(raw, 0, dpi)
+
+
+def pdf_page_count(raw: bytes) -> int:
+    """Number of pages in the PDF. 0 on any failure to open it."""
+    try:
+        doc = fitz.open(stream=raw, filetype="pdf")
+    except Exception:
+        return 0
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
+def _text_layer_hint_for_page(raw: bytes, page_index: int) -> Optional[str]:
+    """One page's text layer, when the PDF has one. Scanned memos return None."""
     try:
         doc = fitz.open(stream=raw, filetype="pdf")
     except Exception:
         return None
     try:
-        if doc.page_count == 0:
+        if page_index >= doc.page_count:
             return None
-        text = (doc[0].get_text() or "").strip()
+        text = (doc[page_index].get_text() or "").strip()
     finally:
         doc.close()
     if len(text) < _MIN_TEXT_HINT_CHARS:
         return None
     return text[:_MAX_TEXT_HINT_CHARS]
+
+
+def _text_layer_hint(raw: bytes) -> Optional[str]:
+    """Page 1's text layer, when the PDF has one. Scanned memos return None."""
+    return _text_layer_hint_for_page(raw, 0)
 
 
 def extract_estimate(

@@ -52,15 +52,18 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from app.auth import user_id_from_token, user_id_from_token_optional
 from app.compliance.catalog import BUILTIN_CHECKS, MANUAL_REVIEW_KEYS, CheckDef
 from app.compliance.cost import CostGapResult, evaluate_cost_gap
+from app.compliance.edq import EdqCoverageResult, evaluate_edq_coverage, match_edq_items_to_activities
 from app.compliance.eval_engine import evaluate_checks
 from app.compliance.geo import RegionResult, resolve_region
 from app.config import config
 from app.database import get_db
 from app.graph_neo4j.seed import (
+    seed_edq_items,
     seed_narrative,
     seed_schedule,
 )
 from app.ingestion.chunk_store import insert_session_chunks
+from app.ingestion.edq_extractor import extract_edq_items
 from app.ingestion.estimate_extractor import (
     EstimateExtraction,
     extract_estimate,
@@ -376,6 +379,51 @@ def _extract_and_store_estimate(
     return estimate_extraction
 
 
+def _seed_edq_items_if_needed(
+    graph: Any,
+    llm: Any,
+    embeddings: OpenAIEmbeddings,
+    estimate_bytes: Optional[bytes],
+    project_id: str,
+    user_id: Optional[str],
+) -> None:
+    """Extract -> match -> seed EDQ items into Neo4j, but only the first
+    time this project needs it.
+
+    Gated on "does EdqItem data already exist for this projectId" (a cheap
+    count() query), not on reseed/rerun -- this makes reruns of an
+    already-seeded project a no-op (evaluate_edq_coverage reads the durable
+    graph directly), and self-heals projects reviewed before this feature
+    existed, in one code path.
+    """
+    existing = graph.query(
+        "MATCH (e:EdqItem {projectId: $pid}) RETURN count(e) AS c LIMIT 1",
+        params={"pid": project_id},
+    )
+    if existing and existing[0]["c"]:
+        return
+    if not estimate_bytes:
+        return
+    extraction = extract_edq_items(estimate_bytes, llm, project_id=project_id, user_id=user_id)
+    if extraction is None or not extraction.items:
+        return
+    activities = graph.query(
+        "MATCH (a:Activity {projectId: $pid}) "
+        "RETURN a.taskId AS taskId, a.name AS name, a.wbsPath AS wbsPath",
+        params={"pid": project_id},
+    ) or []
+    if not activities:
+        return
+    items = [{
+        "id": f"edq:{i}", "jobId": it.job_id, "category": it.category,
+        "itemDescription": it.item_description, "estimatedQuantity": it.estimated_quantity,
+        "unit": it.unit, "sourcePage": it.source_page,
+    } for i, it in enumerate(extraction.items)]
+    matches = match_edq_items_to_activities(
+        items, activities, llm, embeddings, project_id=project_id, user_id=user_id)
+    seed_edq_items(graph, items, matches, project_id=project_id)
+
+
 def _build_static_doc_search_fn(collection: str, match_count: int = 5) -> Optional[Callable[[str], str]]:
     """Search-function factory for a static, pre-ingested reference
     collection (Standard Specifications or the Construction Scheduling
@@ -680,6 +728,8 @@ def _run_review_pipeline(
                 db, embeddings, llm, estimate_bytes, project_id, user_id,
             )
 
+    _seed_edq_items_if_needed(graph, llm, embeddings, estimate_bytes, project_id, user_id)
+
     # Geo and the cost gap are recomputed on every run (both are pure
     # in-process computations) so polyline/parser/threshold fixes apply to
     # re-runs of already-extracted projects.
@@ -695,6 +745,11 @@ def _run_review_pipeline(
         cost_gap = evaluate_cost_gap(graph, project_id, estimate_extraction)
         estimate_facts = render_estimate_facts(estimate_extraction, cost_gap)
 
+    # EDQ coverage is a cheap read of the already-seeded graph (seeded just
+    # above, once per project) -- recomputed every run like geo/cost_gap so
+    # it reflects the current graph state.
+    edq_coverage: Optional[EdqCoverageResult] = evaluate_edq_coverage(graph, project_id)
+
     # ── Evaluate the checklist ───────────────────────────────────────────────────
     # Static reference collections — independent of reseed/fast-path above,
     # since they're ingested once system-wide, not per review.
@@ -707,6 +762,7 @@ def _run_review_pipeline(
             sp_search_fn=sp_search_fn, spec_search_fn=spec_search_fn, csm_search_fn=csm_search_fn,
             keymap_facts=keymap_facts, keymap_geo=keymap_geo,
             estimate_facts=estimate_facts, cost_gap=cost_gap,
+            edq_coverage=edq_coverage,
             utility_plan_search_fn=utility_plan_search_fn,
             project_id=project_id, user_id=user_id,
         )
@@ -758,6 +814,7 @@ def _run_review_pipeline(
         if (estimate_bytes or estimate_extraction is not None)
         else None
     )
+    shaped["edq"] = {"coverage": edq_coverage.as_dict() if edq_coverage else None}
     return shaped
 
 

@@ -47,8 +47,10 @@ class CheckDef:
     deterministic types in that module's ``_DETERMINISTIC_EVALUATORS``
     registry, which compute their result in Python and make no LLM call —
     ``"geo"`` (north/south of I-195 from the key map's coordinates, see
-    ``app.compliance.geo``) and ``"cost_gap"`` (Substantial-to-Final day gap
-    from the Engineer's Estimate, see ``app.compliance.cost``).
+    ``app.compliance.geo``), ``"cost_gap"`` (Substantial-to-Final day gap
+    from the Engineer's Estimate, see ``app.compliance.cost``), and
+    ``"edq_coverage"`` (EDQ line item -> schedule activity graph coverage,
+    see ``app.compliance.edq``).
     """
 
     check_key: str
@@ -365,13 +367,18 @@ BUILTIN_CHECKS: List[CheckDef] = [
         source_files=["schedule", "estimate"],
     ),
 
-    # ── Manual Review: EDQ items ───────────────────────────────────────────────
+    # ── EDQ items (deterministic — graph coverage) ──────────────────────────────
     CheckDef(
         "edq_items", CAT_NONE,
         "EDQ Items Cross-Referenced for Missing Construction Activities",
-        "Cross-reference EDQ items mentioned in the Special Provision or narrative "
-        "against the schedule to detect missing construction activities.",
-        source_files=["sp"],
+        "Deterministic: EDQ (Estimated Distribution Quantity) line items are "
+        "extracted from the DBE Goal Memo's Capital Program Support Job "
+        "Estimate Report and cross-referenced against the schedule graph via "
+        "an LLM-assisted matching pass; a line item with no matching schedule "
+        "activity indicates a missing construction activity. No AI judgement "
+        "at evaluation time -- coverage is read straight from the graph.",
+        check_type="edq_coverage",
+        source_files=["schedule", "estimate"],
     ),
 
     # ── Designer's Narrative (required narrative sections per the CSM) ─────────
@@ -555,8 +562,10 @@ BUILTIN_CHECKS: List[CheckDef] = [
 # "utility_alignment" left this set when the key map upload was added — it is
 # now a real LLM-evaluated comparison (key map utilities vs. Special
 # Provisions) rather than a cross-reference the reviewer must do by hand.
+# "edq_items" left this set for the same reason: it's now a deterministic
+# graph-coverage check (check_type="edq_coverage"), not a human cross-reference.
 MANUAL_REVIEW_KEYS = frozenset({
-    "environmental_permit", "edq_items",
+    "environmental_permit",
     "traffic_control_staging", "summer_shutdown", "required_activities_present",
     "multi_year_funding", "nearby_projects",
 })

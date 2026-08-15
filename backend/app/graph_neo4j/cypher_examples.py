@@ -92,6 +92,22 @@ CYPHER_EXAMPLES = [
             "RETURN count(a) AS activityCount"
         ),
     },
+    {
+        "question": "Which EDQ items have no matching schedule activity?",
+        "query": (
+            "MATCH (e:EdqItem {{projectId: '{project_id}'}}) "
+            "WHERE NOT (e)-[:COVERED_BY]->(:Activity) "
+            "RETURN e.jobId, e.category, e.itemDescription LIMIT 25"
+        ),
+    },
+    {
+        "question": "What schedule activities cover EDQ item edq:3?",
+        "query": (
+            "MATCH (e:EdqItem {{id: 'edq:3', projectId: '{project_id}'}})-[r:COVERED_BY]->"
+            "(a:Activity {{projectId: '{project_id}'}}) "
+            "RETURN a.taskId, a.name, r.confidence, r.rationale LIMIT 25"
+        ),
+    },
 ]
 
 
