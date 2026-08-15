@@ -260,3 +260,30 @@ def evaluate_edq_coverage(graph: Any, project_id: str) -> EdqCoverageResult:
         uncovered=uncovered, uncovered_items=uncovered_items,
         low_confidence_items=low_confidence_items, status=status, detail=detail,
     )
+
+
+def get_edq_item_details(graph: Any, project_id: str, edq_item_id: str) -> Dict[str, Any]:
+    """One EDQ item's own facts plus every activity matched to it, with
+    confidence/rationale -- a raw lookup, not a Pass/Fail judgement. Unlike
+    ``evaluate_edq_coverage``, nothing here is filtered by
+    ``MIN_COVERAGE_CONFIDENCE`` -- callers see everything the matching pass
+    proposed, including weak matches."""
+    item_rows = graph.query(
+        "MATCH (e:EdqItem {id: $id, projectId: $pid}) "
+        "RETURN e.id AS id, e.jobId AS jobId, e.category AS category, "
+        "       e.itemDescription AS itemDescription, "
+        "       e.estimatedQuantity AS estimatedQuantity, e.unit AS unit",
+        params={"id": edq_item_id, "pid": project_id},
+    ) or []
+    if not item_rows:
+        return {"error": f"No EDQ item with id={edq_item_id!r} found for this project."}
+
+    match_rows = graph.query(
+        "MATCH (e:EdqItem {id: $id, projectId: $pid})-[r:COVERED_BY]->(a:Activity) "
+        "RETURN a.taskId AS taskId, a.name AS name, "
+        "       r.confidence AS confidence, r.rationale AS rationale "
+        "ORDER BY r.confidence DESC",
+        params={"id": edq_item_id, "pid": project_id},
+    ) or []
+
+    return {"item": item_rows[0], "matched_activities": match_rows}
