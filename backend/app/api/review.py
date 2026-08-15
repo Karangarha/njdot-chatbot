@@ -386,34 +386,29 @@ def _seed_edq_items_if_needed(
     estimate_bytes: Optional[bytes],
     project_id: str,
     user_id: Optional[str],
-    reseed: bool,
 ) -> None:
-    """Extract -> match -> seed EDQ items into Neo4j.
+    """Extract -> match -> seed EDQ items into Neo4j, but only the first
+    time this project needs it.
 
-    ``reseed=False``: gated on "does EdqItem data already exist for this
-    projectId" (a cheap count() query) -- this makes reruns of an
-    already-seeded project a no-op (evaluate_edq_coverage reads the durable
-    graph directly), and self-heals projects reviewed before this feature
-    existed.
+    Gated on "does EdqItem data already exist for this projectId" (a cheap
+    count() query) -- this makes reruns of an already-seeded project a
+    no-op (evaluate_edq_coverage reads the durable graph directly), and
+    self-heals projects reviewed before this feature existed.
 
-    ``reseed=True``: an explicit rerun against possibly-revised source
-    documents (e.g. a corrected XER schedule meant to close a previously
-    -flagged EDQ gap) -- existing EdqItem nodes for this project are deleted
-    first so the whole extract/match/seed pass runs fresh. No-op delete for
-    a genuinely new project.
+    No ``reseed`` parameter: every fresh upload (``POST /api/review``)
+    already mints a brand-new ``project_id`` (see ``review_endpoint``), and
+    ``POST /api/review/{project_id}/rerun`` always re-downloads the exact
+    same stored document bytes -- there is no real path where an existing
+    project_id needs to be re-matched against revised source documents, so
+    a reseed/delete branch here would be dead code with no way to exercise
+    it against real traffic.
     """
-    if reseed:
-        graph.query(
-            "MATCH (e:EdqItem {projectId: $pid}) DETACH DELETE e",
-            params={"pid": project_id},
-        )
-    else:
-        existing = graph.query(
-            "MATCH (e:EdqItem {projectId: $pid}) RETURN count(e) AS c LIMIT 1",
-            params={"pid": project_id},
-        )
-        if existing and existing[0]["c"]:
-            return
+    existing = graph.query(
+        "MATCH (e:EdqItem {projectId: $pid}) RETURN count(e) AS c LIMIT 1",
+        params={"pid": project_id},
+    )
+    if existing and existing[0]["c"]:
+        return
     if not estimate_bytes:
         return
     extraction = extract_edq_items(estimate_bytes, llm, project_id=project_id, user_id=user_id)
@@ -742,7 +737,7 @@ def _run_review_pipeline(
                 db, embeddings, llm, estimate_bytes, project_id, user_id,
             )
 
-    _seed_edq_items_if_needed(graph, llm, embeddings, estimate_bytes, project_id, user_id, reseed=reseed)
+    _seed_edq_items_if_needed(graph, llm, embeddings, estimate_bytes, project_id, user_id)
 
     # Geo and the cost gap are recomputed on every run (both are pure
     # in-process computations) so polyline/parser/threshold fixes apply to
