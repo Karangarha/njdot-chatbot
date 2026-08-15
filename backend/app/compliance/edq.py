@@ -24,12 +24,14 @@ case which is "Fail".
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.tools import Tool
 from pydantic import BaseModel, Field
 
 from app.observability import get_langfuse_handler, new_trace_id
@@ -287,3 +289,31 @@ def get_edq_item_details(graph: Any, project_id: str, edq_item_id: str) -> Dict[
     ) or []
 
     return {"item": item_rows[0], "matched_activities": match_rows}
+
+
+def build_edq_coverage_tool(graph: Any, project_id: str = "default") -> Tool:
+    """LangChain Tool wrapping EDQ coverage for a bound project. Empty input
+    -> the overall coverage summary (evaluate_edq_coverage). Non-empty input
+    -> one item's matched activities (get_edq_item_details), unfiltered by
+    confidence -- lets the agent drill into why an item is uncovered or
+    flagged low-confidence without falling back to generated Cypher."""
+
+    def _tool(edq_item_id: str = "") -> str:
+        edq_item_id = (edq_item_id or "").strip()
+        if edq_item_id:
+            return json.dumps(get_edq_item_details(graph, project_id, edq_item_id), default=str)
+        return json.dumps(evaluate_edq_coverage(graph, project_id).as_dict(), default=str)
+
+    return Tool.from_function(
+        func=_tool,
+        name="get_edq_coverage",
+        description=(
+            "EDQ (Estimated Distribution Quantity) line item to schedule "
+            "activity coverage, read from the knowledge graph -- not an LLM "
+            "judgement. Call with EMPTY input for the overall coverage "
+            "summary (item counts and the list of uncovered items). Call "
+            "with one EDQ item's id (e.g. 'edq:5', from a prior summary "
+            "result) to see exactly which activities matched it, at what "
+            "confidence, and why."
+        ),
+    )

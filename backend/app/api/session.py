@@ -66,6 +66,7 @@ from app.retrieval_langchain.estimate_retriever import build_estimate_tool
 from app.retrieval_langchain.keymap_retriever import build_keymap_tool
 from app.retrieval_langchain.sp_retriever import build_sp_tool, retrieve_sp_chunks
 from app.retrieval_langchain.utility_plan_retriever import build_utility_plan_tool, retrieve_utility_plan_chunks
+from app.compliance.edq import build_edq_coverage_tool
 from app.scheduling import (
     build_calendars,
     build_network,
@@ -532,6 +533,7 @@ _TOOL_SOURCE_LABEL: Dict[str, str] = {
     "search_estimate":           "Estimate",
     "search_utility_plans":      "Utility Agreement Plan",
     "search_narrative":          "Designer Narrative",
+    "get_edq_coverage":          "EDQ Coverage",
 }
 
 _QA_SYSTEM = """\
@@ -679,7 +681,8 @@ async def session_query(req: QueryRequest) -> dict:
         keymap_tool = build_keymap_tool(db, embeddings.embed_query, project_id=req.session_id)
         estimate_tool = build_estimate_tool(db, embeddings.embed_query, project_id=req.session_id)
         utility_plan_tool = build_utility_plan_tool(db, embeddings.embed_query, project_id=req.session_id)
-        all_tools = graph_tools + [sp_tool, keymap_tool, estimate_tool, utility_plan_tool]
+        edq_tool = build_edq_coverage_tool(graph, project_id=req.session_id)
+        all_tools = graph_tools + [sp_tool, keymap_tool, estimate_tool, utility_plan_tool, edq_tool]
 
         system_prompt = _QA_SYSTEM_GRAPH + f"\n\n[Graph] Project schedule/narrative digest:\n{digest}"
         if context_parts:

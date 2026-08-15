@@ -9,6 +9,7 @@ Runnable two ways:
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -16,7 +17,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from app.compliance.edq import get_edq_item_details   # noqa: E402
+from app.compliance.edq import build_edq_coverage_tool, get_edq_item_details   # noqa: E402
 
 
 class _FakeGraph:
@@ -87,9 +88,43 @@ def test_get_edq_item_details_scopes_query_to_project_and_item_id():
         assert params["id"] == "edq:5"
 
 
+def test_edq_coverage_tool_summary_on_empty_input():
+    graph = _FakeGraph(coverage_rows=[
+        {"id": "edq:1", "jobId": "0001", "category": "0001", "itemDescription": "MOBILIZATION", "bestConfidence": 0.9},
+        {"id": "edq:2", "jobId": "0002", "category": "0001", "itemDescription": "TRAINEES", "bestConfidence": None},
+    ])
+    tool = build_edq_coverage_tool(graph, project_id="proj-1")
+    result = json.loads(tool.func(""))
+    assert result["total_items"] == 2
+    assert result["status"] == "Fail"
+    assert result["uncovered"] == 1
+
+
+def test_edq_coverage_tool_per_item_on_nonempty_input():
+    graph = _FakeGraph(
+        item_rows=[{"id": "edq:5", "jobId": "0006", "category": "0001",
+                    "itemDescription": "MOBILIZATION", "estimatedQuantity": "1", "unit": "LS"}],
+        match_rows=[{"taskId": "A1000", "name": "Mobilize Site", "confidence": 0.9, "rationale": "exact match"}],
+    )
+    tool = build_edq_coverage_tool(graph, project_id="proj-1")
+    result = json.loads(tool.func("edq:5"))
+    assert result["item"]["itemDescription"] == "MOBILIZATION"
+    assert result["matched_activities"][0]["taskId"] == "A1000"
+
+
+def test_edq_coverage_tool_strips_whitespace_input():
+    graph = _FakeGraph(item_rows=[{"id": "edq:5"}], match_rows=[])
+    tool = build_edq_coverage_tool(graph, project_id="proj-1")
+    result = json.loads(tool.func("  edq:5  "))
+    assert "error" not in result
+
+
 if __name__ == "__main__":
     test_get_edq_item_details_found_with_matches()
     test_get_edq_item_details_not_found()
     test_get_edq_item_details_found_no_matches()
     test_get_edq_item_details_scopes_query_to_project_and_item_id()
+    test_edq_coverage_tool_summary_on_empty_input()
+    test_edq_coverage_tool_per_item_on_nonempty_input()
+    test_edq_coverage_tool_strips_whitespace_input()
     print("All tests passed!")
