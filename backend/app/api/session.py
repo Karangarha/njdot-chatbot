@@ -641,42 +641,47 @@ def _tool_message_to_sources(m: Any) -> List[Dict[str, Any]]:
 
     try:
         payload = json.loads(m.content)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError):
         return fallback
 
-    doc_type = _TOOL_DOC_TYPE.get(tool_name)
-    if doc_type and isinstance(payload, dict):
-        items = payload.get("chunks")
-        if items is None:
-            items = payload.get("sections")  # search_narrative's shape
-        page_items = [it for it in (items or []) if isinstance(it, dict) and it.get("page_pdf")]
-        if page_items:
-            entries = []
-            for it in page_items:
-                entry: Dict[str, Any] = {
-                    "label": label, "tool": tool_name, "doc_type": doc_type,
-                    "page_pdf": it["page_pdf"],
-                }
-                if it.get("similarity") is not None:
-                    entry["similarity"] = round(it["similarity"], 3)
-                if it.get("heading") is not None:
-                    entry["heading"] = it["heading"]
-                if it.get("section_id") is not None:
-                    entry["section_id"] = it["section_id"]
-                entries.append(entry)
-            return entries
+    # Wrap shape-detection logic in try/except to guarantee no exceptions propagate.
+    # Any unexpected error (malformed payload, type mismatches, etc.) falls back to label-only.
+    try:
+        doc_type = _TOOL_DOC_TYPE.get(tool_name)
+        if doc_type and isinstance(payload, dict):
+            items = payload.get("chunks")
+            if items is None:
+                items = payload.get("sections")  # search_narrative's shape
+            page_items = [it for it in (items or []) if isinstance(it, dict) and it.get("page_pdf") is not None]
+            if page_items:
+                entries = []
+                for it in page_items:
+                    entry: Dict[str, Any] = {
+                        "label": label, "tool": tool_name, "doc_type": doc_type,
+                        "page_pdf": it["page_pdf"],
+                    }
+                    if it.get("similarity") is not None:
+                        entry["similarity"] = round(it["similarity"], 3)
+                    if it.get("heading") is not None:
+                        entry["heading"] = it["heading"]
+                    if it.get("section_id") is not None:
+                        entry["section_id"] = it["section_id"]
+                    entries.append(entry)
+                return entries
+            return fallback
+
+        if tool_name == "get_critical_path" and isinstance(payload, dict) and payload.get("chains"):
+            activities = _flatten_activities(act for chain in payload["chains"] for act in chain)
+            return [{"label": label, "tool": tool_name, "activities": activities}] if activities else fallback
+
+        if tool_name == "query_schedule_graph" and isinstance(payload, list):
+            rows = [r for r in payload if isinstance(r, dict) and _looks_like_activity_row(r)]
+            activities = _flatten_activities(rows)
+            return [{"label": label, "tool": tool_name, "activities": activities}] if activities else fallback
+
         return fallback
-
-    if tool_name == "get_critical_path" and isinstance(payload, dict) and payload.get("chains"):
-        activities = _flatten_activities(act for chain in payload["chains"] for act in chain)
-        return [{"label": label, "tool": tool_name, "activities": activities}] if activities else fallback
-
-    if tool_name == "query_schedule_graph" and isinstance(payload, list):
-        rows = [r for r in payload if isinstance(r, dict) and _looks_like_activity_row(r)]
-        activities = _flatten_activities(rows)
-        return [{"label": label, "tool": tool_name, "activities": activities}] if activities else fallback
-
-    return fallback
+    except Exception:
+        return fallback
 
 
 def _normalize_key(k: str) -> str:

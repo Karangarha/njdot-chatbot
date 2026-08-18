@@ -128,6 +128,21 @@ def test_search_utility_plans_empty_chunks():
     }
 
 
+def test_special_provisions_empty_chunks_falls_back():
+    """search_special_provisions with empty chunks list (tool in _TOOL_DOC_TYPE) -> fallback, no doc_type."""
+    payload = {"chunks": []}
+    m = _FakeToolMessage("search_special_provisions", json.dumps(payload))
+    sources = _tool_message_to_sources(m)
+
+    assert len(sources) == 1
+    assert sources[0] == {
+        "label": "Special Provision",
+        "tool": "search_special_provisions",
+    }
+    # When no page_items are found, fallback is used (no doc_type)
+    assert "doc_type" not in sources[0]
+
+
 def test_get_critical_path_with_chains():
     """get_critical_path payload with chains -> flattened, deduplicated activities."""
     payload = {
@@ -464,6 +479,26 @@ def test_optional_fields_omitted_when_absent():
     assert "heading" not in source
     assert "section_id" not in source
     assert source["page_pdf"] == 7
+
+
+def test_page_pdf_zero_is_not_dropped():
+    """page_pdf: 0 is a valid page number and should not be filtered out."""
+    payload = {
+        "chunks": [
+            {
+                "page_pdf": 0,
+                "heading": "Cover Page",
+                "similarity": 0.90,
+                "content": "text on page 0",
+            }
+        ]
+    }
+    m = _FakeToolMessage("search_special_provisions", json.dumps(payload))
+    sources = _tool_message_to_sources(m)
+
+    assert len(sources) == 1
+    assert sources[0]["page_pdf"] == 0
+    assert sources[0]["heading"] == "Cover Page"
 
 
 if __name__ == "__main__":
