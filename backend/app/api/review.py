@@ -45,7 +45,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
-from fastapi import APIRouter, File, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, File, Form, Header, HTTPException, Response, UploadFile
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
@@ -1002,3 +1002,48 @@ async def review_rerun_endpoint(
     db.table("review_projects").update(update_fields).eq("id", project_id).execute()
 
     return result
+
+
+_DOC_TYPE_TO_COLUMN: Dict[str, str] = {
+    "narrative":         "narrative_pdf_path",
+    "special_provision": "special_provision_pdf_path",
+    "key_map":           "key_map_pdf_path",
+    "estimate":          "estimate_pdf_path",
+}
+# utility_plan deliberately excluded -- never uploaded to Storage.
+
+
+@router.get("/review/{project_id}/pdf/{doc_type}", summary="Serve a stored review-project PDF")
+async def review_pdf_endpoint(
+    project_id: str,
+    doc_type: str,
+    authorization: Optional[str] = Header(default=None),
+) -> Response:
+    column = _DOC_TYPE_TO_COLUMN.get(doc_type)
+    if column is None:
+        raise HTTPException(status_code=404, detail=f"Unknown document type: {doc_type!r}")
+
+    user_id = user_id_from_token(authorization)
+    db = get_db()
+    rows = db.table("review_projects").select("*").eq("id", project_id).limit(1).execute().data or []
+    if not rows:
+        raise HTTPException(status_code=404, detail="Review project not found")
+    row = rows[0]
+    if row.get("user_id") != user_id:
+        raise HTTPException(status_code=403, detail="This review does not belong to you")
+
+    path = row.get(column)
+    if not path:
+        raise HTTPException(status_code=404, detail=f"No {doc_type} PDF stored for this review")
+
+    try:
+        bucket = db.storage.from_(_STORAGE_BUCKET)
+        pdf_bytes = bucket.download(path)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch stored file: {exc}") from exc
+
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{doc_type}.pdf"'},
+    )
