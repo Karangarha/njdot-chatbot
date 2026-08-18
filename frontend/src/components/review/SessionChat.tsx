@@ -70,23 +70,31 @@ function SourcePill({ source, onOpenPdf }: { source: Source; onOpenPdf: (s: Sour
     'Construction Scheduling Manual': 'bg-green-100 text-green-700',
   }
   const color = tagColors[source.label] ?? 'bg-gray-100 text-gray-600'
-  const clickable = !!(source.page_pdf && source.doc_type)
+  const clickable = source.page_pdf != null && !!source.doc_type
   const detail = source.section_id
     ? source.section_id
     : source.heading
     ? source.heading
-    : source.page_pdf
+    : source.page_pdf != null
     ? `p.${source.page_pdf}`
     : ''
 
+  if (!clickable) {
+    return (
+      <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${color}`}>
+        {source.label}{detail ? ` · ${detail}` : ''}
+      </span>
+    )
+  }
+
   return (
-    <span
-      role={clickable ? 'button' : undefined}
-      onClick={clickable ? () => onOpenPdf(source) : undefined}
-      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${color} ${clickable ? 'cursor-pointer hover:opacity-80' : ''}`}
+    <button
+      type="button"
+      onClick={() => onOpenPdf(source)}
+      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${color} cursor-pointer hover:opacity-80`}
     >
       {source.label}{detail ? ` · ${detail}` : ''}
-    </span>
+    </button>
   )
 }
 
@@ -391,7 +399,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
       </div>
 
       {/* PDF Viewer Modal */}
-      {pdfSource && pdfSource.page_pdf && pdfSource.doc_type && (
+      {pdfSource && pdfSource.page_pdf != null && pdfSource.doc_type && (
         <PDFViewerModal
           url={`${apiBase}/api/review/${sessionId}/pdf/${pdfSource.doc_type}`}
           page={pdfSource.page_pdf}

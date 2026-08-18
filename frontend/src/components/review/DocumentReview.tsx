@@ -329,6 +329,19 @@ export default function DocumentReview({
       })
   }, [selectedProjectId])
 
+  // ── Keep authToken fresh for SessionChat/PDFViewerModal's Bearer auth ──────
+  // Reads the session live (rather than relying on runReview()'s one-time
+  // snapshot) whenever sessionId changes. This covers the load-existing-
+  // project path above, which produces a sessionId but never otherwise sets
+  // a token, and getSession() also transparently refreshes an expired
+  // access token (Supabase tokens last ~1hr), fixing staleness too.
+  useEffect(() => {
+    if (!sessionId) return
+    createClient().auth.getSession().then(({ data: { session } }) => {
+      setAuthToken(session?.access_token)
+    })
+  }, [sessionId])
+
   const canSubmit = scheduleFile !== null && narrativeFile !== null && !isLoading
 
   const toggleSection = (name: string) => setExpanded(prev => ({ ...prev, [name]: !prev[name] }))

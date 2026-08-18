@@ -30,6 +30,8 @@ interface ChatInterfaceProps {
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+
 const SUGGESTED_QUESTIONS = [
   {
     title: 'Working Day Definition',
@@ -593,19 +595,16 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
       </div>
 
       {/* ── PDF Modal ─────────────────────────────────────────────────────────── */}
-      {pdfModal && (() => {
-        const apiBase = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
-        return (
-          <PDFViewerModal
-            url={`${apiBase}/api/pdf/${pdfModal.document}`}
-            page={pdfModal.page_pdf}
-            headerLabel={pdfModal.document || 'NJDOT Document'}
-            headerDetail={pdfModal.section ? `§ ${pdfModal.section}` : undefined}
-            headerPage={pdfModal.page_printed}
-            onClose={() => setPdfModal(null)}
-          />
-        )
-      })()}
+      {pdfModal && (
+        <PDFViewerModal
+          url={`${API_BASE}/api/pdf/${pdfModal.document}`}
+          page={pdfModal.page_pdf}
+          headerLabel={pdfModal.document || 'NJDOT Document'}
+          headerDetail={pdfModal.section ? `§ ${pdfModal.section}` : undefined}
+          headerPage={pdfModal.page_printed}
+          onClose={() => setPdfModal(null)}
+        />
+      )}
     </div>
   )
 }

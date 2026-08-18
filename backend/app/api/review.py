@@ -1040,7 +1040,8 @@ async def review_pdf_endpoint(
         bucket = db.storage.from_(_STORAGE_BUCKET)
         pdf_bytes = bucket.download(path)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to fetch stored file: {exc}") from exc
+        logger.exception("Failed to fetch stored file path=%s for project_id=%s", path, project_id)
+        raise HTTPException(status_code=502, detail="Failed to fetch stored file") from exc
 
     return Response(
         content=pdf_bytes,

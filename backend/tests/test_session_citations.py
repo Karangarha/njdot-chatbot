@@ -501,6 +501,40 @@ def test_page_pdf_zero_is_not_dropped():
     assert sources[0]["heading"] == "Cover Page"
 
 
+def test_duplicate_pages_deduped_and_capped():
+    """Multiple chunks sharing the same page_pdf collapse to one entry (the
+    highest-similarity one for that page), and the result is capped to 3
+    entries even when more than 3 distinct pages are present."""
+    payload = {
+        "chunks": [
+            {"page_pdf": 12, "heading": "Special Provision p.12 (weak match)", "similarity": 0.70, "content": "a"},
+            {"page_pdf": 12, "heading": "Special Provision p.12 (strong match)", "similarity": 0.92, "content": "b"},
+            {"page_pdf": 5,  "heading": "Section A", "similarity": 0.85, "content": "c"},
+            {"page_pdf": 18, "heading": "Section B", "similarity": 0.80, "content": "d"},
+            {"page_pdf": 27, "heading": "Section C", "similarity": 0.60, "content": "e"},
+        ]
+    }
+    m = _FakeToolMessage("search_special_provisions", json.dumps(payload))
+    sources = _tool_message_to_sources(m)
+
+    # Capped to 3, one entry per page.
+    assert len(sources) == 3
+    page_nums = [s["page_pdf"] for s in sources]
+    assert len(page_nums) == len(set(page_nums))  # no duplicate pages
+
+    # Page 12's surviving entry is the higher-similarity one.
+    p12 = next(s for s in sources if s["page_pdf"] == 12)
+    assert p12["similarity"] == 0.92
+    assert p12["heading"] == "Special Provision p.12 (strong match)"
+
+    # The lowest-similarity page (27) was dropped by the cap.
+    assert 27 not in page_nums
+
+    # Sorted by similarity, descending.
+    similarities = [s["similarity"] for s in sources]
+    assert similarities == sorted(similarities, reverse=True)
+
+
 if __name__ == "__main__":
     # Allow running as a script
     import pytest

@@ -640,7 +640,7 @@ def _tool_message_to_sources(m: Any) -> List[Dict[str, Any]]:
     fallback = [{"label": label, "tool": tool_name}]
 
     try:
-        payload = json.loads(m.content)
+        payload = json.loads(getattr(m, "content", None))
     except (TypeError, ValueError):
         return fallback
 
@@ -653,6 +653,16 @@ def _tool_message_to_sources(m: Any) -> List[Dict[str, Any]]:
             if items is None:
                 items = payload.get("sections")  # search_narrative's shape
             page_items = [it for it in (items or []) if isinstance(it, dict) and it.get("page_pdf") is not None]
+            # Dedupe by page (adjacent chunks from the same page produce
+            # near-identical pills), keeping the highest-similarity entry
+            # per page, and cap to a few so one answer can't flood the UI
+            # with up to match_count pills.
+            by_page: Dict[Any, Dict[str, Any]] = {}
+            for it in page_items:
+                pg = it["page_pdf"]
+                if pg not in by_page or (it.get("similarity") or 0) > (by_page[pg].get("similarity") or 0):
+                    by_page[pg] = it
+            page_items = sorted(by_page.values(), key=lambda it: -(it.get("similarity") or 0))[:3]
             if page_items:
                 entries = []
                 for it in page_items:
