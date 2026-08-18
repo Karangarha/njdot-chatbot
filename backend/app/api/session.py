@@ -38,7 +38,7 @@ import logging
 import os
 import tempfile
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
@@ -536,6 +536,24 @@ _TOOL_SOURCE_LABEL: Dict[str, str] = {
     "get_edq_coverage":          "EDQ Coverage",
 }
 
+# ToolMessage name -> doc_type for page-linked citations (matches review.py's
+# _DOC_TYPE_TO_COLUMN keys). search_utility_plans excluded: no page_pdf ever.
+_TOOL_DOC_TYPE: Dict[str, str] = {
+    "search_special_provisions": "special_provision",
+    "search_key_map":            "key_map",
+    "search_estimate":           "estimate",
+    "search_narrative":          "narrative",
+}
+
+# Cypher RETURN aliases are unreliable (few-shot examples in cypher_examples.py
+# use unaliased "a.taskId" style dotted keys); normalize by stripping any
+# "x." prefix and lowercasing before matching.
+_ACTIVITY_FIELD_ALIASES: Dict[str, str] = {
+    "taskid": "taskId", "name": "name",
+    "es": "start", "startdate": "start", "computedearlystart": "start", "start": "start",
+    "ef": "finish", "finishdate": "finish", "computedearlyfinish": "finish", "finish": "finish",
+}
+
 _QA_SYSTEM = """\
 You are an assistant helping an NJDOT engineer review a construction project.
 Answer the question using ONLY the context provided below.
@@ -597,6 +615,96 @@ Rules:
   the context nor the tools answer the question, say:
   "Not found in the provided documents."
 """
+
+
+def _build_tool_sources(messages: List[Any]) -> List[Dict[str, Any]]:
+    """Turn each ToolMessage in an agent.invoke() result into 0+ source dicts.
+
+    Detection order: (a) chunk/section payloads with page_pdf -> page-linked
+    citations; (b) get_critical_path's chains -> flattened activity list;
+    (c) query_schedule_graph records that look like activity rows -> same
+    activity-list shape; (d) everything else, or any parse/shape mismatch
+    -> today's plain label-only entry. Never raises.
+    """
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        if type(m).__name__ != "ToolMessage":
+            continue
+        out.extend(_tool_message_to_sources(m))
+    return out
+
+
+def _tool_message_to_sources(m: Any) -> List[Dict[str, Any]]:
+    tool_name = getattr(m, "name", "tool")
+    label = _TOOL_SOURCE_LABEL.get(tool_name, "Schedule Graph")
+    fallback = [{"label": label, "tool": tool_name}]
+
+    try:
+        payload = json.loads(m.content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return fallback
+
+    doc_type = _TOOL_DOC_TYPE.get(tool_name)
+    if doc_type and isinstance(payload, dict):
+        items = payload.get("chunks")
+        if items is None:
+            items = payload.get("sections")  # search_narrative's shape
+        page_items = [it for it in (items or []) if isinstance(it, dict) and it.get("page_pdf")]
+        if page_items:
+            entries = []
+            for it in page_items:
+                entry: Dict[str, Any] = {
+                    "label": label, "tool": tool_name, "doc_type": doc_type,
+                    "page_pdf": it["page_pdf"],
+                }
+                if it.get("similarity") is not None:
+                    entry["similarity"] = round(it["similarity"], 3)
+                if it.get("heading") is not None:
+                    entry["heading"] = it["heading"]
+                if it.get("section_id") is not None:
+                    entry["section_id"] = it["section_id"]
+                entries.append(entry)
+            return entries
+        return fallback
+
+    if tool_name == "get_critical_path" and isinstance(payload, dict) and payload.get("chains"):
+        activities = _flatten_activities(act for chain in payload["chains"] for act in chain)
+        return [{"label": label, "tool": tool_name, "activities": activities}] if activities else fallback
+
+    if tool_name == "query_schedule_graph" and isinstance(payload, list):
+        rows = [r for r in payload if isinstance(r, dict) and _looks_like_activity_row(r)]
+        activities = _flatten_activities(rows)
+        return [{"label": label, "tool": tool_name, "activities": activities}] if activities else fallback
+
+    return fallback
+
+
+def _normalize_key(k: str) -> str:
+    return k.rsplit(".", 1)[-1].lower()
+
+
+def _looks_like_activity_row(record: Dict[str, Any]) -> bool:
+    norm = {_normalize_key(k) for k in record.keys()}
+    return "taskid" in norm and "name" in norm
+
+
+def _flatten_activities(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen: set = set()
+    out: List[Dict[str, Any]] = []
+    for r in records:
+        if not isinstance(r, dict):
+            continue
+        entry = {"taskId": None, "name": None, "start": None, "finish": None}
+        for k, v in r.items():
+            canon = _ACTIVITY_FIELD_ALIASES.get(_normalize_key(k))
+            if canon and entry.get(canon) is None:
+                entry[canon] = v
+        tid = entry["taskId"]
+        if tid is None or tid in seen:
+            continue
+        seen.add(tid)
+        out.append(entry)
+    return out
 
 
 class QueryRequest(BaseModel):
@@ -695,13 +803,7 @@ async def session_query(req: QueryRequest) -> dict:
         answer = messages[-1].content if messages else "Not found in the provided documents."
 
         sources.insert(0, {"label": "Schedule Graph", "heading": "digest"})
-        for m in messages:
-            if type(m).__name__ == "ToolMessage":
-                tool_name = getattr(m, "name", "tool")
-                sources.append({
-                    "label": _TOOL_SOURCE_LABEL.get(tool_name, "Schedule Graph"),
-                    "tool": tool_name,
-                })
+        sources.extend(_build_tool_sources(messages))
     else:
         # ── SP-only path: no graph for this session ─────────────────────────────
         sp_rows = retrieve_sp_chunks(db, embeddings.embed_query, req.session_id, req.question,
@@ -713,6 +815,7 @@ async def session_query(req: QueryRequest) -> dict:
             sources.append({
                 "label":      _DOC_LABEL.get("special_provision", "Special Provision"),
                 "page_pdf":   meta.get("page_pdf"),
+                "doc_type":   "special_provision",
                 "similarity": round(row.get("similarity", 0.0), 3),
             })
 
