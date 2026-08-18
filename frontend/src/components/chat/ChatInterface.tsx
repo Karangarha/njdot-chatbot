@@ -8,6 +8,7 @@ import { createClient } from '@/lib/supabase/client'
 import type { BDCAlertItem, CitationItem, Conversation, ReviewProject } from '@/lib/types'
 import DocumentReview from '@/components/review/DocumentReview'
 import MarkdownAnswer from '@/components/MarkdownAnswer'
+import PDFViewerModal from '@/components/PDFViewerModal'
 
 // ── Local types ────────────────────────────────────────────────────────────────
 
@@ -592,9 +593,19 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
       </div>
 
       {/* ── PDF Modal ─────────────────────────────────────────────────────────── */}
-      {pdfModal && (
-        <PDFViewerModal citation={pdfModal} onClose={() => setPdfModal(null)} />
-      )}
+      {pdfModal && (() => {
+        const apiBase = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+        return (
+          <PDFViewerModal
+            url={`${apiBase}/api/pdf/${pdfModal.document}`}
+            page={pdfModal.page_pdf}
+            headerLabel={pdfModal.document || 'NJDOT Document'}
+            headerDetail={pdfModal.section ? `§ ${pdfModal.section}` : undefined}
+            headerPage={pdfModal.page_printed}
+            onClose={() => setPdfModal(null)}
+          />
+        )
+      })()}
     </div>
   )
 }
@@ -945,54 +956,6 @@ function CitationCard({
         >
           View PDF →
         </button>
-      </div>
-    </div>
-  )
-}
-
-// ── PDF VIEWER MODAL ───────────────────────────────────────────────────────────
-
-function PDFViewerModal({ citation, onClose }: { citation: CitationItem; onClose: () => void }) {
-  const apiBase = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
-  const src = `${apiBase}/api/pdf/${citation.document}#page=${citation.page_pdf}`
-
-  useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
-    >
-      <div className="flex flex-col bg-white rounded-2xl shadow-2xl w-[96vw] h-[92vh] max-w-5xl sm:w-[92vw] sm:h-[90vh]">
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#E8E8E8] shrink-0">
-          <div className="flex items-center gap-3 min-w-0">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-[#1B3A6B] truncate">
-              {citation.document || 'NJDOT Document'}
-            </span>
-            {citation.section && (
-              <span className="text-sm text-gray-500 truncate">§ {citation.section}</span>
-            )}
-            {citation.page_printed && (
-              <span className="text-sm text-gray-400 shrink-0">p. {citation.page_printed}</span>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="ml-4 shrink-0 rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
-            aria-label="Close"
-          >
-            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-        <iframe src={src} className="flex-1 w-full rounded-b-2xl" title={`PDF: ${citation.document}`} />
       </div>
     </div>
   )
