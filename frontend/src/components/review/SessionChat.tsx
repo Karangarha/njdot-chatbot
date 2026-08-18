@@ -2,15 +2,25 @@
 
 import { useEffect, useRef, useState } from 'react'
 import MarkdownAnswer from '@/components/MarkdownAnswer'
+import PDFViewerModal from '@/components/PDFViewerModal'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
+interface Activity {
+  taskId:  string | null
+  name:    string | null
+  start:   string | null
+  finish:  string | null
+}
+
 interface Source {
-  label:      string
-  heading?:   string
-  page_pdf?:  number
+  label:       string
+  heading?:    string
+  page_pdf?:   number
   section_id?: string
-  similarity: number
+  similarity?: number
+  doc_type?:   string
+  activities?: Activity[]
 }
 
 interface Message {
@@ -50,7 +60,7 @@ function ProgressBar({ step, total }: { step?: number; total?: number }) {
 
 // ── Source pill ────────────────────────────────────────────────────────────────
 
-function SourcePill({ source }: { source: Source }) {
+function SourcePill({ source, onOpenPdf }: { source: Source; onOpenPdf: (s: Source) => void }) {
   const tagColors: Record<string, string> = {
     'Designer Narrative':             'bg-blue-100 text-blue-700',
     'Special Provision':              'bg-purple-100 text-purple-700',
@@ -60,6 +70,7 @@ function SourcePill({ source }: { source: Source }) {
     'Construction Scheduling Manual': 'bg-green-100 text-green-700',
   }
   const color = tagColors[source.label] ?? 'bg-gray-100 text-gray-600'
+  const clickable = !!(source.page_pdf && source.doc_type)
   const detail = source.section_id
     ? source.section_id
     : source.heading
@@ -69,15 +80,38 @@ function SourcePill({ source }: { source: Source }) {
     : ''
 
   return (
-    <span className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${color}`}>
+    <span
+      role={clickable ? 'button' : undefined}
+      onClick={clickable ? () => onOpenPdf(source) : undefined}
+      className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-semibold ${color} ${clickable ? 'cursor-pointer hover:opacity-80' : ''}`}
+    >
       {source.label}{detail ? ` · ${detail}` : ''}
     </span>
   )
 }
 
+// ── Activity list ──────────────────────────────────────────────────────────────
+
+function ActivityList({ source }: { source: Source }) {
+  if (!source.activities?.length) return null
+  return (
+    <div className="rounded-lg px-2 py-1.5 text-[10px] bg-amber-50 text-amber-800">
+      <div className="font-semibold uppercase tracking-wide mb-0.5">{source.label}</div>
+      <ul className="space-y-0.5">
+        {source.activities.map((a, i) => (
+          <li key={a.taskId ?? i}>
+            {a.taskId ?? '—'} · {a.name ?? '—'}
+            {(a.start || a.finish) && ` · ${a.start ?? '?'} → ${a.finish ?? '?'}`}
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 // ── Message bubble ─────────────────────────────────────────────────────────────
 
-function MessageBubble({ msg }: { msg: Message }) {
+function MessageBubble({ msg, onOpenPdf }: { msg: Message; onOpenPdf: (s: Source) => void }) {
   const isUser = msg.role === 'user'
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'}`}>
@@ -94,7 +128,11 @@ function MessageBubble({ msg }: { msg: Message }) {
         {msg.sources && msg.sources.length > 0 && (
           <div className="flex flex-wrap gap-1 px-1">
             {msg.sources.map((s, i) => (
-              <SourcePill key={i} source={s} />
+              s.activities?.length ? (
+                <ActivityList key={i} source={s} />
+              ) : (
+                <SourcePill key={i} source={s} onOpenPdf={onOpenPdf} />
+              )
             ))}
           </div>
         )}
@@ -112,6 +150,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
   const [input,            setInput]            = useState('')
   const [isLoading,        setIsLoading]        = useState(false)
   const [error,            setError]            = useState<string | null>(null)
+  const [pdfSource,        setPdfSource]        = useState<Source | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef  = useRef<HTMLTextAreaElement>(null)
 
@@ -298,7 +337,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
           </div>
         )}
         {messages.map((msg, i) => (
-          <MessageBubble key={i} msg={msg} />
+          <MessageBubble key={i} msg={msg} onOpenPdf={setPdfSource} />
         ))}
         {isLoading && (
           <div className="flex justify-start">
@@ -350,6 +389,18 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
         </div>
         <p className="mt-1.5 text-[10px] text-gray-400">Enter to send · Shift+Enter for new line</p>
       </div>
+
+      {/* PDF Viewer Modal */}
+      {pdfSource && pdfSource.page_pdf && pdfSource.doc_type && (
+        <PDFViewerModal
+          url={`${apiBase}/api/review/${sessionId}/pdf/${pdfSource.doc_type}`}
+          page={pdfSource.page_pdf}
+          authToken={authToken}
+          headerLabel={pdfSource.label}
+          headerDetail={pdfSource.section_id ?? pdfSource.heading}
+          onClose={() => setPdfSource(null)}
+        />
+      )}
     </div>
   )
 }
