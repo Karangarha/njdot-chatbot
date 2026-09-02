@@ -20,7 +20,7 @@ export async function middleware(request: NextRequest) {
 
   const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY!,
     {
       cookies: {
         getAll() {
@@ -46,7 +46,7 @@ export async function middleware(request: NextRequest) {
 
   const { pathname } = request.nextUrl
 
-  // ── Always-public paths (e.g. /reset-password needs the token in the URL) ──
+  // ── Always-public paths (e.g. /update-password needs the token in the URL) ──
   if (ALWAYS_PUBLIC.some((p) => pathname.startsWith(p))) {
     return supabaseResponse
   }

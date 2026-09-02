@@ -11,46 +11,13 @@ from __future__ import annotations
 
 from typing import List
 
-import jwt
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, Header
 from pydantic import BaseModel
 
-from app.config import config
+from app.auth import user_id_from_token as _user_id_from_token
 from app.database import get_db
 
 router = APIRouter(tags=["conversations"])
-
-
-# ── Auth helper ───────────────────────────────────────────────────────────────
-
-def _user_id_from_token(authorization: str | None) -> str:
-    """Decode the Supabase JWT and return the user's UUID (``sub`` claim)."""
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
-
-    token = authorization[7:]
-
-    if not config.SUPABASE_JWT_SECRET:
-        # If the JWT secret isn't configured, extract sub without verification.
-        # Suitable for local dev only — never do this in production.
-        try:
-            payload = jwt.decode(token, options={"verify_signature": False})
-            return payload["sub"]
-        except Exception as exc:
-            raise HTTPException(status_code=401, detail=f"Cannot decode token: {exc}") from exc
-
-    try:
-        payload = jwt.decode(
-            token,
-            config.SUPABASE_JWT_SECRET,
-            algorithms=["HS256"],
-            audience="authenticated",
-        )
-        return payload["sub"]
-    except jwt.ExpiredSignatureError as exc:
-        raise HTTPException(status_code=401, detail="Token expired") from exc
-    except jwt.InvalidTokenError as exc:
-        raise HTTPException(status_code=401, detail=f"Invalid token: {exc}") from exc
 
 
 # ── Response models ───────────────────────────────────────────────────────────

@@ -35,8 +35,9 @@ from __future__ import annotations
 
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 # ── Package-root import shim (supports both -m and direct script execution) ───
 try:
@@ -106,8 +107,12 @@ class Embedder:
         Parameters
         ----------
         chunks : list[dict]
-            Output of ``Chunker.chunk()``.  Each dict must contain a
-            ``"content"`` key.
+            Output of ``Chunker.chunk()`` (optionally post-processed by
+            ``Contextualizer``).  Each dict must contain ``"content"``.
+            If ``"embed_text"`` is present (set by ``Contextualizer``),
+            it is used as the embedding input instead of ``"content"``
+            so the vector carries contextual signal without altering the
+            stored content.
 
         Returns
         -------
@@ -131,7 +136,8 @@ class Embedder:
                 flush=True,
             )
 
-            texts      = [c["content"] for c in batch]
+            # Use embed_text (context + content) when present; else raw content.
+            texts      = [c.get("embed_text") or c["content"] for c in batch]
             embeddings = self._embed_batch_with_retry(texts)
 
             for chunk, embedding in zip(batch, embeddings):
@@ -177,6 +183,59 @@ class Embedder:
                 raise
 
         raise last_exc  # type: ignore[misc]
+
+    def embed_parallel(
+        self,
+        chunks:      List[Dict[str, Any]],
+        max_workers: int = 3,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Embed chunks using concurrent batch API calls.
+
+        Faster than ``embed()`` for session ingestion because multiple
+        batches are in-flight simultaneously.  Uses the same per-batch
+        retry logic as ``embed()``.
+
+        Parameters
+        ----------
+        chunks : list[dict]
+            Chunks to embed (must have ``"content"`` key).
+        max_workers : int
+            Number of concurrent OpenAI API calls (default 3).
+        on_progress : callable or None
+            Called after each batch completes as ``on_progress(done, total)``.
+
+        Returns
+        -------
+        list[dict]
+            Same list with ``"embedding": list[float]`` added in-place.
+        """
+        if not chunks:
+            return chunks
+
+        batches   = [chunks[i : i + self.batch_size] for i in range(0, len(chunks), self.batch_size)]
+        total     = len(batches)
+        completed = 0
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_batch = {
+                executor.submit(
+                    self._embed_batch_with_retry,
+                    [c["content"] for c in batch],
+                ): batch
+                for batch in batches
+            }
+            for future in as_completed(future_to_batch):
+                batch      = future_to_batch[future]
+                embeddings = future.result()
+                for chunk, emb in zip(batch, embeddings):
+                    chunk["embedding"] = emb
+                completed += 1
+                if on_progress:
+                    on_progress(completed, total)
+
+        return chunks
 
 
 # ── Convenience wrapper ───────────────────────────────────────────────────────

@@ -157,12 +157,12 @@ def change_password(
     Requires a valid Supabase JWT in ``Authorization: Bearer <token>``.
     The service role key is never sent to the client.
     """
-    from app.api.conversations import _user_id_from_token
+    from app.auth import user_id_from_token
 
     if len(body.new_password) < _MIN_PW_LEN:
         raise HTTPException(400, f"Password must be at least {_MIN_PW_LEN} characters.")
 
-    user_id = _user_id_from_token(authorization)
+    user_id = user_id_from_token(authorization)
 
     if not _update_user_password(user_id, body.new_password):
         raise HTTPException(400, "Password update failed. Please try again.")

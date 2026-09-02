@@ -30,12 +30,56 @@ export interface Conversation {
   updated_at: string
 }
 
-export interface ConversationMessage {
+export interface ReviewProject {
   id: string
-  conversation_id: string
-  role: 'user' | 'assistant'
-  content: string
-  citations: CitationItem[]
-  bdc_alerts: BDCAlertItem[]
+  session_id: string | null
+  project_name: string
+  review_result: any
+  schedule_file_path?: string | null
+  narrative_pdf_path?: string | null
+  special_provision_pdf_path?: string | null
+  key_map_pdf_path?: string | null
+  estimate_pdf_path?: string | null
+  // Structured extraction JSON for the key map / estimate documents --
+  // Supabase-only now; Neo4j no longer persists these (see backend
+  // review.py's shaped["key_map"]/shaped["estimate"], the source of this
+  // data on every /api/review response).
+  key_map_extraction?: Record<string, unknown> | null
+  estimate_extraction?: Record<string, unknown> | null
   created_at: string
+  updated_at: string
+}
+
+// Which document(s) a check draws evidence from — any combination.
+// "spec"/"csm" are static, pre-ingested reference collections (Standard
+// Specifications / Construction Scheduling Manual) rather than per-review
+// uploads — see backend/scripts/ingest_specs.py.
+export type SourceFile = 'schedule' | 'narrative' | 'sp' | 'keymap' | 'estimate' | 'spec' | 'csm'
+
+export interface ComplianceCheck {
+  id: string
+  user_id: string | null
+  check_key: string
+  category: string
+  name: string
+  instruction: string
+  check_type: string
+  source_files: SourceFile[]
+  is_builtin: boolean
+  enabled: boolean
+  sort_order: number
+  created_at: string
+  updated_at: string
+}
+
+// Enabled-only payload sent as the `checks` form field on POST /api/review.
+// check_type must round-trip ("llm" | "geo") — the backend branches on it
+// for deterministic checks (project_region_i195).
+export interface CheckSpec {
+  check_key: string
+  category: string
+  name: string
+  instruction: string
+  check_type: string
+  source_files: SourceFile[]
 }

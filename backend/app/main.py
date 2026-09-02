@@ -21,6 +21,16 @@ POST /api/query   → QueryResponse  (see app.api.query)
 from __future__ import annotations
 
 import logging
+import sys
+
+# Windows' console defaults to the legacy cp1252 codepage, which can't encode
+# the emoji some ingestion modules (e.g. pdf_parser.py) print for progress
+# logging — crashes with UnicodeEncodeError the first time such a print runs
+# under uvicorn (previously only ever hit via debug scripts that reconfigured
+# this locally). Fix it once, globally, at the real server entrypoint.
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8")
+    sys.stderr.reconfigure(encoding="utf-8")
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,6 +40,7 @@ from app.api.conversations import router as conversations_router
 from app.api.pdf import router as pdf_router
 from app.api.query import router as query_router
 from app.api.review import router as review_router
+from app.api.session import router as session_router
 from app.config import config
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -75,6 +86,7 @@ app.include_router(query_router)
 app.include_router(pdf_router)
 app.include_router(conversations_router)
 app.include_router(review_router)
+app.include_router(session_router)
 
 
 # ── Health check ──────────────────────────────────────────────────────────────

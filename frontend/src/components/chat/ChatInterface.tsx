@@ -5,8 +5,10 @@ import Image from 'next/image'
 import { useRouter } from 'next/navigation'
 import { askQuestion } from '@/lib/api'
 import { createClient } from '@/lib/supabase/client'
-import type { BDCAlertItem, CitationItem, Conversation } from '@/lib/types'
+import type { BDCAlertItem, CitationItem, Conversation, ReviewProject } from '@/lib/types'
 import DocumentReview from '@/components/review/DocumentReview'
+import MarkdownAnswer from '@/components/MarkdownAnswer'
+import PDFViewerModal from '@/components/PDFViewerModal'
 
 // ── Local types ────────────────────────────────────────────────────────────────
 
@@ -27,6 +29,8 @@ interface ChatInterfaceProps {
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────────
+
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
 const SUGGESTED_QUESTIONS = [
   {
@@ -86,6 +90,9 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
   const [userInitials, setUserInitials]       = useState(() => getInitials(userEmail))
   const [conversations, setConversations]     = useState<Conversation[]>([])
   const [currentConvId, setCurrentConvId]     = useState<string | null>(null)
+  const [reviewProjects,    setReviewProjects]    = useState<ReviewProject[]>([])
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null)
+  const [confirmDeleteProjectId, setConfirmDeleteProjectId] = useState<string | null>(null)
   const [messages, setMessages]               = useState<Message[]>([])
   const [input, setInput]                     = useState('')
   const [collection, setCollection]           = useState('')
@@ -113,6 +120,27 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
     } catch { /* table may not exist yet */ }
   }
 
+  const loadReviewProjects = async () => {
+    if (!userId) return
+    try {
+      const sb = createClient()
+      const { data } = await sb
+        .from('review_projects')
+        .select('id, project_name, review_result, session_id, created_at, updated_at')
+        .order('created_at', { ascending: false })
+        .limit(20)
+      if (data) setReviewProjects(data as ReviewProject[])
+    } catch { /* table may not exist yet */ }
+  }
+
+  const handleDeleteProject = async (projectId: string) => {
+    const sb = createClient()
+    await sb.from('review_projects').delete().eq('id', projectId)
+    setReviewProjects(prev => prev.filter(p => p.id !== projectId))
+    if (selectedProjectId === projectId) setSelectedProjectId(null)
+    setConfirmDeleteProjectId(null)
+  }
+
   const loadConversationHistory = async (convId: string) => {
     try {
       const sb = createClient()
@@ -138,6 +166,7 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
 
   useEffect(() => {
     loadConversations()
+    loadReviewProjects()
     // Also get user metadata for better initials
     const sb = createClient()
     sb.auth.getUser().then(({ data }) => {
@@ -352,124 +381,187 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
       {/* ══ BODY ═════════════════════════════════════════════════════════════════ */}
       <div className="flex min-h-0 flex-1 overflow-hidden relative">
 
-        {/* ── Chat-only sidebar UI (hidden entirely in Document Review mode) ───── */}
-        {activeTab === 'spec' && (
-          <>
-            {/* Left-edge tab (visible only when sidebar is closed) */}
-            {!sidebarOpen && (
-              <button
-                onClick={() => setSidebarOpen(true)}
-                aria-label="Open sidebar"
-                className="fixed left-0 z-40 flex items-center justify-center rounded-r-lg border border-l-0 border-[#E8E8E8] bg-white shadow-sm transition-colors hover:bg-gray-50"
-                style={{ top: '50%', transform: 'translateY(-50%)', width: '22px', height: '48px' }}
-              >
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1B3A6B"
-                     strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                  <rect width="18" height="18" x="3" y="3" rx="2" />
-                  <path d="M9 3v18" />
-                </svg>
-              </button>
-            )}
+        {/* ── Sidebar (spec: conversations · review: projects) ─────────────────── */}
+        <>
+          {/* Left-edge tab */}
+          {!sidebarOpen && (
+            <button
+              onClick={() => setSidebarOpen(true)}
+              aria-label="Open sidebar"
+              className="fixed left-0 z-40 flex items-center justify-center rounded-r-lg border border-l-0 border-[#E8E8E8] bg-white shadow-sm transition-colors hover:bg-gray-50"
+              style={{ top: '50%', transform: 'translateY(-50%)', width: '22px', height: '48px' }}
+            >
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#1B3A6B"
+                   strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                <rect width="18" height="18" x="3" y="3" rx="2" />
+                <path d="M9 3v18" />
+              </svg>
+            </button>
+          )}
 
-            {/* Backdrop */}
-            {sidebarOpen && (
-              <div
-                className="fixed inset-0 z-20 bg-black/30"
-                onClick={() => setSidebarOpen(false)}
-              />
-            )}
+          {/* Backdrop */}
+          {sidebarOpen && (
+            <div className="fixed inset-0 z-20 bg-black/30" onClick={() => setSidebarOpen(false)} />
+          )}
 
-            {/* Sidebar */}
-            <aside
-          className={`
+          {/* Sidebar panel */}
+          <aside className={`
             flex w-[85vw] max-w-[280px] flex-col border-r border-[#E8E8E8] bg-white
             fixed top-14 bottom-0 left-0 z-30 shadow-xl transition-transform duration-200 ease-out
             ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
-          `}
-        >
-          {/* New Chat — minimal, text + icon, full width */}
-          <div className="p-3">
-            <button
-              onClick={handleNewChat}
-              className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors"
-            >
-              <svg className="h-4 w-4 shrink-0 text-gray-500" fill="none" viewBox="0 0 24 24"
-                   stroke="currentColor" strokeWidth={2}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-              </svg>
-              New Chat
-            </button>
-          </div>
+          `}>
 
-          {/* Recents — only when conversations exist */}
-          {conversations.length > 0 && (
-            <>
-              <div className="border-t border-[#E8E8E8]" />
-              <div className="px-4 pt-3 pb-1">
-                <span className="text-[10px] font-semibold uppercase tracking-widest text-gray-400">
-                  Recents
-                </span>
-              </div>
-              <nav className="flex-1 overflow-y-auto px-2 pb-3">
-                {conversations.map(conv => (
-                  <div key={conv.id} className="group relative rounded-lg">
-                    {confirmDeleteId === conv.id ? (
-                      /* Inline delete confirmation */
-                      <div className="flex items-center justify-between rounded-lg bg-gray-50 px-3 py-2.5">
-                        <span className="text-xs text-gray-600">Delete?</span>
-                        <div className="flex items-center gap-3">
-                          <button
-                            onClick={() => handleDeleteConversation(conv.id)}
-                            className="text-xs font-semibold text-[#CC2529] hover:underline"
-                          >
-                            Yes
-                          </button>
-                          <button
-                            onClick={() => setConfirmDeleteId(null)}
-                            className="text-xs font-medium text-gray-400 hover:text-gray-600"
-                          >
-                            No
-                          </button>
+            {activeTab === 'spec' ? (
+              /* ── Spec assistant: conversations ── */
+              <>
+                <div className="p-3">
+                  <button
+                    onClick={handleNewChat}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors"
+                  >
+                    <svg className="h-4 w-4 shrink-0 text-gray-500" fill="none" viewBox="0 0 24 24"
+                         stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                    </svg>
+                    New Chat
+                  </button>
+                </div>
+
+                {conversations.length > 0 && (
+                  <>
+                    <div className="border-t border-[#E8E8E8]" />
+                    <div className="px-4 pt-3 pb-1">
+                      <span className="text-[10px] font-semibold uppercase tracking-widest text-gray-400">Recents</span>
+                    </div>
+                    <nav className="flex-1 overflow-y-auto px-2 pb-3">
+                      {conversations.map(conv => (
+                        <div key={conv.id} className="group relative rounded-lg">
+                          {confirmDeleteId === conv.id ? (
+                            <div className="flex items-center justify-between rounded-lg bg-gray-50 px-3 py-2.5">
+                              <span className="text-xs text-gray-600">Delete?</span>
+                              <div className="flex items-center gap-3">
+                                <button onClick={() => handleDeleteConversation(conv.id)}
+                                  className="text-xs font-semibold text-[#CC2529] hover:underline">Yes</button>
+                                <button onClick={() => setConfirmDeleteId(null)}
+                                  className="text-xs font-medium text-gray-400 hover:text-gray-600">No</button>
+                              </div>
+                            </div>
+                          ) : (
+                            <>
+                              <button
+                                onClick={() => { loadConversationHistory(conv.id); setSidebarOpen(false) }}
+                                className={`w-full rounded-lg px-3 py-2 pr-8 text-left transition-colors cursor-pointer ${
+                                  currentConvId === conv.id ? 'bg-[#1B3A6B]/10 text-[#1B3A6B]' : 'text-gray-600 hover:bg-gray-100'
+                                }`}
+                              >
+                                <p className="truncate text-sm font-medium leading-snug">{conv.title}</p>
+                                <p className="mt-0.5 text-[10px] text-gray-400">{relativeTime(conv.updated_at)}</p>
+                              </button>
+                              <button
+                                onClick={(e) => { e.stopPropagation(); setConfirmDeleteId(conv.id) }}
+                                className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-6 w-6 items-center justify-center rounded text-gray-300 opacity-0 transition-all group-hover:opacity-100 hover:!text-[#CC2529]"
+                                aria-label="Delete conversation"
+                              >
+                                <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                                     stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                                  <polyline points="3 6 5 6 21 6" />
+                                  <path d="m19 6-.867 12.142A2 2 0 0116.138 20H7.862a2 2 0 01-1.995-1.858L5 6" />
+                                  <path d="M10 11v6M14 11v6M9 6V4h6v2" />
+                                </svg>
+                              </button>
+                            </>
+                          )}
                         </div>
-                      </div>
-                    ) : (
-                      <>
-                        <button
-                          onClick={() => { loadConversationHistory(conv.id); setSidebarOpen(false) }}
-                          className={`w-full rounded-lg px-3 py-2 pr-8 text-left transition-colors cursor-pointer ${
-                            currentConvId === conv.id
-                              ? 'bg-[#1B3A6B]/10 text-[#1B3A6B]'
-                              : 'text-gray-600 hover:bg-gray-100'
-                          }`}
-                        >
-                          <p className="truncate text-sm font-medium leading-snug">{conv.title}</p>
-                          <p className="mt-0.5 text-[10px] text-gray-400">{relativeTime(conv.updated_at)}</p>
-                        </button>
-                        {/* Trash icon — visible on row hover */}
-                        <button
-                          onClick={(e) => { e.stopPropagation(); setConfirmDeleteId(conv.id) }}
-                          className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-6 w-6 items-center justify-center rounded text-gray-300 opacity-0 transition-all group-hover:opacity-100 hover:!text-[#CC2529]"
-                          aria-label="Delete conversation"
-                        >
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
-                               stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
-                            <polyline points="3 6 5 6 21 6" />
-                            <path d="m19 6-.867 12.142A2 2 0 0116.138 20H7.862a2 2 0 01-1.995-1.858L5 6" />
-                            <path d="M10 11v6" />
-                            <path d="M14 11v6" />
-                            <path d="M9 6V4h6v2" />
-                          </svg>
-                        </button>
-                      </>
-                    )}
+                      ))}
+                    </nav>
+                  </>
+                )}
+              </>
+            ) : (
+              /* ── Document Review: projects ── */
+              <>
+                <div className="p-3">
+                  <button
+                    onClick={() => { setSelectedProjectId(null); setSidebarOpen(false) }}
+                    className="flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-sm font-medium text-gray-700 hover:bg-gray-100 transition-colors"
+                  >
+                    <svg className="h-4 w-4 shrink-0 text-gray-500" fill="none" viewBox="0 0 24 24"
+                         stroke="currentColor" strokeWidth={2}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
+                    </svg>
+                    New Review
+                  </button>
+                </div>
+
+                {reviewProjects.length > 0 && (
+                  <>
+                    <div className="border-t border-[#E8E8E8]" />
+                    <div className="px-4 pt-3 pb-1">
+                      <span className="text-[10px] font-semibold uppercase tracking-widest text-gray-400">Projects</span>
+                    </div>
+                    <nav className="flex-1 overflow-y-auto px-2 pb-3">
+                      {reviewProjects.map(proj => {
+                        const s = proj.review_result?.summary
+                        return (
+                          <div key={proj.id} className="group relative rounded-lg">
+                            {confirmDeleteProjectId === proj.id ? (
+                              <div className="flex items-center justify-between rounded-lg bg-gray-50 px-3 py-2.5">
+                                <span className="text-xs text-gray-600">Delete?</span>
+                                <div className="flex items-center gap-3">
+                                  <button onClick={() => handleDeleteProject(proj.id)}
+                                    className="text-xs font-semibold text-[#CC2529] hover:underline">Yes</button>
+                                  <button onClick={() => setConfirmDeleteProjectId(null)}
+                                    className="text-xs font-medium text-gray-400 hover:text-gray-600">No</button>
+                                </div>
+                              </div>
+                            ) : (
+                              <>
+                                <button
+                                  onClick={() => { setSelectedProjectId(proj.id); setSidebarOpen(false) }}
+                                  className={`w-full rounded-lg px-3 py-2 pr-8 text-left transition-colors cursor-pointer ${
+                                    selectedProjectId === proj.id ? 'bg-[#1B3A6B]/10 text-[#1B3A6B]' : 'text-gray-600 hover:bg-gray-100'
+                                  }`}
+                                >
+                                  <p className="truncate text-sm font-medium leading-snug">{proj.project_name}</p>
+                                  <p className="mt-0.5 text-[10px] text-gray-400">{relativeTime(proj.created_at)}</p>
+                                  {s && (
+                                    <div className="mt-1 flex gap-1.5">
+                                      <span className="rounded-full bg-green-100 px-1.5 py-0.5 text-[9px] font-bold text-green-700">{s.passed}✓</span>
+                                      {s.warnings > 0 && <span className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[9px] font-bold text-amber-700">{s.warnings}!</span>}
+                                      {s.failed > 0 && <span className="rounded-full bg-red-100 px-1.5 py-0.5 text-[9px] font-bold text-red-700">{s.failed}✗</span>}
+                                    </div>
+                                  )}
+                                </button>
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); setConfirmDeleteProjectId(proj.id) }}
+                                  className="absolute right-1.5 top-1/2 -translate-y-1/2 flex h-6 w-6 items-center justify-center rounded text-gray-300 opacity-0 transition-all group-hover:opacity-100 hover:!text-[#CC2529]"
+                                  aria-label="Delete project"
+                                >
+                                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                                       stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
+                                    <polyline points="3 6 5 6 21 6" />
+                                    <path d="m19 6-.867 12.142A2 2 0 0116.138 20H7.862a2 2 0 01-1.995-1.858L5 6" />
+                                    <path d="M10 11v6M14 11v6M9 6V4h6v2" />
+                                  </svg>
+                                </button>
+                              </>
+                            )}
+                          </div>
+                        )
+                      })}
+                    </nav>
+                  </>
+                )}
+
+                {reviewProjects.length === 0 && (
+                  <div className="flex-1 flex items-center justify-center px-4">
+                    <p className="text-center text-xs text-gray-400">No projects yet. Run a review to get started.</p>
                   </div>
-                ))}
-              </nav>
-            </>
-          )}
-            </aside>
-          </>
-        )}
+                )}
+              </>
+            )}
+          </aside>
+        </>
 
         {/* ── MAIN CONTENT ──────────────────────────────────────────────────── */}
         <main className="min-w-0 flex-1 overflow-hidden">
@@ -489,14 +581,29 @@ export default function ChatInterface({ userId, userEmail }: ChatInterfaceProps)
             />
 
           ) : (
-            <DocumentReview />
+            <DocumentReview
+              userId={userId}
+              selectedProjectId={selectedProjectId}
+              onProjectSaved={(p) => {
+                setReviewProjects(prev => [p, ...prev.filter(x => x.id !== p.id)])
+                setSelectedProjectId(p.id)
+              }}
+              onNewReview={() => setSelectedProjectId(null)}
+            />
           )}
         </main>
       </div>
 
       {/* ── PDF Modal ─────────────────────────────────────────────────────────── */}
       {pdfModal && (
-        <PDFViewerModal citation={pdfModal} onClose={() => setPdfModal(null)} />
+        <PDFViewerModal
+          url={`${API_BASE}/api/pdf/${pdfModal.document}`}
+          page={pdfModal.page_pdf}
+          headerLabel={pdfModal.document || 'NJDOT Document'}
+          headerDetail={pdfModal.section ? `§ ${pdfModal.section}` : undefined}
+          headerPage={pdfModal.page_printed}
+          onClose={() => setPdfModal(null)}
+        />
       )}
     </div>
   )
@@ -582,7 +689,7 @@ function SpecAssistantView({
                     }`}
                     style={{ border: '1px solid #e2e8f0', borderLeft: '3px solid #CC2529' }}
                   >
-                    <p className="whitespace-pre-wrap">{msg.content}</p>
+                    <MarkdownAnswer content={msg.content} />
                   </div>
                   {msg.response_time_ms != null && (
                     <p className="mt-1 pl-1 text-[10px] text-gray-400">
@@ -848,54 +955,6 @@ function CitationCard({
         >
           View PDF →
         </button>
-      </div>
-    </div>
-  )
-}
-
-// ── PDF VIEWER MODAL ───────────────────────────────────────────────────────────
-
-function PDFViewerModal({ citation, onClose }: { citation: CitationItem; onClose: () => void }) {
-  const apiBase = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
-  const src = `${apiBase}/api/pdf/${citation.document}#page=${citation.page_pdf}`
-
-  useEffect(() => {
-    const handler = (e: globalThis.KeyboardEvent) => { if (e.key === 'Escape') onClose() }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-      onClick={(e) => { if (e.target === e.currentTarget) onClose() }}
-    >
-      <div className="flex flex-col bg-white rounded-2xl shadow-2xl w-[96vw] h-[92vh] max-w-5xl sm:w-[92vw] sm:h-[90vh]">
-        {/* Header */}
-        <div className="flex items-center justify-between px-5 py-3.5 border-b border-[#E8E8E8] shrink-0">
-          <div className="flex items-center gap-3 min-w-0">
-            <span className="text-[10px] font-bold uppercase tracking-widest text-[#1B3A6B] truncate">
-              {citation.document || 'NJDOT Document'}
-            </span>
-            {citation.section && (
-              <span className="text-sm text-gray-500 truncate">§ {citation.section}</span>
-            )}
-            {citation.page_printed && (
-              <span className="text-sm text-gray-400 shrink-0">p. {citation.page_printed}</span>
-            )}
-          </div>
-          <button
-            type="button"
-            onClick={onClose}
-            className="ml-4 shrink-0 rounded-lg p-1.5 text-gray-400 hover:bg-gray-100 hover:text-gray-700"
-            aria-label="Close"
-          >
-            <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-            </svg>
-          </button>
-        </div>
-        <iframe src={src} className="flex-1 w-full rounded-b-2xl" title={`PDF: ${citation.document}`} />
       </div>
     </div>
   )
