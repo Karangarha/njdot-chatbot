@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react'
 import MarkdownAnswer from '@/components/MarkdownAnswer'
 import PDFViewerModal from '@/components/PDFViewerModal'
+import { authHeaders } from '@/lib/api'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -43,6 +44,11 @@ interface SessionChatProps {
   authToken?: string
 }
 
+// Whether a citation can open the PDF viewer -- kept as one predicate so the
+// pill's clickability and the modal-render guard can never drift apart.
+const isPdfLinkable = (source: Source): boolean =>
+  source.page_pdf != null && !!source.doc_type
+
 // ── Progress bar ───────────────────────────────────────────────────────────────
 
 function ProgressBar({ step, total }: { step?: number; total?: number }) {
@@ -70,7 +76,7 @@ function SourcePill({ source, onOpenPdf }: { source: Source; onOpenPdf: (s: Sour
     'Construction Scheduling Manual': 'bg-green-100 text-green-700',
   }
   const color = tagColors[source.label] ?? 'bg-gray-100 text-gray-600'
-  const clickable = source.page_pdf != null && !!source.doc_type
+  const clickable = isPdfLinkable(source)
   const detail = source.section_id
     ? source.section_id
     : source.heading
@@ -161,6 +167,8 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
   const [pdfSource,        setPdfSource]        = useState<Source | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef  = useRef<HTMLTextAreaElement>(null)
+  const authTokenRef = useRef(authToken)
+  useEffect(() => { authTokenRef.current = authToken }, [authToken])
 
   // ── SSE: stream ingestion progress ────────────────────────────────────────
   useEffect(() => {
@@ -185,14 +193,15 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
   }, [sessionId, apiBase])
 
   // ── Load message history when session becomes ready ────────────────────────
+  // Reads authTokenRef (not the authToken prop) so a later token refresh
+  // doesn't re-trigger this effect and clobber messages sent since the
+  // initial load -- this should run once per session, not on every token
+  // change.
   useEffect(() => {
     if (!sessionId || progress?.status !== 'ready') return
 
-    const headers: HeadersInit = {}
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`
-
     setHistoryLoading(true)
-    fetch(`${apiBase}/api/session/messages/${sessionId}`, { headers })
+    fetch(`${apiBase}/api/session/messages/${sessionId}`, { headers: authHeaders(authTokenRef.current) })
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then(data => {
         const loaded: Message[] = (data.messages ?? []).map((m: any) => ({
@@ -204,7 +213,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
       })
       .catch(() => { /* history load failure is non-fatal */ })
       .finally(() => setHistoryLoading(false))
-  }, [sessionId, progress?.status, apiBase, authToken])
+  }, [sessionId, progress?.status, apiBase])
 
   // ── Auto-scroll on new message ─────────────────────────────────────────────
   useEffect(() => {
@@ -222,8 +231,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
     setError(null)
 
     try {
-      const headers: HeadersInit = { 'Content-Type': 'application/json' }
-      if (authToken) headers['Authorization'] = `Bearer ${authToken}`
+      const headers: HeadersInit = { 'Content-Type': 'application/json', ...authHeaders(authToken) }
 
       const res = await fetch(`${apiBase}/api/session/query`, {
         method:  'POST',
@@ -399,11 +407,12 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
       </div>
 
       {/* PDF Viewer Modal */}
-      {pdfSource && pdfSource.page_pdf != null && pdfSource.doc_type && (
+      {pdfSource && isPdfLinkable(pdfSource) && (
         <PDFViewerModal
           url={`${apiBase}/api/review/${sessionId}/pdf/${pdfSource.doc_type}`}
           page={pdfSource.page_pdf}
           authToken={authToken}
+          requireAuth
           headerLabel={pdfSource.label}
           headerDetail={pdfSource.section_id ?? pdfSource.heading}
           onClose={() => setPdfSource(null)}

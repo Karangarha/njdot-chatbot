@@ -1,10 +1,14 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { authHeaders } from '@/lib/api'
 
 export interface PDFViewerModalProps {
   url:           string          // GET endpoint, no #fragment, no query-string token
   page?:         number          // drives the #page=N fragment
-  authToken?:    string          // set -> fetch+blob with Authorization header; unset -> iframe src=url directly (today's public path)
+  authToken?:    string          // Bearer token to send when requireAuth is set
+  requireAuth?:  boolean         // true -> always fetch+blob (with auth header if available)
+                                  // and surface a real error if it fails; false/unset -> iframe
+                                  // src=url directly, no auth (today's public-doc path)
   headerLabel:   string
   headerDetail?: string          // e.g. "§ Section 104" or a narrative heading
   headerPage?:   string | number // e.g. printed page number
@@ -12,35 +16,37 @@ export interface PDFViewerModalProps {
 }
 
 export default function PDFViewerModal({
-  url, page, authToken, headerLabel, headerDetail, headerPage, onClose,
+  url, page, authToken, requireAuth, headerLabel, headerDetail, headerPage, onClose,
 }: PDFViewerModalProps) {
   const [blobUrl, setBlobUrl] = useState<string | null>(null)
   const [error,   setError]   = useState<string | null>(null)
-  const [loading, setLoading] = useState(!!authToken)
+  const [loading, setLoading] = useState(requireAuth || !!authToken)
+  const onCloseRef = useRef(onClose)
+  useEffect(() => { onCloseRef.current = onClose }, [onClose])
 
   useEffect(() => {
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose() }
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onCloseRef.current() }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [onClose])
+  }, [])
 
   useEffect(() => {
-    if (!authToken) return
+    if (!requireAuth && !authToken) return
     let cancelled = false
     let objectUrl: string | null = null
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setLoading(true)
     setError(null)
-    fetch(url, { headers: { Authorization: `Bearer ${authToken}` } })
+    fetch(url, { headers: authHeaders(authToken) })
       .then(res => { if (!res.ok) throw new Error(`Failed to load PDF (${res.status})`); return res.blob() })
       .then(blob => { if (!cancelled) setBlobUrl(objectUrl = URL.createObjectURL(blob)) })
       .catch(err => { if (!cancelled) setError(err.message ?? 'Failed to load PDF') })
       .finally(() => { if (!cancelled) setLoading(false) })
     return () => { cancelled = true; if (objectUrl) URL.revokeObjectURL(objectUrl) }
-  }, [url, authToken])
+  }, [url, authToken, requireAuth])
 
-  const src = authToken ? (blobUrl ? `${blobUrl}#page=${page ?? 1}` : undefined)
-                         : `${url}#page=${page ?? 1}`
+  const src = (requireAuth || authToken) ? (blobUrl ? `${blobUrl}#page=${page ?? 1}` : undefined)
+                                          : `${url}#page=${page ?? 1}`
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"

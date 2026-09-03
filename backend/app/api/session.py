@@ -545,14 +545,25 @@ _TOOL_DOC_TYPE: Dict[str, str] = {
     "search_narrative":          "narrative",
 }
 
+# Cap on flattened activities per citation -- get_critical_path/query_schedule_graph
+# can return long chains/row sets; without a cap they'd flood the chat UI (the
+# LIMIT 25 already used throughout cypher_examples.py's few-shot queries).
+_MAX_ACTIVITIES = 25
+
 # Cypher RETURN aliases are unreliable (few-shot examples in cypher_examples.py
-# use unaliased "a.taskId" style dotted keys); normalize by stripping any
-# "x." prefix and lowercasing before matching.
+# use unaliased "a.taskId" style dotted keys, and an LLM-generated query could
+# rename columns further, e.g. "AS id"/"AS activityName"); normalize by
+# stripping any "x." prefix and lowercasing before matching.
 _ACTIVITY_FIELD_ALIASES: Dict[str, str] = {
-    "taskid": "taskId", "name": "name",
+    "taskid": "taskId", "id": "taskId", "activityid": "taskId",
+    "name": "name", "activityname": "name", "taskname": "name",
     "es": "start", "startdate": "start", "computedearlystart": "start", "start": "start",
     "ef": "finish", "finishdate": "finish", "computedearlyfinish": "finish", "finish": "finish",
 }
+# CPM-computed dates are authoritative over raw/reported ones (per
+# _QA_SYSTEM_GRAPH's rules) -- when a row carries both, the computed variant
+# wins regardless of which key happens to iterate first.
+_COMPUTED_DATE_ALIASES = {"es", "computedearlystart", "ef", "computedearlyfinish"}
 
 _QA_SYSTEM = """\
 You are an assistant helping an NJDOT engineer review a construction project.
@@ -634,6 +645,13 @@ def _build_tool_sources(messages: List[Any]) -> List[Dict[str, Any]]:
     return out
 
 
+def _similarity(it: Dict[str, Any]) -> Any:
+    """search_narrative keys its match score "score", not "similarity" like
+    the Supabase-backed chunk retrievers -- normalize here so ranking/dedup
+    works the same regardless of which tool produced the item."""
+    return it.get("similarity", it.get("score"))
+
+
 def _tool_message_to_sources(m: Any) -> List[Dict[str, Any]]:
     tool_name = getattr(m, "name", "tool")
     label = _TOOL_SOURCE_LABEL.get(tool_name, "Schedule Graph")
@@ -657,12 +675,11 @@ def _tool_message_to_sources(m: Any) -> List[Dict[str, Any]]:
             # near-identical pills), keeping the highest-similarity entry
             # per page, and cap to a few so one answer can't flood the UI
             # with up to match_count pills.
+            page_items = sorted(page_items, key=lambda it: -(_similarity(it) or 0))
             by_page: Dict[Any, Dict[str, Any]] = {}
             for it in page_items:
-                pg = it["page_pdf"]
-                if pg not in by_page or (it.get("similarity") or 0) > (by_page[pg].get("similarity") or 0):
-                    by_page[pg] = it
-            page_items = sorted(by_page.values(), key=lambda it: -(it.get("similarity") or 0))[:3]
+                by_page.setdefault(it["page_pdf"], it)
+            page_items = list(by_page.values())[:3]
             if page_items:
                 entries = []
                 for it in page_items:
@@ -670,8 +687,9 @@ def _tool_message_to_sources(m: Any) -> List[Dict[str, Any]]:
                         "label": label, "tool": tool_name, "doc_type": doc_type,
                         "page_pdf": it["page_pdf"],
                     }
-                    if it.get("similarity") is not None:
-                        entry["similarity"] = round(it["similarity"], 3)
+                    sim = _similarity(it)
+                    if sim is not None:
+                        entry["similarity"] = round(sim, 3)
                     if it.get("heading") is not None:
                         entry["heading"] = it["heading"]
                     if it.get("section_id") is not None:
@@ -680,11 +698,16 @@ def _tool_message_to_sources(m: Any) -> List[Dict[str, Any]]:
                 return entries
             return fallback
 
-        if tool_name == "get_critical_path" and isinstance(payload, dict) and payload.get("chains"):
-            activities = _flatten_activities(act for chain in payload["chains"] for act in chain)
+        # Activity-list detection is shape-based, not tool-name-gated, so a
+        # future deterministic schedule-graph tool doesn't need its own branch
+        # here -- it just needs to return one of these two shapes.
+        if isinstance(payload, dict) and isinstance(payload.get("chains"), list):
+            activities = _flatten_activities(
+                act for chain in payload["chains"] if isinstance(chain, list) for act in chain
+            )
             return [{"label": label, "tool": tool_name, "activities": activities}] if activities else fallback
 
-        if tool_name == "query_schedule_graph" and isinstance(payload, list):
+        if isinstance(payload, list):
             rows = [r for r in payload if isinstance(r, dict) and _looks_like_activity_row(r)]
             activities = _flatten_activities(rows)
             return [{"label": label, "tool": tool_name, "activities": activities}] if activities else fallback
@@ -699,8 +722,16 @@ def _normalize_key(k: str) -> str:
 
 
 def _looks_like_activity_row(record: Dict[str, Any]) -> bool:
-    norm = {_normalize_key(k) for k in record.keys()}
-    return "taskid" in norm and "name" in norm
+    # Require the taskId-ish and name-ish keys to share the same dotted alias
+    # (e.g. both "a.taskId"/"a.name", or both bare) -- otherwise a Cypher row
+    # joining two nodes (e.g. "p.taskId"/"s.name") would splice together an
+    # activity identity that doesn't actually exist.
+    prefixes: Dict[str, str] = {}
+    for k in record.keys():
+        canon = _ACTIVITY_FIELD_ALIASES.get(_normalize_key(k))
+        if canon in ("taskId", "name") and canon not in prefixes:
+            prefixes[canon] = k.rsplit(".", 1)[0] if "." in k else ""
+    return "taskId" in prefixes and "name" in prefixes and prefixes["taskId"] == prefixes["name"]
 
 
 def _flatten_activities(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -710,15 +741,26 @@ def _flatten_activities(records: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
         if not isinstance(r, dict):
             continue
         entry = {"taskId": None, "name": None, "start": None, "finish": None}
+        is_computed = {"start": False, "finish": False}
         for k, v in r.items():
-            canon = _ACTIVITY_FIELD_ALIASES.get(_normalize_key(k))
-            if canon and entry.get(canon) is None:
+            norm = _normalize_key(k)
+            canon = _ACTIVITY_FIELD_ALIASES.get(norm)
+            if not canon:
+                continue
+            if canon in ("start", "finish"):
+                computed = norm in _COMPUTED_DATE_ALIASES
+                if entry[canon] is None or (computed and not is_computed[canon]):
+                    entry[canon] = v
+                    is_computed[canon] = computed
+            elif entry.get(canon) is None:
                 entry[canon] = v
         tid = entry["taskId"]
         if tid is None or tid in seen:
             continue
         seen.add(tid)
         out.append(entry)
+        if len(out) >= _MAX_ACTIVITIES:
+            break
     return out
 
 
