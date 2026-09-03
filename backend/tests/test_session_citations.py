@@ -70,14 +70,20 @@ def test_search_special_provisions_with_page_pdf():
 
 
 def test_search_narrative_with_sections_and_page_pdf():
-    """search_narrative payload with sections (not chunks) + page_pdf -> doc_type="narrative"."""
+    """search_narrative payload with sections (not chunks) + page_pdf -> doc_type="narrative".
+
+    search_narrative's real items key their match score "score" (see
+    graph_neo4j/tools.py's search_narrative), not "similarity" like the
+    Supabase-backed retrievers -- this fixture matches that real shape so the
+    test actually exercises the score->similarity normalization.
+    """
     payload = {
         "sections": [
             {
                 "page_pdf": 12,
                 "heading": "Project Overview",
                 "section_id": "nar_1",
-                "similarity": 0.88,
+                "score": 0.88,
                 "content": "Designer narrative text",
             }
         ]
@@ -90,6 +96,7 @@ def test_search_narrative_with_sections_and_page_pdf():
     assert sources[0]["tool"] == "search_narrative"
     assert sources[0]["doc_type"] == "narrative"
     assert sources[0]["page_pdf"] == 12
+    assert sources[0]["similarity"] == 0.88
 
 
 def test_search_utility_plans_no_page_pdf_fallback():
@@ -144,16 +151,23 @@ def test_special_provisions_empty_chunks_falls_back():
 
 
 def test_get_critical_path_with_chains():
-    """get_critical_path payload with chains -> flattened, deduplicated activities."""
+    """get_critical_path payload with chains -> flattened, deduplicated activities.
+
+    Uses real get_critical_path field names (taskId/name/es/ef -- see
+    graph_neo4j/tools.py's `RETURN a.taskId AS taskId, ..., a.computedEarlyStart
+    AS es, a.computedEarlyFinish AS ef`) rather than already-canonical
+    start/finish, so this exercises the es->start / ef->finish alias mapping
+    instead of bypassing it.
+    """
     payload = {
         "chains": [
             [
-                {"taskId": "A1000", "name": "Mobilization", "start": "2024-01-01", "finish": "2024-01-05"},
-                {"taskId": "A2000", "name": "Excavation", "start": "2024-01-06", "finish": "2024-02-15"},
+                {"taskId": "A1000", "name": "Mobilization", "es": "2024-01-01", "ef": "2024-01-05"},
+                {"taskId": "A2000", "name": "Excavation", "es": "2024-01-06", "ef": "2024-02-15"},
             ],
             [
-                {"taskId": "A2000", "name": "Excavation", "start": "2024-01-06", "finish": "2024-02-15"},  # Duplicate
-                {"taskId": "A3000", "name": "Paving", "start": "2024-02-16", "finish": "2024-03-30"},
+                {"taskId": "A2000", "name": "Excavation", "es": "2024-01-06", "ef": "2024-02-15"},  # Duplicate
+                {"taskId": "A3000", "name": "Paving", "es": "2024-02-16", "ef": "2024-03-30"},
             ],
         ]
     }
@@ -533,6 +547,41 @@ def test_duplicate_pages_deduped_and_capped():
     # Sorted by similarity, descending.
     similarities = [s["similarity"] for s in sources]
     assert similarities == sorted(similarities, reverse=True)
+
+
+def test_looks_like_activity_row_rejects_cross_node_splice():
+    """taskId and name from two different aliased nodes (e.g. a predecessor/
+    successor join) must NOT be treated as one activity's identity."""
+    assert _looks_like_activity_row({"p.taskId": "A050", "s.name": "Final Paving"}) is False
+    # Same alias for both -> still valid.
+    assert _looks_like_activity_row({"p.taskId": "A050", "p.name": "Final Paving"}) is True
+
+
+def test_looks_like_activity_row_recognizes_as_aliased_columns():
+    """An LLM-authored `RETURN a.taskId AS id, a.name AS activityName` should
+    still be recognized as an activity row instead of silently vanishing."""
+    assert _looks_like_activity_row({"id": "A1000", "activityName": "Setup"}) is True
+
+
+def test_flatten_activities_prefers_computed_dates_over_raw():
+    """When a record carries both a raw/reported date and a CPM-computed one,
+    the computed value wins regardless of which key iterates first."""
+    records = [{
+        "taskId": "A1000", "name": "Mobilization",
+        "startDate": "2024-01-01", "computedEarlyStart": "2024-01-03",
+        "finishDate": "2024-01-10", "computedEarlyFinish": "2024-01-12",
+    }]
+    activities = _flatten_activities(records)
+    assert activities[0]["start"] == "2024-01-03"
+    assert activities[0]["finish"] == "2024-01-12"
+
+
+def test_flatten_activities_capped():
+    """Activity lists are capped so a long critical-path chain can't flood
+    the chat UI (mirrors the page-citation path's top-3 cap)."""
+    records = [{"taskId": f"A{i}", "name": f"Activity {i}"} for i in range(40)]
+    activities = _flatten_activities(records)
+    assert len(activities) == 25
 
 
 if __name__ == "__main__":

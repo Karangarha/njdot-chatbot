@@ -400,7 +400,8 @@ export default function DocumentReview({
       const headers: HeadersInit = {}
       if (session?.access_token) {
         headers['Authorization'] = `Bearer ${session.access_token}`
-        setAuthToken(session.access_token)
+        // authToken state is set by the useEffect below, once sessionId is
+        // set a few lines down -- no need to duplicate that getSession() call here.
       }
 
       const reviewForm = new FormData()

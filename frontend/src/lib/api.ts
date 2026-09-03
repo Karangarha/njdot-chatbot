@@ -2,6 +2,11 @@ import type { QueryResponse } from './types'
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
+/** Bearer-auth header, or {} when no token is available. */
+export function authHeaders(accessToken?: string): HeadersInit {
+  return accessToken ? { Authorization: `Bearer ${accessToken}` } : {}
+}
+
 /**
  * POST /api/query — run a RAG query against the NJDOT backend.
  *
@@ -42,7 +47,7 @@ async function _authPost(path: string, body: object, accessToken?: string): Prom
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+      ...authHeaders(accessToken),
     },
     body: JSON.stringify(body),
   })
