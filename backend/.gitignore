@@ -12,48 +12,39 @@
 # 009_review_projects_sp_keymap_estimate_supabase_only.sql.
 !migrations/
 !migrations/*
-# Un-ignore the configurable-checklist migration/seed scripts
+# Un-ignore the standalone SQL function files deployed via scripts/deploy_sql.py.
+!sql/
+!sql/*
+# Un-ignore the scripts directory. Every script under it is tracked, so this
+# is a directory-level rule rather than a per-file list — a per-file list is
+# exactly what silently dropped ingest_specs.py and friends from git (one
+# side of a merge never had them tracked because they post-dated this file's
+# per-file rules, so the merge kept the "deleted" side with no conflict; see
+# the app/ note below for the same class of gap).
 !scripts/
-!scripts/migrate_compliance_checks.sql
-!scripts/seed_compliance_checks.py
-# Un-ignore the review re-run file-persistence migrations
-!scripts/migrate_review_projects_add_file_paths.sql
-!scripts/migrate_review_files_storage.sql
-# Un-ignore this branch's new one-time backfill script
-!scripts/backfill_sp_keymap_estimate_to_supabase.py
-# Un-ignore core app modules the blanket rule above missed — the Neo4j/
-# LangChain migration package, the compliance engine, and a couple of
-# top-level app/ files. app/ itself must be un-ignored first or git won't
-# look inside it; __pycache__ and other build artifacts stay ignored via
-# the blanket rule (same pattern as !debug/ above).
+!scripts/*
+# Un-ignore every app/ subpackage as a directory-level rule (not per-file —
+# see the scripts/ note above for why per-file lists are the actual bug
+# here). app/ itself must be un-ignored first or git won't look inside it;
+# __pycache__ and other build artifacts stay ignored via the blanket rule
+# (same pattern as !debug/ above).
 !app/
-!app/auth.py
-!app/neo4j_client.py
-!app/observability.py
+!app/*.py
+!app/api/
+!app/api/*
 !app/compliance/
 !app/compliance/*
+!app/generation/
+!app/generation/*
 !app/graph_neo4j/
 !app/graph_neo4j/*
+!app/ingestion/
+!app/ingestion/*
+!app/retrieval/
+!app/retrieval/*
 !app/retrieval_langchain/
 !app/retrieval_langchain/*
 !app/scheduling/
-!app/scheduling/cpm_cache.py
-# Un-ignore this branch's new shared session_chunks writer. app/ingestion/
-# itself must be un-ignored first (like !app/compliance/ etc. above) or git
-# never looks inside it to evaluate the file-level exception — a lone
-# `!app/ingestion/chunk_store.py` with no `!app/ingestion/` silently does
-# nothing, since a parent directory is still excluded.
-!app/ingestion/
-!app/ingestion/chunk_store.py
-# Pre-existing extractors that review.py imports (keymap/estimate ingestion)
-# were never added to git either — same class of gap as the migration
-# scripts below. Un-ignored here so Task 3 can import and modify them.
-!app/ingestion/keymap_extractor.py
-!app/ingestion/estimate_extractor.py
-!app/ingestion/utility_plan_extractor.py
-!app/ingestion/edq_extractor.py
-# Un-ignore pre-existing migration scripts that were never added to git
-!scripts/fix_conversations_rls.sql
-!scripts/migrate_session_no_expiry.sql
+!app/scheduling/*
 # Un-ignore the env var template (no secrets — placeholders only)
 !.env.example

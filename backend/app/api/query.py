@@ -280,7 +280,14 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
     raw_cites = result.get("citations") or []
 
     # If CitationSerializer fell back (parse_error), citations is already []
-    citations: List[CitationItem] = [CitationItem(**c) for c in raw_cites]
+    # Only surface citations that matched a retrieved chunk. An unverified
+    # citation's "document" field is whatever the LLM typed (e.g. "2019
+    # Standard Specifications Book" instead of the real doc key "Spec2019"),
+    # which /api/pdf/{doc_name} can't resolve to a real file -> 404 when the
+    # frontend tries to open it.
+    citations: List[CitationItem] = [
+        CitationItem(**c) for c in raw_cites if c.get("verified")
+    ]
 
     # Build BDC alert list (summary fields only — amendment_text goes to LLM, not client)
     bdc_alerts: List[BDCAlertItem] = [
