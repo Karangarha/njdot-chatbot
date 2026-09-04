@@ -57,3 +57,14 @@
 !scripts/migrate_session_no_expiry.sql
 # Un-ignore the env var template (no secrets — placeholders only)
 !.env.example
+# Un-ignore the reference-doc ingestion/eval scripts -- these were silently
+# dropped by a past merge (one side had them, the other didn't, because they
+# were victims of this same blanket-ignore gap; git's merge kept the
+# "deleted" side with no conflict). Restored from git history; un-ignoring
+# them here so this doesn't happen again.
+!scripts/ingest_specs.py
+!scripts/ingest_bdc.py
+!scripts/run_eval.py
+!scripts/test_retrieval.py
+!scripts/deploy_sql.py
+!scripts/test_db.py
