@@ -656,7 +656,7 @@ export default function DocumentReview({
               ) : (
                 groupSequential(visibleChecks).map((run, i) => (
                   run.header ? (
-                    <CollapsibleSection key={run.header} title={run.header}
+                    <CollapsibleSection key={i} title={run.header}
                       checks={run.items}
                       expanded={expanded[run.header] ?? true}
                       onToggle={() => toggleSection(run.header!)} />
