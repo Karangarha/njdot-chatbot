@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import List
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from app.auth import user_id_from_token as _user_id_from_token
