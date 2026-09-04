@@ -174,10 +174,12 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Environmental Permit Compliance Beyond Narrative",
         "Check the SCHEDULE OBEYS the permit restrictions, not that the "
         "narrative mentions them. Typical: in-water work barred Mar 1 - Jun "
-        "30 and Oct 1 - Nov 30; tree clearing barred Apr 1 - Aug 30. Test "
-        "cofferdam, in-water and clearing activities against those windows. "
-        "A dedicated calendar whose non-working ranges match the permit is "
-        "the strongest evidence of compliance. Look in: narrative Permit "
+        "30 and Oct 1 - Nov 30; tree clearing barred Apr 1 - Aug 30. These "
+        "windows recur every year the project spans - test cofferdam, "
+        "in-water and clearing activities against every occurrence, not "
+        "just the first. A dedicated calendar whose non-working ranges "
+        "match the permit is the strongest evidence of compliance. Look "
+        "in: narrative Permit "
         "Requirements section; schedule activity dates and calendar "
         "assignments; Special Provisions.",
         source_files=["sp", "narrative", "schedule"],
@@ -190,7 +192,9 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Two different windows apply - evaluate both. PLANTING (plant, tree, "
         "shrub, bulb, transplant): Mar 1 - May 15, Aug 15 - Dec 1. "
         "SEEDING/TURF (seed, topsoil, fertiliz, sod, turf): Mar 1 - May 15, "
-        "Aug 15 - OCT 15. Any activity starting or finishing outside its "
+        "Aug 15 - OCT 15. Both windows recur every year the project spans - "
+        "check every activity against every year's occurrence, not just "
+        "the first. Any activity starting or finishing outside its "
         "window is a violation. If the list is non-empty the status is FAIL "
         "- 'Tree Plantings' is planting, and 'topsoiling, fertilizing and "
         "seeding' is seeding. Look in: schedule activity list; Standard "
@@ -201,7 +205,8 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "gas_interruption", CAT_ENV_LANDSCAPE_UTILITIES,
         "No Gas Service Interruptions Oct 1 to Apr 1",
-        "Restricted window: Oct 1 - Apr 1. Search activity names for: gas, "
+        "Restricted window: Oct 1 - Apr 1, recurring every year the project "
+        "spans - check every occurrence, not just the first. Search activity names for: gas, "
         "gas main, gas line, gas valve, gas service, and named gas "
         "utilities. Never conclude 'no gas activity' without listing the "
         "terms you searched. Nothing found -> PASS. Installation, tie-in, "
@@ -215,7 +220,8 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "water_interruption", CAT_ENV_LANDSCAPE_UTILITIES,
         "No Water Service Interruptions Apr 1 to Sep 30",
-        "Restricted window: Apr 1 - Sep 30. Search for: water, water main, "
+        "Restricted window: Apr 1 - Sep 30, recurring every year the project "
+        "spans - check every occurrence, not just the first. Search for: water, water main, "
         "water service, water valve, hydrant, named water owners. Nothing "
         "found -> PASS, naming the terms searched. A live TIE-IN OR "
         "CONNECTION TO AN EXISTING MAIN IS a service interruption - do not "
@@ -229,7 +235,8 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "electric_interruption", CAT_ENV_LANDSCAPE_UTILITIES,
         "No Electric Service Interruptions Jun 1 to Sep 30",
-        "Restricted window: Jun 1 - Sep 30. Search for: electric, power, "
+        "Restricted window: Jun 1 - Sep 30, recurring every year the project "
+        "spans - check every occurrence, not just the first. Search for: electric, power, "
         "service, meter, lighting, signal, ITS, conduit, junction box, named "
         "electric owners. Nothing found -> PASS, naming terms. Service "
         "cut-over, meter changeover, de-energizing and resetting a live "
@@ -269,7 +276,8 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "temp_50_window", CAT_WEATHER,
         "Work Requiring >50°F Scheduled May 1 - Sep 30",
-        "Work requiring above 50 F must fall between May 1 and Sep 30. You "
+        "Work requiring above 50 F must fall between May 1 and Sep 30, "
+        "checking every year the project spans, not just the first. You "
         "must classify which work carries the threshold - the schedule will "
         "not label it. Typical: pavement markings and thermoplastic, epoxy "
         "and latex-modified materials, waterproofing membranes, joint and "
@@ -283,7 +291,8 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "temp_60_window", CAT_WEATHER,
         "Work Requiring >60°F Scheduled Jun 1 - Sep 15",
-        "Work requiring above 60 F must fall between Jun 1 and Sep 15. "
+        "Work requiring above 60 F must fall between Jun 1 and Sep 15, "
+        "checking every year the project spans, not just the first. "
         "Narrower set than the 50 F rule - typically epoxy and polymer "
         "overlays, thin bonded overlays, and materials whose specification "
         "states a 60 F minimum. Cite the spec. Exclude HMA paving. If no "
@@ -298,8 +307,10 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "no_concrete_winter", CAT_WINTER,
         "No Concrete Activities Dec 15 - Mar 15",
-        "Temperature-sensitive concrete placement is barred Dec 15 - Mar 15. "
-        "INCLUDE only placement: 'Place and cure', 'Pour', 'Cast'. EXCLUDE "
+        "Temperature-sensitive concrete placement is barred Dec 15 - Mar 15, "
+        "recurring every winter the project spans - a multi-year project "
+        "has more than one such window; check every one of them, not just "
+        "the first. INCLUDE only placement: 'Place and cure', 'Pour', 'Cast'. EXCLUDE "
         "these, which get miscounted: 'Remove concrete', 'Demolish', 'Cut', "
         "'Saw' -> demolition; 'Form', 'Install reinforcement', 'Install deck "
         "pans' -> precede placement; 'Install new bearings', 'Erect "
@@ -313,13 +324,16 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "cold_weather_concreting", CAT_WINTER,
         "Winter Concrete Uses Cold Weather Concreting (504.03.02.C)",
         "Only applies if genuine concrete PLACEMENT falls in Dec 15 - Mar 15 "
-        "(apply the same exclusions as the winter concrete check). No "
-        "winter placement -> WARNING, 'no winter concrete work present.' "
-        "Otherwise confirm three things: a cold-weather concreting plan "
-        "submittal finishing at least 30 days before the first winter "
-        "placement; durations allowing 7 days protection for decks and "
-        "approaches, 5 for other placements; and the narrative identifying "
-        "the winter work. Look in: schedule submittal activities and "
+        "(apply the same exclusions as the winter concrete check), checking "
+        "every winter the project spans - a multi-year project has more "
+        "than one, and a placement in a LATER winter still needs a "
+        "cold-weather plan even if the first winter had none. No "
+        "winter placement in ANY year -> WARNING, 'no winter concrete work present.' "
+        "Otherwise confirm three things per winter with a placement: a "
+        "cold-weather concreting plan submittal finishing at least 30 days "
+        "before that winter's first placement; durations allowing 7 days "
+        "protection for decks and approaches, 5 for other placements; and "
+        "the narrative identifying the winter work. Look in: schedule submittal activities and "
         "placement dates; Standard Specifications 504.03.02.C; designer's "
         "narrative.",
         source_files=["narrative", "schedule", "spec"],
@@ -344,10 +358,12 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "no_paving_winter", CAT_WEATHER_PAVING,
         "No Paving Activities Dec 15 - Mar 15",
-        "No paving between Dec 15 and Mar 15. Identify paving: pave, "
+        "No paving between Dec 15 and Mar 15, recurring every winter the "
+        "project spans - a multi-year project has more than one such "
+        "window; check every one, not just the first. Identify paving: pave, "
         "paving, mill, overlay, HMA, asphalt, surface course, base course, "
         "pavement box, stripe. List them all, then filter to those "
-        "intersecting the window. THE STATUS FOLLOWS THE FILTERED LIST. If "
+        "intersecting any occurrence of the window. THE STATUS FOLLOWS THE FILTERED LIST. If "
         "it is empty, PASS - however many paving activities exist "
         "elsewhere. Never cite an activity outside the window as evidence "
         "of a violation inside it. Look in: schedule activity list and "
