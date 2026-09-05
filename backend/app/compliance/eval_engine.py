@@ -573,6 +573,14 @@ def _evaluate_one_check(
                 _accumulate_usage(usage_totals, re_judge_usage)
 
             if retried is not None and re_judgment is not None and re_judgment.grounded:
+                # Note the asymmetry: if the FIRST judge call errors, _judge_grounding
+                # fails open and we keep the original answer unverified (safe — it's
+                # what we already had). If the RE-judge errors, it also fails open,
+                # and we accept the RETRIED answer unverified here — a different
+                # answer we've never actually verified. Both follow "an unreachable
+                # judge never blocks a check," and accepting the correction is the
+                # better of the two options, but it's worth being explicit that this
+                # branch can be reached without the retry ever being judged.
                 result = retried
             else:
                 failure_reason = re_judgment.reason if re_judgment is not None else judgment.reason
