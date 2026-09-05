@@ -108,6 +108,15 @@ class EvaluationSchema(BaseModel):
     source:   str   # page number, document name, or Task ID
 
 
+class GroundingJudgment(BaseModel):
+    """Structured output for the second-pass grounding judge — verifies that
+    an ``EvaluationSchema`` result's evidence actually supports its status,
+    catching self-contradictory verdicts a single LLM call can produce."""
+
+    grounded: bool
+    reason:   str   # brief explanation, especially when grounded=False
+
+
 class ReviewCheckResult(BaseModel):
     """One evaluated check, with catalog identity attached to its EvaluationSchema result."""
 

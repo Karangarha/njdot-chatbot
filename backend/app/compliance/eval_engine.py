@@ -51,7 +51,7 @@ from app.compliance.cost import CostGapResult
 from app.compliance.edq import EdqCoverageResult
 from app.compliance.geo import RegionResult
 from app.config import config
-from app.models import EvaluationSchema, ReviewCheckResult
+from app.models import EvaluationSchema, GroundingJudgment, ReviewCheckResult
 from app.observability import get_langfuse_client, get_langfuse_handler, new_trace_id
 
 logger = logging.getLogger(__name__)
@@ -74,6 +74,23 @@ what was provided.
 number, narrative text) — keep it concise.
 - source: cite where the evidence came from (e.g. an activity ID, an SP \
 section number, "narrative", or "no data provided").
+"""
+
+_JUDGE_SYSTEM_PROMPT = """\
+You are a strict fact-checker reviewing ONE compliance-check verdict for \
+internal consistency. You will be shown the same evidence the original \
+check saw, the rule being checked, and the verdict that was produced.
+
+Your only job: does the cited evidence actually support the stated status? \
+Look specifically for:
+- A status that contradicts what the evidence itself shows (e.g. dates in \
+the evidence indicate compliance, but status is "Fail").
+- Evidence that does not appear to describe what it claims to (a quote \
+attributed to a document that doesn't match the material shown).
+
+grounded: true if the evidence genuinely supports the status. false if the \
+status contradicts its own evidence, or the evidence looks fabricated.
+reason: one sentence explaining your grounded/not-grounded call.
 """
 
 
@@ -321,6 +338,63 @@ _DETERMINISTIC_EVALUATORS: Dict[str, Callable[[CheckDef, _DeterministicContext],
     "cost_gap": _evaluate_cost_gap_check,
     "edq_coverage": _evaluate_edq_coverage_check,
 }
+
+
+def _usage_from_raw(raw_result: dict) -> Dict[str, int]:
+    """Extract input/output/cached token counts from a structured-output
+    call's raw response — shared by the original check call, the grounding
+    judge, and the corrective retry, all of which return the same
+    ``{"raw": ..., "parsed": ..., "parsing_error": ...}`` shape."""
+    usage = getattr(raw_result.get("raw"), "usage_metadata", None) or {}
+    return {
+        "input_tokens": usage.get("input_tokens", 0) or 0,
+        "output_tokens": usage.get("output_tokens", 0) or 0,
+        "cached_tokens": (usage.get("input_token_details") or {}).get("cache_read", 0) or 0,
+    }
+
+
+def _accumulate_usage(totals: Dict[str, int], call_usage: Dict[str, int]) -> None:
+    """Add one call's token usage into the running totals and bump the call
+    count — shared by every call site in _evaluate_one_check (the original
+    check, the judge, and the retry), so that logic isn't repeated at each."""
+    totals["llm_call_count"] += 1
+    totals["input_tokens"] += call_usage["input_tokens"]
+    totals["output_tokens"] += call_usage["output_tokens"]
+    totals["cached_tokens"] += call_usage["cached_tokens"]
+
+
+def _judge_grounding(
+    check: CheckDef,
+    evidence_blob: str,
+    result: EvaluationSchema,
+    structured_judge_llm: Runnable,
+    invoke_config: dict,
+) -> Tuple[GroundingJudgment, Dict[str, int]]:
+    """Second-pass check: does `result`'s evidence actually support its
+    status? Only called for Pass/Fail verdicts — Missing already means "not
+    enough evidence," nothing to judge. Fails open (grounded=True) if the
+    judge call itself errors, so an unreachable judge never blocks an
+    otherwise-reasonable answer."""
+    judge_msg = (
+        f"{evidence_blob}\n\nCHECK: {check.name}\n{check.instruction}\n\n"
+        f"VERDICT TO REVIEW:\nstatus: {result.status}\n"
+        f"evidence: {result.evidence}\nsource: {result.source}"
+    )
+    try:
+        raw = structured_judge_llm.invoke(
+            [SystemMessage(content=_JUDGE_SYSTEM_PROMPT), HumanMessage(content=judge_msg)],
+            config=invoke_config,
+        )
+        judgment: Optional[GroundingJudgment] = raw.get("parsed")
+        if judgment is None:
+            raise ValueError(f"judge structured output parsing failed: {raw.get('parsing_error')}")
+        return judgment, _usage_from_raw(raw)
+    except Exception:
+        logger.exception("evaluate_checks: grounding judge failed for check %s", check.check_key)
+        return (
+            GroundingJudgment(grounded=True, reason="Judge call failed; not blocking on it."),
+            {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0},
+        )
 
 
 def _evaluate_one_check(
