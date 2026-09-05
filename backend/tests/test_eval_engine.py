@@ -11,7 +11,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from app.compliance.catalog import CheckDef  # noqa: E402
-from app.compliance.eval_engine import _accumulate_usage, _judge_grounding  # noqa: E402
+from app.compliance.eval_engine import _accumulate_usage, _judge_grounding, _retry_with_correction  # noqa: E402
 from app.models import EvaluationSchema, GroundingJudgment  # noqa: E402
 
 
@@ -92,3 +92,31 @@ def test_accumulate_usage_adds_call_and_tokens():
     _accumulate_usage(totals, {"input_tokens": 10, "output_tokens": 3, "cached_tokens": 0})
 
     assert totals == {"input_tokens": 15, "output_tokens": 5, "cached_tokens": 1, "llm_call_count": 2}
+
+
+def test_retry_with_correction_includes_correction_and_returns_parsed():
+    retried = EvaluationSchema(
+        status="Pass", evidence="B1010 starts after ROW available.", source="B1010",
+    )
+    fake_llm = _FakeStructuredLLM([
+        (retried, {"input_tokens": 80, "output_tokens": 15, "input_token_details": {"cache_read": 20}}),
+    ])
+
+    parsed, usage = _retry_with_correction(
+        fake_llm,
+        "original evidence\n\nCHECK: ROW Availability\ninstruction",
+        "dates show compliance, not violation",
+        {},
+    )
+
+    assert parsed is retried
+    assert usage == {"input_tokens": 80, "output_tokens": 15, "cached_tokens": 20}
+    sent_messages = fake_llm.calls[0]
+    assert "dates show compliance" in sent_messages[-1].content
+
+
+def test_retry_with_correction_returns_none_on_error():
+    parsed, usage = _retry_with_correction(_FakeErroringLLM(), "msg", "reason", {})
+
+    assert parsed is None
+    assert usage == {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}

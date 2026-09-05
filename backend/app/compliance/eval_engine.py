@@ -397,6 +397,38 @@ def _judge_grounding(
         )
 
 
+def _retry_with_correction(
+    structured_llm: Runnable,
+    user_msg: str,
+    correction: str,
+    invoke_config: dict,
+) -> Tuple[Optional[EvaluationSchema], Dict[str, int]]:
+    """Re-run the original check once with a corrective note appended, after
+    the first answer failed grounding verification. Returns (None, zeroed
+    usage) if the retry call itself errors — the caller falls back to
+    Missing either way, so a broken retry isn't a crash."""
+    try:
+        raw = structured_llm.invoke(
+            [
+                SystemMessage(content=_STATIC_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+                HumanMessage(
+                    content=f"Your previous answer could not be verified: {correction} "
+                    "Re-examine the evidence above and provide a corrected answer, "
+                    "quoting only text that actually appears in it."
+                ),
+            ],
+            config=invoke_config,
+        )
+        parsed: Optional[EvaluationSchema] = raw.get("parsed")
+        if parsed is None:
+            raise ValueError(f"retry structured output parsing failed: {raw.get('parsing_error')}")
+        return parsed, _usage_from_raw(raw)
+    except Exception:
+        logger.exception("evaluate_checks: grounding retry failed")
+        return None, {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0}
+
+
 def _evaluate_one_check(
     check: CheckDef,
     structured_llm: Runnable,
