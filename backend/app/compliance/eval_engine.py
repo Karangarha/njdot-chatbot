@@ -549,7 +549,7 @@ def _evaluate_one_check(
             source="error",
         )
 
-    if result.status in ("Pass", "Fail"):
+    if config.REVIEW_GROUNDING_JUDGE and result.status in ("Pass", "Fail"):
         judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:judge"}
         judgment, judge_usage = _judge_grounding(check, evidence, result, structured_judge_llm, judge_config)
         _accumulate_usage(usage_totals, judge_usage)

@@ -49,6 +49,13 @@ class Config:
     # tripping provider rate limits.
     REVIEW_CHECK_CONCURRENCY: int = int(os.getenv("REVIEW_CHECK_CONCURRENCY", "8"))
 
+    # Second-pass grounding judge for compliance checks (app.compliance.
+    # eval_engine._evaluate_one_check) — verifies a Pass/Fail verdict's
+    # evidence actually supports it before trusting it, at the cost of extra
+    # LLM calls per check. Set to "false" to disable instantly (no redeploy)
+    # if it misbehaves; each check then falls back to its unjudged first answer.
+    REVIEW_GROUNDING_JUDGE: bool = os.getenv("REVIEW_GROUNDING_JUDGE", "true").lower() == "true"
+
     # Frontend origin for CORS (set to Vercel URL in production)
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")
 

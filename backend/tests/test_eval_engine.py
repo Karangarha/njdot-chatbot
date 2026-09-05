@@ -23,6 +23,7 @@ from app.compliance.eval_engine import (  # noqa: E402
     _judge_grounding,
     _retry_with_correction,
 )
+from app.config import config  # noqa: E402
 from app.models import EvaluationSchema, GroundingJudgment  # noqa: E402
 
 
@@ -192,6 +193,29 @@ def test_evaluate_one_check_grounded_pass_through_status_pass():
     assert usage["ungrounded"] == 0
     assert usage["downgraded"] == 0
     assert len(judge.calls) == 1
+
+
+def test_evaluate_one_check_grounding_judge_can_be_disabled():
+    """config.REVIEW_GROUNDING_JUDGE=False is the rollback toggle: it must
+    skip the judge (and any retry) entirely, regardless of the original
+    verdict, so the check falls back to its unjudged first answer."""
+    check = _make_check()
+    original = EvaluationSchema(status="Fail", evidence="cited evidence", source="schedule")
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([])  # must not be called
+
+    previous = config.REVIEW_GROUNDING_JUDGE
+    config.REVIEW_GROUNDING_JUDGE = False
+    try:
+        result, usage = _call_evaluate_one_check(check, llm, judge)
+    finally:
+        config.REVIEW_GROUNDING_JUDGE = previous
+
+    assert result.status == "Fail"
+    assert result.evidence == "cited evidence"
+    assert usage["llm_call_count"] == 1  # original only, no judge call
+    assert usage["judged"] == 0
+    assert len(judge.calls) == 0
 
 
 def test_evaluate_one_check_ungrounded_retry_succeeds():
