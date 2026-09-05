@@ -92,9 +92,9 @@ attributed to a document that doesn't match the material shown).
 
 A "Pass" that rests on a well-scoped absence (e.g. "searched for water, \
 water main, hydrant, valve — none appear in the evidence") is grounded, \
-provided the search terms are named and the evidence shown is the right \
-material to have searched. Absence of a quote is not the same as a \
-fabricated quote.
+provided the search terms are named, the named terms genuinely do not \
+appear, and the evidence shown is the right material to have searched. \
+Absence of a quote is not the same as a fabricated quote.
 
 grounded: true if the evidence genuinely supports the status. false if the \
 status contradicts its own evidence, or the evidence looks fabricated.
@@ -609,8 +609,10 @@ def evaluate_checks(
     project_id: str = "default",
     user_id: Optional[str] = None,
 ) -> List[ReviewCheckResult]:
-    """Run the batch checklist: one structured-output LLM call per check, up
-    to ``config.REVIEW_CHECK_CONCURRENCY`` running at once.
+    """Run the batch checklist: at least one structured-output LLM call per
+    check (up to 4 — original answer, grounding judge, and a corrective
+    retry plus re-judge if the judge finds it ungrounded), up to
+    ``config.REVIEW_CHECK_CONCURRENCY`` running at once.
 
     Each check's evidence is built from exactly the document(s) named in
     ``check.source_files`` — ``"schedule"`` and ``"narrative"`` are each
@@ -635,9 +637,10 @@ def evaluate_checks(
     order.
 
     Logs a token-usage summary (input/output/total, plus any cached input
-    tokens) to the server console when done — ``include_raw=True`` is needed
-    to see each call's ``usage_metadata``; the plain parsed Pydantic object
-    doesn't carry it.
+    tokens, plus how many checks were judged/ungrounded/downgraded) to the
+    server console when done — ``include_raw=True`` is needed to see each
+    call's ``usage_metadata``; the plain parsed Pydantic object doesn't
+    carry it.
     """
     structured_llm = llm.with_structured_output(EvaluationSchema, include_raw=True)
     structured_judge_llm = llm.with_structured_output(GroundingJudgment, include_raw=True)
@@ -727,7 +730,7 @@ def evaluate_checks(
 
     logger.info(
         "evaluate_checks: %d checks evaluated (%d LLM calls, concurrency=%d) | tokens: %d in "
-        "(%d cached) / %d out / %d total | judge: %d judged, %d ungrounded, %d downgraded",
+        "(%d cached) / %d out / %d total | judge: %d checks judged, %d ungrounded, %d downgraded",
         len(results), llm_call_count, config.REVIEW_CHECK_CONCURRENCY, total_input_tokens,
         total_cached_tokens, total_output_tokens, total_input_tokens + total_output_tokens,
         total_judged, total_ungrounded, total_downgraded,
