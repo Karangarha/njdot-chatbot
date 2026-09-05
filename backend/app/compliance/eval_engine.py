@@ -1,9 +1,11 @@
 """Batch compliance-checklist evaluation engine.
 
 Replaces the retired ``app.compliance.prompt.build_system_prompt`` (one LLM
-call covering all 56 checks, manually parsed from free-text JSON) with a
-per-check LLM call using ``.with_structured_output(EvaluationSchema)`` —
-Pydantic-enforced, no manual JSON parsing.
+call covering all 56 checks, manually parsed from free-text JSON) with
+per-check LLM calls using ``.with_structured_output(EvaluationSchema)`` —
+Pydantic-enforced, no manual JSON parsing. A check can now cost up to 4 LLM
+calls: the original answer, a grounding judge, and — if the judge finds it
+ungrounded — a corrective retry plus a re-judge of that retry.
 
 Each check names the document(s) it needs via ``CheckDef.source_files``
 (any combination of ``"schedule"``, ``"narrative"``, ``"sp"``, ``"keymap"``,
@@ -87,6 +89,12 @@ Look specifically for:
 the evidence indicate compliance, but status is "Fail").
 - Evidence that does not appear to describe what it claims to (a quote \
 attributed to a document that doesn't match the material shown).
+
+A "Pass" that rests on a well-scoped absence (e.g. "searched for water, \
+water main, hydrant, valve — none appear in the evidence") is grounded, \
+provided the search terms are named and the evidence shown is the right \
+material to have searched. Absence of a quote is not the same as a \
+fabricated quote.
 
 grounded: true if the evidence genuinely supports the status. false if the \
 status contradicts its own evidence, or the evidence looks fabricated.
@@ -446,11 +454,16 @@ def _evaluate_one_check(
     user_id: Optional[str],
     langfuse_handler,
 ) -> Tuple[ReviewCheckResult, Dict[str, int]]:
-    """Evaluate a single check and return its result plus that call's token
-    usage. Touches no shared state — safe to run concurrently in a worker
-    thread (see ``evaluate_checks``'s ``ThreadPoolExecutor``).
+    """Evaluate a single check and return its result plus the token usage of
+    all the LLM calls this check made (original answer, plus the grounding
+    judge and any retry/re-judge). Touches no shared state — safe to run
+    concurrently in a worker thread (see ``evaluate_checks``'s
+    ``ThreadPoolExecutor``).
     """
-    usage_totals = {"input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "llm_call_count": 0}
+    usage_totals = {
+        "input_tokens": 0, "output_tokens": 0, "cached_tokens": 0, "llm_call_count": 0,
+        "judged": 0, "ungrounded": 0, "downgraded": 0,
+    }
     sources = check.source_files or ["schedule"]
 
     # "sp"/"keymap"/"estimate" are per-review (only present if that document
@@ -540,8 +553,13 @@ def _evaluate_one_check(
         judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:judge"}
         judgment, judge_usage = _judge_grounding(check, evidence, result, structured_judge_llm, judge_config)
         _accumulate_usage(usage_totals, judge_usage)
+        usage_totals["judged"] = 1
 
         if not judgment.grounded:
+            logger.warning(
+                "evaluate_checks: check %s judged ungrounded (%s)", check.check_key, judgment.reason,
+            )
+            usage_totals["ungrounded"] = 1
             retry_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:retry"}
             retried, retry_usage = _retry_with_correction(structured_llm, user_msg, judgment.reason, retry_config)
             _accumulate_usage(usage_totals, retry_usage)
@@ -558,6 +576,11 @@ def _evaluate_one_check(
                 result = retried
             else:
                 failure_reason = re_judgment.reason if re_judgment is not None else judgment.reason
+                logger.warning(
+                    "evaluate_checks: check %s downgraded to Missing after retry (%s)",
+                    check.check_key, failure_reason,
+                )
+                usage_totals["downgraded"] = 1
                 result = EvaluationSchema(
                     status="Missing",
                     evidence=f"Could not verify grounding after retry: {failure_reason}",
@@ -625,6 +648,9 @@ def evaluate_checks(
     total_output_tokens = 0
     total_cached_tokens = 0
     llm_call_count = 0
+    total_judged = 0
+    total_ungrounded = 0
+    total_downgraded = 0
     # Each computed once; shared verbatim across every check requesting it,
     # so checks with the same source_files set get an identical, cacheable
     # prefix.
@@ -681,6 +707,9 @@ def evaluate_checks(
                 total_output_tokens += usage["output_tokens"]
                 total_cached_tokens += usage["cached_tokens"]
                 llm_call_count += usage["llm_call_count"]
+                total_judged += usage["judged"]
+                total_ungrounded += usage["ungrounded"]
+                total_downgraded += usage["downgraded"]
 
         if review_span is not None:
             try:
@@ -698,8 +727,9 @@ def evaluate_checks(
 
     logger.info(
         "evaluate_checks: %d checks evaluated (%d LLM calls, concurrency=%d) | tokens: %d in "
-        "(%d cached) / %d out / %d total",
+        "(%d cached) / %d out / %d total | judge: %d judged, %d ungrounded, %d downgraded",
         len(results), llm_call_count, config.REVIEW_CHECK_CONCURRENCY, total_input_tokens,
         total_cached_tokens, total_output_tokens, total_input_tokens + total_output_tokens,
+        total_judged, total_ungrounded, total_downgraded,
     )
     return results

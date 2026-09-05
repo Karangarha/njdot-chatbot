@@ -1,4 +1,9 @@
-"""Tests for the grounding-judge second-pass check in eval_engine.py."""
+"""Tests for the grounding-judge second-pass check in eval_engine.py.
+
+Runnable two ways:
+    python tests/test_eval_engine.py
+    python -m pytest tests/test_eval_engine.py
+"""
 
 from __future__ import annotations
 
@@ -149,7 +154,7 @@ def _call_evaluate_one_check(check, structured_llm, structured_judge_llm, **over
 
 def test_evaluate_one_check_grounded_pass_through():
     check = _make_check()
-    original = EvaluationSchema(status="Fail", evidence="fabricated", source="schedule")
+    original = EvaluationSchema(status="Fail", evidence="cited evidence", source="schedule")
     llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
     judge = _FakeStructuredLLM([
         (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
@@ -158,8 +163,34 @@ def test_evaluate_one_check_grounded_pass_through():
     result, usage = _call_evaluate_one_check(check, llm, judge)
 
     assert result.status == "Fail"
-    assert result.evidence == "fabricated"
+    assert result.evidence == "cited evidence"
     assert usage["llm_call_count"] == 2  # original + judge
+    assert usage["judged"] == 1
+    assert usage["ungrounded"] == 0
+    assert usage["downgraded"] == 0
+    assert len(judge.calls) == 1
+
+
+def test_evaluate_one_check_grounded_pass_through_status_pass():
+    """Same as test_evaluate_one_check_grounded_pass_through but for a
+    status="Pass" original verdict — the judge condition is
+    ``if result.status in ("Pass", "Fail")``, so Pass must be judged too,
+    not just Fail."""
+    check = _make_check()
+    original = EvaluationSchema(status="Pass", evidence="cited evidence", source="schedule")
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    result, usage = _call_evaluate_one_check(check, llm, judge)
+
+    assert result.status == "Pass"
+    assert result.evidence == "cited evidence"
+    assert usage["llm_call_count"] == 2  # original + judge
+    assert usage["judged"] == 1
+    assert usage["ungrounded"] == 0
+    assert usage["downgraded"] == 0
     assert len(judge.calls) == 1
 
 
@@ -181,6 +212,9 @@ def test_evaluate_one_check_ungrounded_retry_succeeds():
     assert result.status == "Pass"
     assert result.evidence == "B1010 starts after ROW available"
     assert usage["llm_call_count"] == 4  # original + judge + retry + re-judge
+    assert usage["judged"] == 1
+    assert usage["ungrounded"] == 1
+    assert usage["downgraded"] == 0
 
 
 def test_evaluate_one_check_ungrounded_retry_still_fails():
@@ -201,6 +235,10 @@ def test_evaluate_one_check_ungrounded_retry_still_fails():
     assert result.status == "Missing"
     assert "still contradicts dates" in result.evidence
     assert result.source == "grounding verification failed"
+    assert usage["llm_call_count"] == 4  # original + judge + retry + re-judge
+    assert usage["judged"] == 1
+    assert usage["ungrounded"] == 1
+    assert usage["downgraded"] == 1
 
 
 def test_evaluate_one_check_missing_status_skips_judge():
@@ -213,6 +251,9 @@ def test_evaluate_one_check_missing_status_skips_judge():
 
     assert result.status == "Missing"
     assert usage["llm_call_count"] == 1
+    assert usage["judged"] == 0
+    assert usage["ungrounded"] == 0
+    assert usage["downgraded"] == 0
     assert len(judge.calls) == 0
 
 
@@ -248,4 +289,22 @@ def test_evaluate_one_check_retry_call_fails_entirely():
     assert result.source == "grounding verification failed"
     assert "dates show compliance" in result.evidence
     assert usage["llm_call_count"] == 3  # original + judge + failed retry attempt
+    assert usage["judged"] == 1
+    assert usage["ungrounded"] == 1
+    assert usage["downgraded"] == 1
     assert len(judge.calls) == 1  # no re-judge, since the retry never produced an answer
+
+
+if __name__ == "__main__":
+    failures = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except Exception as exc:  # noqa: BLE001
+                failures += 1
+                print(f"FAIL {name}: {exc}")
+    total = sum(1 for n in globals() if n.startswith("test_"))
+    print(f"\n{total - failures}/{total} passed")
+    sys.exit(1 if failures else 0)
