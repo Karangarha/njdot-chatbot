@@ -432,6 +432,7 @@ def _retry_with_correction(
 def _evaluate_one_check(
     check: CheckDef,
     structured_llm: Runnable,
+    structured_judge_llm: Runnable,
     schedule_facts: str,
     narrative_text: str,
     sp_search_fn: Optional[Callable[[str], str]],
@@ -523,11 +524,7 @@ def _evaluate_one_check(
             [SystemMessage(content=_STATIC_SYSTEM_PROMPT), HumanMessage(content=user_msg)],
             config=invoke_config,
         )
-        usage_totals["llm_call_count"] = 1
-        usage = getattr(raw_result.get("raw"), "usage_metadata", None) or {}
-        usage_totals["input_tokens"] = usage.get("input_tokens", 0) or 0
-        usage_totals["output_tokens"] = usage.get("output_tokens", 0) or 0
-        usage_totals["cached_tokens"] = (usage.get("input_token_details") or {}).get("cache_read", 0) or 0
+        _accumulate_usage(usage_totals, _usage_from_raw(raw_result))
 
         result: Optional[EvaluationSchema] = raw_result.get("parsed")
         if result is None:
@@ -538,6 +535,34 @@ def _evaluate_one_check(
             status="Missing", evidence="Evaluation failed due to an internal error.",
             source="error",
         )
+
+    if result.status in ("Pass", "Fail"):
+        judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:judge"}
+        judgment, judge_usage = _judge_grounding(check, evidence, result, structured_judge_llm, judge_config)
+        _accumulate_usage(usage_totals, judge_usage)
+
+        if not judgment.grounded:
+            retry_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:retry"}
+            retried, retry_usage = _retry_with_correction(structured_llm, user_msg, judgment.reason, retry_config)
+            _accumulate_usage(usage_totals, retry_usage)
+
+            re_judgment = None
+            if retried is not None:
+                re_judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:rejudge"}
+                re_judgment, re_judge_usage = _judge_grounding(
+                    check, evidence, retried, structured_judge_llm, re_judge_config,
+                )
+                _accumulate_usage(usage_totals, re_judge_usage)
+
+            if retried is not None and re_judgment is not None and re_judgment.grounded:
+                result = retried
+            else:
+                failure_reason = re_judgment.reason if re_judgment is not None else judgment.reason
+                result = EvaluationSchema(
+                    status="Missing",
+                    evidence=f"Could not verify grounding after retry: {failure_reason}",
+                    source="grounding verification failed",
+                )
 
     return ReviewCheckResult(
         id=check.check_key, category=check.category, name=check.name,
@@ -592,6 +617,7 @@ def evaluate_checks(
     doesn't carry it.
     """
     structured_llm = llm.with_structured_output(EvaluationSchema, include_raw=True)
+    structured_judge_llm = llm.with_structured_output(GroundingJudgment, include_raw=True)
     deterministic_ctx = _DeterministicContext(
         keymap_geo=keymap_geo, cost_gap=cost_gap, edq_coverage=edq_coverage,
     )
@@ -639,7 +665,8 @@ def evaluate_checks(
         with ThreadPoolExecutor(max_workers=config.REVIEW_CHECK_CONCURRENCY) as executor:
             future_to_index = {
                 executor.submit(
-                    _evaluate_one_check, check, structured_llm, schedule_facts, narrative_text,
+                    _evaluate_one_check, check, structured_llm, structured_judge_llm,
+                    schedule_facts, narrative_text,
                     sp_search_fn, spec_search_fn, csm_search_fn, keymap_facts, estimate_facts,
                     utility_plan_search_fn,
                     deterministic_ctx, project_id, user_id, langfuse_handler,
