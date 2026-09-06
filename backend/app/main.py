@@ -64,7 +64,7 @@ app = FastAPI(
 _allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
-    "https://cm-chatbot-corral.vercel.app",
+    "https://cm-chatbot-coral.vercel.app",
     "https://cm-smart-assistant.vercel.app",
 ]
 
