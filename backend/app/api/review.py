@@ -840,8 +840,10 @@ def _run_review_pipeline(
     ),
 )
 async def review_endpoint(
-    schedule_file: UploadFile = File(..., description="CPM schedule XER file"),
-    narrative_pdf: UploadFile = File(..., description="Project narrative PDF"),
+    schedule_file: Optional[UploadFile] = File(
+        None, description="CPM schedule XER file. Omit if schedule_file_path is given."),
+    narrative_pdf: Optional[UploadFile] = File(
+        None, description="Project narrative PDF. Omit if narrative_pdf_path is given."),
     special_provision_pdf: Optional[UploadFile] = File(
         None, description="Optional Special Provision PDF"),
     key_map_pdf: Optional[UploadFile] = File(
@@ -851,6 +853,24 @@ async def review_endpoint(
     utility_plan_pdfs: Optional[List[UploadFile]] = File(
         None, description="Optional Utility Agreement Plan sheet PDFs -- one per utility "
                            "(gas, water/sewer, electric, telecom, ...)."),
+    schedule_file_path: Optional[str] = Form(
+        None, description="Storage path of a schedule file already uploaded directly to "
+                           "Supabase Storage by a signed-in client, in place of schedule_file "
+                           "-- bypasses Vercel's fixed 4.5MB serverless request-body limit."),
+    narrative_pdf_path: Optional[str] = Form(
+        None, description="Storage path in place of narrative_pdf. See schedule_file_path."),
+    special_provision_pdf_path: Optional[str] = Form(
+        None, description="Storage path in place of special_provision_pdf."),
+    key_map_pdf_path: Optional[str] = Form(
+        None, description="Storage path in place of key_map_pdf."),
+    estimate_pdf_path: Optional[str] = Form(
+        None, description="Storage path in place of estimate_pdf."),
+    utility_plan_pdf_paths: Optional[str] = Form(
+        None, description="JSON array of Storage paths, parallel to utility_plan_pdfs."),
+    project_id: Optional[str] = Form(
+        None, description="Client-generated id to reuse as the Storage path prefix for the "
+                           "*_path fields above. Required when using them; ignored otherwise "
+                           "(a fresh one is minted)."),
     checks: Optional[str] = Form(
         None,
         description="Optional JSON array of the checks to run "
@@ -864,50 +884,99 @@ async def review_endpoint(
 
     Usable signed-out (``authorization`` absent or invalid just means the
     review isn't persisted to Storage — see ``user_id_from_token_optional``).
-    Generates the ``project_id`` that fences this review's Neo4j data and,
-    for signed-in callers, doubles as the Storage path prefix and the
-    ``review_projects.id`` the frontend inserts under (backend-led upload —
-    the frontend never talks to Storage directly, avoiding a double upload
-    of the same file bytes).
+
+    Two ways to supply files, chosen per-document by which field is set:
+
+    - Raw upload (``schedule_file``, ``narrative_pdf``, ...): the original
+      path. This endpoint reads the bytes and — for signed-in callers —
+      uploads them to Storage itself. The only option for a signed-out
+      caller, since there's no stable per-user Storage path to write to.
+      Still subject to Vercel's 4.5MB request-body limit.
+    - Pre-uploaded path (``schedule_file_path``, ``narrative_pdf_path``,
+      ...): for a signed-in caller that already uploaded the file straight
+      to Storage from the browser (bypassing this function's request body
+      entirely). Requires ``project_id`` — the caller-generated id used as
+      the Storage path prefix it uploaded under, reused here as the
+      ``review_projects.id`` / Neo4j ``projectId`` so the two agree.
+
+    ``schedule_file``/``narrative_pdf`` are required in the raw-upload case;
+    ``schedule_file_path``/``narrative_pdf_path`` are required in the
+    pre-uploaded case. Mixing the two for the same document is not supported.
     """
     selected_checks = _parse_checks(checks)
-    project_id = str(uuid.uuid4())
-
-    try:
-        schedule_bytes = await schedule_file.read()
-        narrative_bytes = await narrative_pdf.read()
-        sp_bytes = await special_provision_pdf.read() if special_provision_pdf else None
-        keymap_bytes = await key_map_pdf.read() if key_map_pdf else None
-        estimate_bytes = await estimate_pdf.read() if estimate_pdf else None
-        utility_plan_bytes_list = [await f.read() for f in (utility_plan_pdfs or [])]
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to read uploaded files: {exc}") from exc
-
     user_id = user_id_from_token_optional(authorization)
-    schedule_path = narrative_path = sp_path = keymap_path = estimate_path = None
-    if user_id:
+    using_stored_paths = bool(schedule_file_path or narrative_pdf_path)
+
+    if using_stored_paths:
+        if not user_id:
+            raise HTTPException(status_code=400, detail="*_path fields require a signed-in session.")
+        if not project_id:
+            raise HTTPException(status_code=400, detail="project_id is required when using *_path fields.")
+        if not schedule_file_path or not narrative_pdf_path:
+            raise HTTPException(
+                status_code=400,
+                detail="schedule_file_path and narrative_pdf_path are both required.",
+            )
         try:
             db = get_db()
             bucket = db.storage.from_(_STORAGE_BUCKET)
-            base = f"{user_id}/{project_id}"
-            schedule_path = f"{base}/schedule.xer"
-            bucket.upload(schedule_path, schedule_bytes, {"upsert": "true"})
-            narrative_path = f"{base}/narrative.pdf"
-            bucket.upload(narrative_path, narrative_bytes, {"upsert": "true"})
-            if sp_bytes:
-                sp_path = f"{base}/special_provision.pdf"
-                bucket.upload(sp_path, sp_bytes, {"upsert": "true"})
-            if keymap_bytes:
-                keymap_path = f"{base}/key_map.pdf"
-                bucket.upload(keymap_path, keymap_bytes, {"upsert": "true"})
-            if estimate_bytes:
-                estimate_path = f"{base}/estimate.pdf"
-                bucket.upload(estimate_path, estimate_bytes, {"upsert": "true"})
-        except Exception:
-            # Best-effort — "Re-run" just won't be offered for this project;
-            # the review itself should still succeed.
-            logger.exception("Failed to persist review files to Storage for project_id=%s", project_id)
-            schedule_path = narrative_path = sp_path = keymap_path = estimate_path = None
+            schedule_bytes = bucket.download(schedule_file_path)
+            narrative_bytes = bucket.download(narrative_pdf_path)
+            sp_bytes = bucket.download(special_provision_pdf_path) if special_provision_pdf_path else None
+            keymap_bytes = bucket.download(key_map_pdf_path) if key_map_pdf_path else None
+            estimate_bytes = bucket.download(estimate_pdf_path) if estimate_pdf_path else None
+            utility_plan_bytes_list = [
+                bucket.download(p)
+                for p in (json.loads(utility_plan_pdf_paths) if utility_plan_pdf_paths else [])
+            ]
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to fetch stored files: {exc}") from exc
+        schedule_path, narrative_path = schedule_file_path, narrative_pdf_path
+        sp_path, keymap_path, estimate_path = (
+            special_provision_pdf_path, key_map_pdf_path, estimate_pdf_path,
+        )
+    else:
+        if not schedule_file or not narrative_pdf:
+            raise HTTPException(
+                status_code=400,
+                detail="schedule_file and narrative_pdf are required "
+                       "(either as files, or as schedule_file_path/narrative_pdf_path).",
+            )
+        project_id = project_id or str(uuid.uuid4())
+        try:
+            schedule_bytes = await schedule_file.read()
+            narrative_bytes = await narrative_pdf.read()
+            sp_bytes = await special_provision_pdf.read() if special_provision_pdf else None
+            keymap_bytes = await key_map_pdf.read() if key_map_pdf else None
+            estimate_bytes = await estimate_pdf.read() if estimate_pdf else None
+            utility_plan_bytes_list = [await f.read() for f in (utility_plan_pdfs or [])]
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Failed to read uploaded files: {exc}") from exc
+
+        schedule_path = narrative_path = sp_path = keymap_path = estimate_path = None
+        if user_id:
+            try:
+                db = get_db()
+                bucket = db.storage.from_(_STORAGE_BUCKET)
+                base = f"{user_id}/{project_id}"
+                schedule_path = f"{base}/schedule.xer"
+                bucket.upload(schedule_path, schedule_bytes, {"upsert": "true"})
+                narrative_path = f"{base}/narrative.pdf"
+                bucket.upload(narrative_path, narrative_bytes, {"upsert": "true"})
+                if sp_bytes:
+                    sp_path = f"{base}/special_provision.pdf"
+                    bucket.upload(sp_path, sp_bytes, {"upsert": "true"})
+                if keymap_bytes:
+                    keymap_path = f"{base}/key_map.pdf"
+                    bucket.upload(keymap_path, keymap_bytes, {"upsert": "true"})
+                if estimate_bytes:
+                    estimate_path = f"{base}/estimate.pdf"
+                    bucket.upload(estimate_path, estimate_bytes, {"upsert": "true"})
+            except Exception:
+                # Best-effort — "Re-run" just won't be offered for this project;
+                # the review itself should still succeed.
+                logger.exception("Failed to persist review files to Storage for project_id=%s", project_id)
+                schedule_path = narrative_path = sp_path = keymap_path = estimate_path = None
 
     result = _run_review_pipeline(
         schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,

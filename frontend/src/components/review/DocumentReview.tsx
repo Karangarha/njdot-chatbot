@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import { API_BASE } from '@/lib/api'
 import { createClient } from '@/lib/supabase/client'
 import jsPDF from 'jspdf'
 import autoTable from 'jspdf-autotable'
@@ -54,9 +55,9 @@ interface DocumentReviewProps {
   onNewReview?: () => void
 }
 
-// ── Constants ──────────────────────────────────────────────────────────────────
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+// Must match backend/app/api/review.py's _STORAGE_BUCKET.
+const STORAGE_BUCKET = 'review-files'
 
 // The checklist (backend/app/compliance/catalog.py) is mostly uncategorized —
 // only checks the source NJDOT document actually nests under one parent line
@@ -405,12 +406,48 @@ export default function DocumentReview({
       }
 
       const reviewForm = new FormData()
-      reviewForm.append('schedule_file', scheduleFile)
-      reviewForm.append('narrative_pdf', narrativeFile)
-      if (spFile) reviewForm.append('special_provision_pdf', spFile)
-      if (keyMapFile) reviewForm.append('key_map_pdf', keyMapFile)
-      if (estimateFile) reviewForm.append('estimate_pdf', estimateFile)
-      utilityPlanFiles.forEach(f => reviewForm.append('utility_plan_pdfs', f))
+
+      if (userId) {
+        // Signed in: upload files straight to Storage from the browser and
+        // send only their paths. A real project's combined PDFs (Special
+        // Provisions alone is often 50-100+ pages) can exceed Vercel's fixed
+        // 4.5MB serverless request-body limit -- which the platform enforces
+        // *before* the app runs, so the rejection carries no CORS headers and
+        // shows up in the browser as a misleading "blocked by CORS policy"
+        // error rather than the real 413 FUNCTION_PAYLOAD_TOO_LARGE.
+        const projectId = crypto.randomUUID()
+        const base = `${userId}/${projectId}`
+        const uploadOne = async (file: File, name: string) => {
+          const path = `${base}/${name}`
+          const { error } = await sb.storage.from(STORAGE_BUCKET).upload(path, file, { upsert: true })
+          if (error) throw new Error(`Failed to upload ${name}: ${error.message}`)
+          return path
+        }
+
+        reviewForm.append('project_id', projectId)
+        reviewForm.append('schedule_file_path', await uploadOne(scheduleFile, 'schedule.xer'))
+        reviewForm.append('narrative_pdf_path', await uploadOne(narrativeFile, 'narrative.pdf'))
+        if (spFile) reviewForm.append('special_provision_pdf_path', await uploadOne(spFile, 'special_provision.pdf'))
+        if (keyMapFile) reviewForm.append('key_map_pdf_path', await uploadOne(keyMapFile, 'key_map.pdf'))
+        if (estimateFile) reviewForm.append('estimate_pdf_path', await uploadOne(estimateFile, 'estimate.pdf'))
+        if (utilityPlanFiles.length > 0) {
+          const utilityPaths: string[] = []
+          for (let i = 0; i < utilityPlanFiles.length; i++) {
+            utilityPaths.push(await uploadOne(utilityPlanFiles[i], `utility_plan_${i}.pdf`))
+          }
+          reviewForm.append('utility_plan_pdf_paths', JSON.stringify(utilityPaths))
+        }
+      } else {
+        // Signed out: no stable per-user Storage path to upload to, so fall
+        // back to sending the raw files through the API as before -- still
+        // subject to the payload limit, same as pre-existing behavior.
+        reviewForm.append('schedule_file', scheduleFile)
+        reviewForm.append('narrative_pdf', narrativeFile)
+        if (spFile) reviewForm.append('special_provision_pdf', spFile)
+        if (keyMapFile) reviewForm.append('key_map_pdf', keyMapFile)
+        if (estimateFile) reviewForm.append('estimate_pdf', estimateFile)
+        utilityPlanFiles.forEach(f => reviewForm.append('utility_plan_pdfs', f))
+      }
       if (specs.length > 0) reviewForm.append('checks', JSON.stringify(specs))
 
       // /api/review already chunks, embeds, and stores the schedule/narrative/SP
