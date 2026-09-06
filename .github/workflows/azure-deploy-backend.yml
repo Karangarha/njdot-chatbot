@@ -1,48 +1,40 @@
-# Deploys backend/ to an Azure App Service Web App on every push to main
-# that touches the backend. Adapted from GitHub's official Python-to-Azure-
-# App-Service template for this repo's monorepo layout (the app lives in
-# backend/, not the repo root).
+# Deploys backend/ to the Azure App Service Web App "NJDOT" on every push to
+# main that touches the backend. Adapted from GitHub's official Python-to-
+# Azure-App-Service template for this repo's monorepo layout (the app lives
+# in backend/, not the repo root).
 #
-# Uses OIDC (azure/login), not a publish profile: the ARM template used to
-# create NJ-DoT-Backend disables basic publishing credentials entirely
-# (basicPublishingCredentialsPolicies -> allow: false for both scm and ftp),
-# so a publish-profile secret can never authenticate against this Web App —
-# confirmed by a real run failing with "No credentials found. Add an Azure
-# login action before this action." That template also created a user-
-# assigned managed identity (NJ-DoT-Backend-id-9941) with a federated
-# credential trusting `repo:Karangarha/njdot-chatbot:ref:refs/heads/main`
-# and granted it Website Contributor on the site — azure/login below
-# exchanges GitHub's OIDC token for that identity's Azure credentials.
+# Uses a publish profile, not OIDC: OIDC needs an Azure AD App Registration /
+# Managed Identity, which a school/EDU Azure tenant commonly blocks regular
+# users from creating or viewing — confirmed blocked on this account. NJDOT
+# has `adminEnabled: true` (basic publishing credentials on), so a publish
+# profile downloads and works with no Azure AD permissions needed.
 #
 # One-time setup required before this workflow can succeed:
-#   1. Azure Portal -> Managed Identities -> NJ-DoT-Backend-id-9941 ->
-#      Overview -> copy the Client ID and Tenant ID (or:
-#        az identity show --resource-group NJ-Dot --name NJ-DoT-Backend-id-9941 --query "{clientId:clientId,tenantId:tenantId}"
-#      ). Add them as GitHub Actions secrets: AZURE_CLIENT_ID, AZURE_TENANT_ID.
-#      AZURE_SUBSCRIPTION_ID is 1ecbbd38-e38e-4b81-b922-14e1736912e2 (from the
-#      deployment parameters) -- add that as a secret too, for consistency
-#      with the other two (it isn't sensitive on its own, just an id).
-#   2. Azure Portal -> NJ-DoT-Backend -> Configuration -> General settings ->
+#   1. Azure Portal -> NJDOT -> Overview -> "Download publish profile" (or:
+#        az webapp deployment list-publishing-profiles --resource-group NJ-Dot-Backend --name NJDOT --xml
+#      ). Add the full XML contents as a GitHub Actions secret named
+#      AZURE_WEBAPP_PUBLISH_PROFILE (repo Settings -> Secrets and variables
+#      -> Actions -> New repository secret).
+#   2. Azure Portal -> NJDOT -> Environment variables -> General settings ->
 #      Startup Command:
 #        uvicorn app.main:app --host 0.0.0.0 --port 8000
-#   3. Azure Portal -> NJ-DoT-Backend -> Configuration -> Application settings
-#      -> add every variable backend/app/config.py reads: SUPABASE_URL,
+#   3. Azure Portal -> NJDOT -> Environment variables -> App settings -> add
+#      every variable backend/app/config.py reads: SUPABASE_URL,
 #      SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,
 #      NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE,
 #      SUPABASE_JWT_SECRET, FRONTEND_URL (copy values from the current
-#      Vercel backend project) -- SCM_DO_BUILD_DURING_DEPLOYMENT=1 is already
-#      set by the ARM template.
-#   4. Consider setting alwaysOn to true (Portal -> Configuration -> General
-#      settings) -- the ARM template deployed it as false, so the app can
-#      idle out and cold-start on the next request; Basic tier supports
-#      Always On at no extra cost.
+#      Vercel backend project), plus SCM_DO_BUILD_DURING_DEPLOYMENT=1 so
+#      Azure's Oryx builder installs requirements.txt server-side.
+#   4. Consider setting alwaysOn to true (same page, General settings) — it's
+#      currently false, so the app can idle out and cold-start on the next
+#      request; Basic tier supports Always On at no extra cost.
 #   5. Once live, update the frontend's NEXT_PUBLIC_API_URL (Vercel project
-#      settings) to this Web App's URL.
+#      settings) to https://njdot-f2f6a4baaedyhbfx.eastus-01.azurewebsites.net
 
 name: Deploy backend to Azure Web App
 
 env:
-  AZURE_WEBAPP_NAME: NJ-DoT-Backend
+  AZURE_WEBAPP_NAME: NJDOT
   PYTHON_VERSION: '3.13'
 
 on:
@@ -53,10 +45,6 @@ on:
       - 'backend/**'
       - '.github/workflows/azure-deploy-backend.yml'
   workflow_dispatch: {}   # allows a manual re-deploy from the Actions tab
-
-permissions:
-  id-token: write   # required for azure/login's OIDC token exchange
-  contents: read
 
 jobs:
   build:
@@ -104,15 +92,9 @@ jobs:
           name: backend-app
           path: .
 
-      - name: Azure login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
       - name: Deploy to Azure Web App
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
