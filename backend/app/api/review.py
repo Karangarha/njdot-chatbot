@@ -128,6 +128,20 @@ def _set_review_progress(project_id: str, **kwargs: Any) -> None:
     _review_progress[project_id] = {**_review_progress.get(project_id, {}), **kwargs}
 
 
+def _validate_owned_path(path: str, user_id: str) -> None:
+    """Raises 403 unless `path`'s first segment is exactly `user_id` and
+    no segment is empty, '.', or '..'. A plain `path.startswith(f"{user_id}/")`
+    check is NOT sufficient: storage3 (the Supabase Storage client) builds
+    its request URL via yarl's URL.joinpath, which collapses '..' segments
+    per normal URL-path resolution -- "attacker/../victim/p/x" passes a
+    startswith("attacker/") check as a string but resolves on the wire to
+    ".../victim/p/x". Splitting into segments and rejecting '.'/'..'
+    anywhere closes that."""
+    parts = path.split("/")
+    if not parts or parts[0] != user_id or any(p in ("", ".", "..") for p in parts):
+        raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
+
+
 @router.get("/review/{project_id}/status", summary="Stream review progress via SSE")
 async def review_status(project_id: str, token: Optional[str] = None) -> StreamingResponse:
     """Server-Sent Events stream of a review's progress.
@@ -861,7 +875,7 @@ def _run_review_pipeline(
         )
     except Exception as exc:
         logger.exception("Compliance evaluation failed")
-        raise HTTPException(status_code=502, detail=f"Compliance evaluation failed: {exc}") from exc
+        raise HTTPException(status_code=502, detail="Compliance evaluation failed.") from exc
 
     response = ReviewResponse(
         project_id=project_id,
@@ -1066,13 +1080,12 @@ async def review_endpoint(
                 status_code=400,
                 detail="schedule_file_path and narrative_pdf_path are both required.",
             )
-        _owned_prefix = f"{user_id}/"
         for _path in (
             schedule_file_path, narrative_pdf_path, special_provision_pdf_path,
             key_map_pdf_path, estimate_pdf_path,
         ):
-            if _path and not _path.startswith(_owned_prefix):
-                raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
+            if _path:
+                _validate_owned_path(_path, user_id)
         try:
             db = get_db()
             bucket = db.storage.from_(_STORAGE_BUCKET)
@@ -1083,8 +1096,7 @@ async def review_endpoint(
             estimate_bytes = bucket.download(estimate_pdf_path) if estimate_pdf_path else None
             utility_plan_paths_list = json.loads(utility_plan_pdf_paths) if utility_plan_pdf_paths else []
             for _p in utility_plan_paths_list:
-                if not _p.startswith(_owned_prefix):
-                    raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
+                _validate_owned_path(_p, user_id)
             utility_plan_bytes_list = [bucket.download(p) for p in utility_plan_paths_list]
         except HTTPException:
             raise
@@ -1102,6 +1114,8 @@ async def review_endpoint(
                        "(either as files, or as schedule_file_path/narrative_pdf_path).",
             )
         project_id = project_id or str(uuid.uuid4())
+        if not project_id or "/" in project_id or project_id in (".", ".."):
+            raise HTTPException(status_code=400, detail="Invalid project_id.")
         try:
             schedule_bytes = await schedule_file.read()
             narrative_bytes = await narrative_pdf.read()
@@ -1238,6 +1252,9 @@ async def review_rerun_endpoint(
             status_code=400,
             detail="Original files for this review are not available — re-upload once to enable re-run.",
         )
+    for _path in (schedule_path, narrative_path, sp_path, keymap_path, estimate_path):
+        if _path:
+            _validate_owned_path(_path, user_id)
 
     try:
         bucket = db.storage.from_(_STORAGE_BUCKET)
@@ -1290,6 +1307,7 @@ async def review_pdf_endpoint(
     path = row.get(column)
     if not path:
         raise HTTPException(status_code=404, detail=f"No {doc_type} PDF stored for this review")
+    _validate_owned_path(path, user_id)
 
     try:
         bucket = db.storage.from_(_STORAGE_BUCKET)

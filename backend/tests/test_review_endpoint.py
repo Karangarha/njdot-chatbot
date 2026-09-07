@@ -265,7 +265,16 @@ def test_stored_paths_decodes_utility_plan_path_list():
 def test_stored_paths_rejects_project_id_owned_by_another_review_in_memory():
     """Fix D (final-review-fixes-3-brief.md): the ownership check must also
     cover the stored-paths branch, not just raw-upload -- this is the branch
-    every signed-in client's normal flow actually uses."""
+    every signed-in client's normal flow actually uses.
+
+    Asserts on the specific detail text (not just the 403 status): this
+    test's paths are "u1/p1/..." under caller "attacker-456", which Fix
+    H's NEW path-ownership check would ALSO 403 (path doesn't start with
+    "attacker-456/") -- so a bare status-code assertion would keep passing
+    even if Fix D's project_id ownership check were deleted entirely.
+    Fix D's message ("belongs to another review") is distinct from Fix H's
+    ("does not belong to you"), so this pins down which check actually
+    fired."""
     _review_progress.clear()
     _review_progress["p1"] = {"status": "running", "user_id": "owner-123"}
     try:
@@ -279,6 +288,7 @@ def test_stored_paths_rejects_project_id_owned_by_another_review_in_memory():
                 assert False, "Should have raised HTTPException"
             except HTTPException as e:
                 assert e.status_code == 403
+                assert "belongs to another review" in e.detail
     finally:
         _review_progress.clear()
 
@@ -286,7 +296,11 @@ def test_stored_paths_rejects_project_id_owned_by_another_review_in_memory():
 def test_stored_paths_rejects_project_id_owned_by_another_review_via_db():
     """Same hijack, but for a project_id that finished (and dropped out of
     the in-memory dict, e.g. after a process restart) -- the ownership check
-    must also fall back to the review_projects table."""
+    must also fall back to the review_projects table.
+
+    Asserts on the specific detail text -- see the in-memory variant above
+    for why a bare status-code assertion is too weak now that Fix H's path
+    check would ALSO 403 this same "u1/p1/..." vs "attacker-456" combination."""
     _review_progress.clear()
     try:
         with patch("app.api.review.user_id_from_token_optional", return_value="attacker-456"), \
@@ -300,6 +314,7 @@ def test_stored_paths_rejects_project_id_owned_by_another_review_via_db():
                 assert False, "Should have raised HTTPException"
             except HTTPException as e:
                 assert e.status_code == 403
+                assert "belongs to another review" in e.detail
     finally:
         _review_progress.clear()
 
@@ -375,6 +390,51 @@ def test_stored_paths_rejects_mismatched_special_provision_path():
                 assert e.status_code == 403
     finally:
         _review_progress.clear()
+
+
+def test_stored_paths_rejects_dotdot_traversal_disguised_as_own_prefix():
+    """Fix H (final-review-fixes-5-brief.md): a naive `startswith(user_id +
+    "/")` check is bypassable -- storage3 builds its request URL via yarl's
+    URL.joinpath, which COLLAPSES '..' segments per normal URL-path
+    resolution. "user-1/../victim/p/schedule.xer" passes
+    startswith("user-1/") as a plain string, but resolves on the wire to
+    victim's file. _validate_owned_path must reject it by segment, not by
+    prefix string."""
+    _review_progress.clear()
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+             patch("app.api.review.get_db", return_value=_FakeDB()):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="user-1/../victim/p/schedule.xer",
+                    narrative_pdf_path="user-1/p9/narrative.pdf",
+                    project_id="p9",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_raw_upload_rejects_project_id_containing_path_traversal():
+    """Fix H step 3 (final-review-fixes-5-brief.md): the raw-upload branch
+    interpolates project_id directly into the Storage upload path
+    (f"{user_id}/{project_id}"). user_id is trusted (from the verified JWT)
+    but project_id is caller-controlled -- a project_id containing '../'
+    segments could redirect the upload to overwrite a DIFFERENT user's
+    files. project_id must be a single opaque segment, never a path."""
+    with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+         patch("app.api.review.get_db", return_value=_FakeDB()):
+        try:
+            _run(_call_review_endpoint(
+                schedule_file=_FakeUploadFile(b"XER-BYTES"),
+                narrative_pdf=_FakeUploadFile(b"NARRATIVE-BYTES"),
+                project_id="../victim/proj",
+            ))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 400
 
 
 # ── Raw-upload branch (unchanged behavior, now explicitly validated) ────────

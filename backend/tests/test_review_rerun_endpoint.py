@@ -102,8 +102,8 @@ ROW = {
     "id": "p1",
     "user_id": "user-1",
     "project_name": "Old Name",
-    "schedule_file_path": "u1/p1/schedule.xer",
-    "narrative_pdf_path": "u1/p1/narrative.pdf",
+    "schedule_file_path": "user-1/p1/schedule.xer",
+    "narrative_pdf_path": "user-1/p1/narrative.pdf",
     "special_provision_pdf_path": None,
     "key_map_pdf_path": None,
     "estimate_pdf_path": None,
@@ -113,7 +113,7 @@ ROW = {
 
 
 def test_rerun_returns_processing_and_schedules_background():
-    db = _FakeDB(ROW, downloads={"u1/p1/schedule.xer": b"XER", "u1/p1/narrative.pdf": b"NARR"})
+    db = _FakeDB(ROW, downloads={"user-1/p1/schedule.xer": b"XER", "user-1/p1/narrative.pdf": b"NARR"})
     with patch("app.api.review.user_id_from_token", return_value="user-1"), \
          patch("app.api.review.get_db", return_value=db):
         bg = _FakeBackgroundTasks()
@@ -146,6 +146,33 @@ def test_rerun_project_not_found_returns_404():
 
 def test_rerun_user_mismatch_returns_403():
     db = _FakeDB({**ROW, "user_id": "someone-else"})
+    with patch("app.api.review.user_id_from_token", return_value="user-1"), \
+         patch("app.api.review.get_db", return_value=db):
+        try:
+            _run(review_rerun_endpoint(
+                project_id="p1", background_tasks=_FakeBackgroundTasks(),
+                authorization="Bearer token", checks=None,
+            ))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 403
+
+
+def test_rerun_rejects_row_with_mismatched_narrative_path():
+    """Fix H (final-review-fixes-5-brief.md): the existing ownership check
+    only confirms the review_projects ROW belongs to the caller. The path
+    COLUMNS on that row are written by a plain client-side Supabase insert
+    (frontend/src/components/review/DocumentReview.tsx) using the
+    anon/authenticated client, not this backend -- nothing stops a caller
+    from using the Supabase JS client directly to insert a row under their
+    own user_id but with a DIFFERENT user's storage path in a path column.
+    Without validating the path itself, bucket.download() (service-role,
+    bypasses RLS) would fetch the other user's file."""
+    row = {**ROW, "narrative_pdf_path": "other-user/proj/narrative.pdf"}
+    db = _FakeDB(row, downloads={
+        "u1/p1/schedule.xer": b"XER",
+        "other-user/proj/narrative.pdf": b"NARR",
+    })
     with patch("app.api.review.user_id_from_token", return_value="user-1"), \
          patch("app.api.review.get_db", return_value=db):
         try:
