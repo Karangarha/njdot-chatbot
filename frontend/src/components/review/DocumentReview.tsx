@@ -450,12 +450,6 @@ export default function DocumentReview({
       }
       if (specs.length > 0) reviewForm.append('checks', JSON.stringify(specs))
 
-      // /api/review already chunks, embeds, and stores the schedule/narrative/SP
-      // data under project_id. Session upload reuses that same data (passing
-      // project_id instead of re-uploading the files) rather than redoing the
-      // same parsing/embedding work a second time — see _process_session_reuse
-      // in backend/app/api/session.py. This necessarily runs after review
-      // resolves (project_id isn't known until then).
       const reviewRes = await fetch(`${API_BASE}/api/review`, { method: 'POST', headers, body: reviewForm })
 
       if (!reviewRes.ok) {
@@ -464,65 +458,103 @@ export default function DocumentReview({
         throw new Error(detail)
       }
 
-      const data = await reviewRes.json() as ReviewResult
-      setResult(data)
-      setStatusFilter(null)
+      const { project_id: reviewProjectId } = await reviewRes.json() as { project_id: string; status: string }
 
-      const sessionForm = new FormData()
-      sessionForm.append('project_id', data.project_id)
-      // Utility plans are sent with the /api/review submission above now
-      // (so compliance checks can see them) -- session.py's project_id-reuse
-      // path can still accept more later (e.g. attaching one after the
-      // fact), just not needed on this initial submission anymore.
-      const sessionRes = await fetch(`${API_BASE}/api/session/upload`, { method: 'POST', headers, body: sessionForm })
+      // The review now runs in the background (a full review can take
+      // longer than a hosting platform's request timeout) — stream progress
+      // via SSE instead of waiting on this one request. isLoading/
+      // submittingRef only clear once the stream reports ready or error,
+      // not when this function returns.
+      const es = new EventSource(`${API_BASE}/api/review/${reviewProjectId}/status`)
 
-      // ── Save review result to DB ──────────────────────────────────────────
-      // The backend already uploaded the original files to Storage (when
-      // signed in) and generated project_id — see /api/review's
-      // backend-led upload. We just insert one row using that same id as
-      // the primary key, so Neo4j's projectId === review_projects.id from
-      // the very first run. No frontend Storage access, no second upload
-      // of the same bytes, no follow-up PATCH.
-      let savedProjectId: string | null = null
-      if (userId) {
-        const { data: saved } = await sb
-          .from('review_projects')
-          .insert({
-            id:                          data.project_id,
-            user_id:                     userId,
-            project_name:                data.project_name || 'Untitled Project',
-            review_result:               data,
-            session_id:                  null,
-            schedule_file_path:          data.schedule_file_path ?? null,
-            narrative_pdf_path:          data.narrative_pdf_path ?? null,
-            special_provision_pdf_path:  data.special_provision_pdf_path ?? null,
-            key_map_pdf_path:            data.key_map_pdf_path ?? null,
-            estimate_pdf_path:           data.estimate_pdf_path ?? null,
-            key_map_extraction:          data.key_map?.extraction ?? null,
-            estimate_extraction:         data.estimate?.extraction ?? null,
-          })
-          .select()
-          .single()
-        if (saved) {
-          savedProjectId = saved.id
-          currentProjectRef.current = saved.id
-          onProjectSaved?.(saved as ReviewProject)
+      es.onmessage = async (e) => {
+        let progress: { status: string; message?: string; result?: ReviewResult }
+        try {
+          progress = JSON.parse(e.data)
+        } catch {
+          return
         }
+
+        if (progress.status === 'error') {
+          es.close()
+          setError(progress.message || 'An unexpected error occurred.')
+          setIsLoading(false)
+          submittingRef.current = false
+          return
+        }
+        if (progress.status !== 'ready' || !progress.result) return
+        es.close()
+
+        const data = progress.result
+        setResult(data)
+        setStatusFilter(null)
+
+        // /api/review already chunks, embeds, and stores the schedule/
+        // narrative/SP data under project_id. Session upload reuses that
+        // same data (passing project_id instead of re-uploading the files)
+        // rather than redoing the same parsing/embedding work a second time
+        // — see _process_session_reuse in backend/app/api/session.py.
+        const sessionForm = new FormData()
+        sessionForm.append('project_id', data.project_id)
+        const sessionRes = await fetch(`${API_BASE}/api/session/upload`, { method: 'POST', headers, body: sessionForm })
+
+        // ── Save review result to DB ────────────────────────────────────────
+        // The backend already uploaded the original files to Storage (when
+        // signed in) and generated project_id — see /api/review's
+        // backend-led upload. We just insert one row using that same id as
+        // the primary key, so Neo4j's projectId === review_projects.id from
+        // the very first run. No frontend Storage access, no second upload
+        // of the same bytes, no follow-up PATCH.
+        let savedProjectId: string | null = null
+        if (userId) {
+          const { data: saved } = await sb
+            .from('review_projects')
+            .insert({
+              id:                          data.project_id,
+              user_id:                     userId,
+              project_name:                data.project_name || 'Untitled Project',
+              review_result:               data,
+              session_id:                  null,
+              schedule_file_path:          data.schedule_file_path ?? null,
+              narrative_pdf_path:          data.narrative_pdf_path ?? null,
+              special_provision_pdf_path:  data.special_provision_pdf_path ?? null,
+              key_map_pdf_path:            data.key_map_pdf_path ?? null,
+              estimate_pdf_path:           data.estimate_pdf_path ?? null,
+              key_map_extraction:          data.key_map?.extraction ?? null,
+              estimate_extraction:         data.estimate?.extraction ?? null,
+            })
+            .select()
+            .single()
+          if (saved) {
+            savedProjectId = saved.id
+            currentProjectRef.current = saved.id
+            onProjectSaved?.(saved as ReviewProject)
+          }
+        }
+
+        // ── Link session_id once upload resolves ──────────────────────────
+        if (sessionRes.ok) {
+          const { session_id } = await sessionRes.json()
+          setSessionId(session_id)
+          if (savedProjectId) {
+            await sb.from('review_projects')
+              .update({ session_id, updated_at: new Date().toISOString() })
+              .eq('id', savedProjectId)
+          }
+        }
+
+        setIsLoading(false)
+        submittingRef.current = false
       }
 
-      // ── Link session_id once upload resolves ──────────────────────────────
-      if (sessionRes.ok) {
-        const { session_id } = await sessionRes.json()
-        setSessionId(session_id)
-        if (savedProjectId) {
-          await sb.from('review_projects')
-            .update({ session_id, updated_at: new Date().toISOString() })
-            .eq('id', savedProjectId)
-        }
+      es.onerror = () => {
+        es.close()
+        setError('Lost connection while waiting for the review to finish.')
+        setIsLoading(false)
+        submittingRef.current = false
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred.')
-    } finally {
       setIsLoading(false)
       submittingRef.current = false
     }
