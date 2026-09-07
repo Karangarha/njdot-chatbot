@@ -1,34 +1,40 @@
-# Deploys backend/ to an Azure App Service Web App on every push to main
-# that touches the backend. Adapted from GitHub's official Python-to-Azure-
-# App-Service template for this repo's monorepo layout (the app lives in
-# backend/, not the repo root).
+# Deploys backend/ to the Azure App Service Web App "NJDOT" on every push to
+# main that touches the backend. Adapted from GitHub's official Python-to-
+# Azure-App-Service template for this repo's monorepo layout (the app lives
+# in backend/, not the repo root).
+#
+# Uses a publish profile, not OIDC: OIDC needs an Azure AD App Registration /
+# Managed Identity, which a school/EDU Azure tenant commonly blocks regular
+# users from creating or viewing — confirmed blocked on this account. NJDOT
+# has `adminEnabled: true` (basic publishing credentials on), so a publish
+# profile downloads and works with no Azure AD permissions needed.
 #
 # One-time setup required before this workflow can succeed:
-#   1. Create the Azure App Service (Linux, Python runtime) — e.g.:
-#        az appservice plan create --resource-group MY_RG --name MY_PLAN --is-linux --sku B2
-#        az webapp create --resource-group MY_RG --plan MY_PLAN --name MY_WEBAPP_NAME --runtime "PYTHON:3.13"
-#   2. Set AZURE_WEBAPP_NAME below to that Web App's name.
-#   3. Azure Portal -> your Web App -> Get publish profile -> download the
-#      XML file, then add its full contents as a GitHub Actions secret named
+#   1. Azure Portal -> NJDOT -> Overview -> "Download publish profile" (or:
+#        az webapp deployment list-publishing-profiles --resource-group NJ-Dot-Backend --name NJDOT --xml
+#      ). Add the full XML contents as a GitHub Actions secret named
 #      AZURE_WEBAPP_PUBLISH_PROFILE (repo Settings -> Secrets and variables
 #      -> Actions -> New repository secret).
-#   4. Azure Portal -> your Web App -> Configuration -> General settings ->
+#   2. Azure Portal -> NJDOT -> Environment variables -> General settings ->
 #      Startup Command:
 #        uvicorn app.main:app --host 0.0.0.0 --port 8000
-#   5. Azure Portal -> your Web App -> Configuration -> Application settings
-#      -> add every variable backend/app/config.py reads: SUPABASE_URL,
+#   3. Azure Portal -> NJDOT -> Environment variables -> App settings -> add
+#      every variable backend/app/config.py reads: SUPABASE_URL,
 #      SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,
 #      NEO4J_URI, NEO4J_USERNAME, NEO4J_PASSWORD, NEO4J_DATABASE,
 #      SUPABASE_JWT_SECRET, FRONTEND_URL (copy values from the current
-#      Vercel backend project) — plus SCM_DO_BUILD_DURING_DEPLOYMENT=1 so
+#      Vercel backend project), plus SCM_DO_BUILD_DURING_DEPLOYMENT=1 so
 #      Azure's Oryx builder installs requirements.txt server-side.
-#   6. Once live, update the frontend's NEXT_PUBLIC_API_URL (Vercel project
-#      settings) to this Web App's URL.
+#   4. Consider setting alwaysOn to true (same page, General settings) — it's
+#      currently false, so the app can idle out and cold-start on the next
+#      request; Basic tier supports Always On at no extra cost.
+#   5. Once live, update the frontend's NEXT_PUBLIC_API_URL (Vercel project
+#      settings) to https://njdot-f2f6a4baaedyhbfx.eastus-01.azurewebsites.net
 
 name: Deploy backend to Azure Web App
 
 env:
-  AZURE_WEBAPP_NAME: MY_WEBAPP_NAME   # <- replace with the real Web App name
+  AZURE_WEBAPP_NAME: NJDOT
   PYTHON_VERSION: '3.13'
 
 on:
@@ -88,7 +94,7 @@ jobs:
 
       - name: Deploy to Azure Web App
         id: deploy-to-webapp
-        uses: azure/webapps-deploy@85270a1854658d167ab239bce43949edb336fa7c
+        uses: azure/webapps-deploy@v3
         with:
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
