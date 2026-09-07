@@ -191,8 +191,8 @@ def test_stored_paths_download_failure_returns_502():
          patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
         try:
             _run(_call_review_endpoint(
-                schedule_file_path="u1/p1/schedule.xer",
-                narrative_pdf_path="u1/p1/narrative.pdf",
+                schedule_file_path="user-1/p1/schedule.xer",
+                narrative_pdf_path="user-1/p1/narrative.pdf",
                 project_id="p1",
             ))
             assert False, "Should have raised HTTPException"
@@ -203,9 +203,9 @@ def test_stored_paths_download_failure_returns_502():
 
 def test_stored_paths_happy_path_returns_processing_and_schedules_background():
     bucket = _FakeBucket(downloads={
-        "u1/p1/schedule.xer": b"XER-BYTES",
-        "u1/p1/narrative.pdf": b"NARRATIVE-BYTES",
-        "u1/p1/special_provision.pdf": b"SP-BYTES",
+        "user-1/p1/schedule.xer": b"XER-BYTES",
+        "user-1/p1/narrative.pdf": b"NARRATIVE-BYTES",
+        "user-1/p1/special_provision.pdf": b"SP-BYTES",
     })
 
     with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
@@ -213,9 +213,9 @@ def test_stored_paths_happy_path_returns_processing_and_schedules_background():
         bg = _FakeBackgroundTasks()
         result = _run(_call_review_endpoint(
             background_tasks=bg,
-            schedule_file_path="u1/p1/schedule.xer",
-            narrative_pdf_path="u1/p1/narrative.pdf",
-            special_provision_pdf_path="u1/p1/special_provision.pdf",
+            schedule_file_path="user-1/p1/schedule.xer",
+            narrative_pdf_path="user-1/p1/narrative.pdf",
+            special_provision_pdf_path="user-1/p1/special_provision.pdf",
             project_id="p1",
         ))
 
@@ -232,19 +232,19 @@ def test_stored_paths_happy_path_returns_processing_and_schedules_background():
     assert args[2] == b"NARRATIVE-BYTES"
     assert args[3] == b"SP-BYTES"
     assert args[7] == "user-1"          # user_id
-    assert args[9] == "u1/p1/schedule.xer"      # schedule_path
-    assert args[10] == "u1/p1/narrative.pdf"    # narrative_path
-    assert args[11] == "u1/p1/special_provision.pdf"  # sp_path
+    assert args[9] == "user-1/p1/schedule.xer"      # schedule_path
+    assert args[10] == "user-1/p1/narrative.pdf"    # narrative_path
+    assert args[11] == "user-1/p1/special_provision.pdf"  # sp_path
     # Nothing should have been uploaded — these paths were already there.
     assert bucket.uploaded == {}
 
 
 def test_stored_paths_decodes_utility_plan_path_list():
     bucket = _FakeBucket(downloads={
-        "u1/p1/schedule.xer": b"XER",
-        "u1/p1/narrative.pdf": b"NARR",
-        "u1/p1/utility_plan_0.pdf": b"UP0",
-        "u1/p1/utility_plan_1.pdf": b"UP1",
+        "user-1/p1/schedule.xer": b"XER",
+        "user-1/p1/narrative.pdf": b"NARR",
+        "user-1/p1/utility_plan_0.pdf": b"UP0",
+        "user-1/p1/utility_plan_1.pdf": b"UP1",
     })
 
     with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
@@ -252,9 +252,9 @@ def test_stored_paths_decodes_utility_plan_path_list():
         bg = _FakeBackgroundTasks()
         _run(_call_review_endpoint(
             background_tasks=bg,
-            schedule_file_path="u1/p1/schedule.xer",
-            narrative_pdf_path="u1/p1/narrative.pdf",
-            utility_plan_pdf_paths='["u1/p1/utility_plan_0.pdf", "u1/p1/utility_plan_1.pdf"]',
+            schedule_file_path="user-1/p1/schedule.xer",
+            narrative_pdf_path="user-1/p1/narrative.pdf",
+            utility_plan_pdf_paths='["user-1/p1/utility_plan_0.pdf", "user-1/p1/utility_plan_1.pdf"]',
             project_id="p1",
         ))
 
@@ -308,8 +308,8 @@ def test_stored_paths_allows_same_owner_to_reuse_their_own_project_id():
     """The hoisted ownership check must not block a legitimate resubmit by
     the same owner reusing their own project_id in the stored-paths branch."""
     bucket = _FakeBucket(downloads={
-        "u1/p1/schedule.xer": b"XER-BYTES",
-        "u1/p1/narrative.pdf": b"NARRATIVE-BYTES",
+        "owner-123/p1/schedule.xer": b"XER-BYTES",
+        "owner-123/p1/narrative.pdf": b"NARRATIVE-BYTES",
     })
     _review_progress.clear()
     _review_progress["p1"] = {"status": "running", "user_id": "owner-123"}
@@ -319,11 +319,60 @@ def test_stored_paths_allows_same_owner_to_reuse_their_own_project_id():
             bg = _FakeBackgroundTasks()
             result = _run(_call_review_endpoint(
                 background_tasks=bg,
-                schedule_file_path="u1/p1/schedule.xer",
-                narrative_pdf_path="u1/p1/narrative.pdf",
+                schedule_file_path="owner-123/p1/schedule.xer",
+                narrative_pdf_path="owner-123/p1/narrative.pdf",
                 project_id="p1",
             ))
         assert result == {"project_id": "p1", "status": "processing"}
+    finally:
+        _review_progress.clear()
+
+
+def test_stored_paths_rejects_path_not_owned_by_caller():
+    """Fix F (final-review-fixes-4-brief.md): a signed-in caller can supply a
+    fresh, legitimately-owned project_id (passing Fix D's check) while
+    pointing schedule_file_path/narrative_pdf_path/... at someone ELSE's
+    Storage path -- bucket.download() runs through the service-role client
+    and bypasses RLS, so without this check that other user's document gets
+    downloaded and returned to the caller."""
+    _review_progress.clear()
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+             patch("app.api.review.get_db", return_value=_FakeDB()):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="other-user/p9/schedule.xer",
+                    narrative_pdf_path="user-1/p9/narrative.pdf",
+                    project_id="p9",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_stored_paths_rejects_mismatched_special_provision_path():
+    """Companion to the above -- proves the ownership check isn't limited to
+    just schedule_file_path/narrative_pdf_path."""
+    bucket = _FakeBucket(downloads={
+        "user-1/p9/schedule.xer": b"XER",
+        "user-1/p9/narrative.pdf": b"NARR",
+    })
+    _review_progress.clear()
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+             patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="user-1/p9/schedule.xer",
+                    narrative_pdf_path="user-1/p9/narrative.pdf",
+                    special_provision_pdf_path="other-user/p9/sp.pdf",
+                    project_id="p9",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
     finally:
         _review_progress.clear()
 
@@ -462,6 +511,10 @@ def test_run_review_pipeline_background_http_exception_sets_error():
 
 
 def test_run_review_pipeline_background_generic_exception_sets_error():
+    """Fix G (final-review-fixes-4-brief.md): a generic exception's raw
+    str() must NOT reach the client-facing progress message -- it's streamed
+    over SSE to any caller, including anonymous ones. logger.exception (not
+    asserted here) still captures the real text server-side."""
     from app.api.review import _review_progress, _run_review_pipeline_background
 
     _review_progress.clear()
@@ -476,7 +529,8 @@ def test_run_review_pipeline_background_generic_exception_sets_error():
         )
 
     assert _review_progress["p1"]["status"] == "error"
-    assert "neo4j is down" in _review_progress["p1"]["message"]
+    assert _review_progress["p1"]["message"] == "An unexpected error occurred while running the review."
+    assert "neo4j is down" not in _review_progress["p1"]["message"]
 
 
 if __name__ == "__main__":

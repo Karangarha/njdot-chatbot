@@ -175,6 +175,10 @@ def test_run_review_rerun_background_success_updates_db_and_sets_ready():
 
 
 def test_run_review_rerun_background_failure_sets_error():
+    """Fix G (final-review-fixes-4-brief.md): a generic exception's raw
+    str() must NOT reach the client-facing progress message -- it's streamed
+    over SSE to any caller, including anonymous ones. logger.exception (not
+    asserted here) still captures the real text server-side."""
     db = _FakeDB(ROW)
 
     def fake_pipeline(*args, **kwargs):
@@ -185,7 +189,8 @@ def test_run_review_rerun_background_failure_sets_error():
         _run_review_rerun_background("p1", b"XER", b"NARR", None, None, None, None, "user-1", ROW)
 
     assert _review_progress["p1"]["status"] == "error"
-    assert "neo4j is down" in _review_progress["p1"]["message"]
+    assert _review_progress["p1"]["message"] == "An unexpected error occurred while running the review."
+    assert "neo4j is down" not in _review_progress["p1"]["message"]
     assert len(db._table.updates) == 0  # never reached the DB update
 
 

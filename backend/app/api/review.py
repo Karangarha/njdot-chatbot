@@ -957,7 +957,7 @@ def _run_review_pipeline_background(
         _set_review_progress(project_id, status="error", message=str(exc.detail))
     except Exception as exc:
         logger.exception("Background review failed for project_id=%s", project_id)
-        _set_review_progress(project_id, status="error", message=str(exc))
+        _set_review_progress(project_id, status="error", message="An unexpected error occurred while running the review.")
 
 
 @router.post(
@@ -1066,6 +1066,13 @@ async def review_endpoint(
                 status_code=400,
                 detail="schedule_file_path and narrative_pdf_path are both required.",
             )
+        _owned_prefix = f"{user_id}/"
+        for _path in (
+            schedule_file_path, narrative_pdf_path, special_provision_pdf_path,
+            key_map_pdf_path, estimate_pdf_path,
+        ):
+            if _path and not _path.startswith(_owned_prefix):
+                raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
         try:
             db = get_db()
             bucket = db.storage.from_(_STORAGE_BUCKET)
@@ -1074,10 +1081,13 @@ async def review_endpoint(
             sp_bytes = bucket.download(special_provision_pdf_path) if special_provision_pdf_path else None
             keymap_bytes = bucket.download(key_map_pdf_path) if key_map_pdf_path else None
             estimate_bytes = bucket.download(estimate_pdf_path) if estimate_pdf_path else None
-            utility_plan_bytes_list = [
-                bucket.download(p)
-                for p in (json.loads(utility_plan_pdf_paths) if utility_plan_pdf_paths else [])
-            ]
+            utility_plan_paths_list = json.loads(utility_plan_pdf_paths) if utility_plan_pdf_paths else []
+            for _p in utility_plan_paths_list:
+                if not _p.startswith(_owned_prefix):
+                    raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
+            utility_plan_bytes_list = [bucket.download(p) for p in utility_plan_paths_list]
+        except HTTPException:
+            raise
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Failed to fetch stored files: {exc}") from exc
         schedule_path, narrative_path = schedule_file_path, narrative_pdf_path
@@ -1180,7 +1190,7 @@ def _run_review_rerun_background(
         _set_review_progress(project_id, status="error", message=str(exc.detail))
     except Exception as exc:
         logger.exception("Background rerun failed for project_id=%s", project_id)
-        _set_review_progress(project_id, status="error", message=str(exc))
+        _set_review_progress(project_id, status="error", message="An unexpected error occurred while running the review.")
 
 
 @router.post(
