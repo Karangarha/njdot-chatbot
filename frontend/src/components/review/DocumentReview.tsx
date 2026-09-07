@@ -601,11 +601,42 @@ export default function DocumentReview({
         try { const b = await res.json(); if (typeof b.detail === 'string') detail = b.detail } catch {}
         throw new Error(detail)
       }
-      setResult(await res.json() as ReviewResult)
-      setStatusFilter(null)
+      await res.json()   // {project_id, status: "processing"} -- projectId is already known
+
+      const es = new EventSource(`${API_BASE}/api/review/${projectId}/status`)
+
+      es.onmessage = (e) => {
+        let progress: { status: string; message?: string; result?: ReviewResult }
+        try {
+          progress = JSON.parse(e.data)
+        } catch {
+          return
+        }
+
+        if (progress.status === 'error') {
+          es.close()
+          setRerunError(progress.message || 'An unexpected error occurred.')
+          setIsRerunning(false)
+          rerunningRef.current = false
+          return
+        }
+        if (progress.status !== 'ready' || !progress.result) return
+        es.close()
+
+        setResult(progress.result)
+        setStatusFilter(null)
+        setIsRerunning(false)
+        rerunningRef.current = false
+      }
+
+      es.onerror = () => {
+        es.close()
+        setRerunError('Lost connection while waiting for the review to finish.')
+        setIsRerunning(false)
+        rerunningRef.current = false
+      }
     } catch (err) {
       setRerunError(err instanceof Error ? err.message : 'An unexpected error occurred.')
-    } finally {
       setIsRerunning(false)
       rerunningRef.current = false
     }
