@@ -166,14 +166,16 @@ def _validate_owned_path(path: str, user_id: str) -> None:
     into a DIFFERENT bucket while still superficially "starting with the
     caller's own user_id" one level too shallow. Anchoring the full
     expected prefix closes that."""
-    parts = _relative_path_parts(path)
     try:
+        parts = _relative_path_parts(path)
         resolved = _PATH_RESOLUTION_BASE.joinpath(*parts).parts[1:]
-    except ValueError:
-        # yarl's joinpath rejects a part that, after our own decoding,
-        # contains a literal leading '/' (e.g. a doubly-encoded "%2Fx"
-        # segment) -- that's exactly the class of malformed/adversarial
-        # input this check exists to reject, not a legitimate value.
+    except Exception:
+        # yarl can raise on more than just a doubly-encoded "%2Fx" segment
+        # (e.g. a "//host"-prefixed path making it parse a bogus host, or
+        # a segment that fails IDNA encoding) -- any parse failure here
+        # means the input is malformed/adversarial, not a legitimate
+        # value, so it's rejected the same way as a resolved-but-wrong
+        # path rather than propagating as an unhandled 500.
         raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
     if (
         len(resolved) < 4
