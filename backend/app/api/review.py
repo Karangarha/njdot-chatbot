@@ -1098,6 +1098,51 @@ async def review_endpoint(
     return {"project_id": project_id, "status": "processing"}
 
 
+def _run_review_rerun_background(
+    project_id: str,
+    schedule_bytes: bytes,
+    narrative_bytes: bytes,
+    sp_bytes: Optional[bytes],
+    keymap_bytes: Optional[bytes],
+    estimate_bytes: Optional[bytes],
+    selected_checks: Optional[List[CheckDef]],
+    user_id: Optional[str],
+    row: Dict[str, Any],
+) -> None:
+    """Runs _run_review_pipeline (reseed=False) for the rerun endpoint,
+    updates the review_projects row, and stores the outcome in
+    _review_progress. See _run_review_pipeline_background's docstring for
+    why every exception must be caught here rather than raised."""
+    _set_review_progress(
+        project_id, status="running",
+        message="Re-running compliance review — this can take several minutes…",
+    )
+    try:
+        result = _run_review_pipeline(
+            schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
+            selected_checks, project_id, reseed=False, user_id=user_id,
+        )
+        update_fields: Dict[str, Any] = {
+            "review_result": result,
+            "project_name": result.get("project_name") or row.get("project_name"),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        new_km_extraction = (result.get("key_map") or {}).get("extraction")
+        if not row.get("key_map_extraction") and new_km_extraction:
+            update_fields["key_map_extraction"] = new_km_extraction
+        new_est_extraction = (result.get("estimate") or {}).get("extraction")
+        if not row.get("estimate_extraction") and new_est_extraction:
+            update_fields["estimate_extraction"] = new_est_extraction
+        get_db().table("review_projects").update(update_fields).eq("id", project_id).execute()
+        _set_review_progress(project_id, status="ready", message="Review complete.", result=result)
+    except HTTPException as exc:
+        logger.exception("Background rerun failed for project_id=%s", project_id)
+        _set_review_progress(project_id, status="error", message=str(exc.detail))
+    except Exception as exc:
+        logger.exception("Background rerun failed for project_id=%s", project_id)
+        _set_review_progress(project_id, status="error", message=str(exc))
+
+
 @router.post(
     "/review/{project_id}/rerun",
     summary="Re-run a past schedule compliance review",
@@ -1111,6 +1156,7 @@ async def review_endpoint(
 )
 async def review_rerun_endpoint(
     project_id: str,
+    background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(default=None),
     checks: Optional[str] = Form(
         None,
@@ -1153,31 +1199,13 @@ async def review_rerun_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch stored files: {exc}") from exc
 
-    result = _run_review_pipeline(
-        schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
-        selected_checks, project_id, reseed=False, user_id=user_id,
+    _set_review_progress(project_id, status="queued", message="Rerun queued…")
+    background_tasks.add_task(
+        _run_review_rerun_background,
+        project_id, schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
+        selected_checks, user_id, row,
     )
-
-    update_fields: Dict[str, Any] = {
-        "review_result": result,
-        "project_name": result.get("project_name") or row.get("project_name"),
-        "updated_at": datetime.now(timezone.utc).isoformat(),
-    }
-    # Persist any extraction the self-heal path in _run_review_pipeline just
-    # computed (row.get(...) was NULL going in) -- otherwise a rerun keeps
-    # re-running the extraction LLM/vision call every single time instead of
-    # caching it, exactly the cost _read_keymap_extraction_from_supabase/
-    # _read_estimate_extraction_from_supabase exist to avoid.
-    new_km_extraction = (result.get("key_map") or {}).get("extraction")
-    if not row.get("key_map_extraction") and new_km_extraction:
-        update_fields["key_map_extraction"] = new_km_extraction
-    new_est_extraction = (result.get("estimate") or {}).get("extraction")
-    if not row.get("estimate_extraction") and new_est_extraction:
-        update_fields["estimate_extraction"] = new_est_extraction
-
-    db.table("review_projects").update(update_fields).eq("id", project_id).execute()
-
-    return result
+    return {"project_id": project_id, "status": "processing"}
 
 
 _DOC_TYPE_TO_COLUMN: Dict[str, str] = {
