@@ -76,6 +76,18 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+class _FakeBackgroundTasks:
+    """Stub for FastAPI's BackgroundTasks — records add_task calls instead
+    of running them, so a test can assert what would have been scheduled
+    without the (mocked-out) pipeline actually running."""
+
+    def __init__(self):
+        self.tasks: list = []
+
+    def add_task(self, func, *args, **kwargs):
+        self.tasks.append((func, args, kwargs))
+
+
 def _call_review_endpoint(**overrides):
     """Call review_endpoint directly as a coroutine, bypassing FastAPI's own
     request parsing (same pattern as test_review_pdf_endpoint.py). Every
@@ -85,6 +97,7 @@ def _call_review_endpoint(**overrides):
     omitted argument would otherwise pass the raw FieldInfo object through
     instead of the None a real request gives it."""
     kwargs = dict(
+        background_tasks=_FakeBackgroundTasks(),
         schedule_file=None,
         narrative_pdf=None,
         special_provision_pdf=None,
@@ -164,43 +177,40 @@ def test_stored_paths_download_failure_returns_502():
             assert "Failed to fetch stored files" in e.detail
 
 
-def test_stored_paths_happy_path_downloads_and_reuses_project_id():
+def test_stored_paths_happy_path_returns_processing_and_schedules_background():
     bucket = _FakeBucket(downloads={
         "u1/p1/schedule.xer": b"XER-BYTES",
         "u1/p1/narrative.pdf": b"NARRATIVE-BYTES",
         "u1/p1/special_provision.pdf": b"SP-BYTES",
     })
-    captured = {}
-
-    def fake_pipeline(schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
-                       selected_checks, project_id, user_id=None, utility_plan_bytes_list=None):
-        captured.update(
-            schedule_bytes=schedule_bytes, narrative_bytes=narrative_bytes, sp_bytes=sp_bytes,
-            project_id=project_id, user_id=user_id,
-            utility_plan_bytes_list=utility_plan_bytes_list,
-        )
-        return {"project_id": project_id}
 
     with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
-         patch("app.api.review.get_db", return_value=_FakeDB(bucket)), \
-         patch("app.api.review._run_review_pipeline", side_effect=fake_pipeline):
+         patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+        bg = _FakeBackgroundTasks()
         result = _run(_call_review_endpoint(
+            background_tasks=bg,
             schedule_file_path="u1/p1/schedule.xer",
             narrative_pdf_path="u1/p1/narrative.pdf",
             special_provision_pdf_path="u1/p1/special_provision.pdf",
             project_id="p1",
         ))
 
-    assert captured["schedule_bytes"] == b"XER-BYTES"
-    assert captured["narrative_bytes"] == b"NARRATIVE-BYTES"
-    assert captured["sp_bytes"] == b"SP-BYTES"
-    assert captured["project_id"] == "p1"  # reused, not re-minted
-    assert captured["user_id"] == "user-1"
-    assert captured["utility_plan_bytes_list"] == []
-    assert result["schedule_file_path"] == "u1/p1/schedule.xer"
-    assert result["narrative_pdf_path"] == "u1/p1/narrative.pdf"
-    assert result["special_provision_pdf_path"] == "u1/p1/special_provision.pdf"
-    assert result["key_map_pdf_path"] is None
+    assert result == {"project_id": "p1", "status": "processing"}
+    assert len(bg.tasks) == 1
+    func, args, kwargs = bg.tasks[0]
+    assert func.__name__ == "_run_review_pipeline_background"
+    # Positional args: project_id, schedule_bytes, narrative_bytes, sp_bytes,
+    # keymap_bytes, estimate_bytes, selected_checks, user_id,
+    # utility_plan_bytes_list, schedule_path, narrative_path, sp_path,
+    # keymap_path, estimate_path
+    assert args[0] == "p1"
+    assert args[1] == b"XER-BYTES"
+    assert args[2] == b"NARRATIVE-BYTES"
+    assert args[3] == b"SP-BYTES"
+    assert args[7] == "user-1"          # user_id
+    assert args[9] == "u1/p1/schedule.xer"      # schedule_path
+    assert args[10] == "u1/p1/narrative.pdf"    # narrative_path
+    assert args[11] == "u1/p1/special_provision.pdf"  # sp_path
     # Nothing should have been uploaded — these paths were already there.
     assert bucket.uploaded == {}
 
@@ -212,23 +222,20 @@ def test_stored_paths_decodes_utility_plan_path_list():
         "u1/p1/utility_plan_0.pdf": b"UP0",
         "u1/p1/utility_plan_1.pdf": b"UP1",
     })
-    captured = {}
-
-    def fake_pipeline(*args, utility_plan_bytes_list=None, **kwargs):
-        captured["utility_plan_bytes_list"] = utility_plan_bytes_list
-        return {"project_id": "p1"}
 
     with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
-         patch("app.api.review.get_db", return_value=_FakeDB(bucket)), \
-         patch("app.api.review._run_review_pipeline", side_effect=fake_pipeline):
+         patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+        bg = _FakeBackgroundTasks()
         _run(_call_review_endpoint(
+            background_tasks=bg,
             schedule_file_path="u1/p1/schedule.xer",
             narrative_pdf_path="u1/p1/narrative.pdf",
             utility_plan_pdf_paths='["u1/p1/utility_plan_0.pdf", "u1/p1/utility_plan_1.pdf"]',
             project_id="p1",
         ))
 
-    assert captured["utility_plan_bytes_list"] == [b"UP0", b"UP1"]
+    _, args, _ = bg.tasks[0]
+    assert args[8] == [b"UP0", b"UP1"]  # utility_plan_bytes_list
 
 
 # ── Raw-upload branch (unchanged behavior, now explicitly validated) ────────
@@ -244,44 +251,97 @@ def test_raw_upload_requires_schedule_and_narrative():
 
 
 def test_raw_upload_signed_out_skips_storage_entirely():
-    def fake_pipeline(schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
-                       selected_checks, project_id, user_id=None, utility_plan_bytes_list=None):
-        return {"project_id": project_id}
-
     with patch("app.api.review.user_id_from_token_optional", return_value=None), \
-         patch("app.api.review._run_review_pipeline", side_effect=fake_pipeline) as mock_pipeline, \
          patch("app.api.review.get_db") as mock_get_db:
+        bg = _FakeBackgroundTasks()
         result = _run(_call_review_endpoint(
+            background_tasks=bg,
             schedule_file=_FakeUploadFile(b"XER-BYTES"),
             narrative_pdf=_FakeUploadFile(b"NARRATIVE-BYTES"),
         ))
 
     mock_get_db.assert_not_called()  # signed-out: no Storage interaction at all
-    assert mock_pipeline.call_args.kwargs["user_id"] is None
-    assert result["schedule_file_path"] is None
-    assert result["narrative_pdf_path"] is None
+    assert result["status"] == "processing"
+    _, args, _ = bg.tasks[0]
+    assert args[7] is None    # user_id
+    assert args[9] is None    # schedule_path
+    assert args[10] is None   # narrative_path
 
 
 def test_raw_upload_signed_in_uploads_and_mints_project_id():
     bucket = _FakeBucket()
 
-    def fake_pipeline(schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
-                       selected_checks, project_id, user_id=None, utility_plan_bytes_list=None):
-        return {"project_id": project_id}
-
     with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
-         patch("app.api.review.get_db", return_value=_FakeDB(bucket)), \
-         patch("app.api.review._run_review_pipeline", side_effect=fake_pipeline):
+         patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+        bg = _FakeBackgroundTasks()
         result = _run(_call_review_endpoint(
+            background_tasks=bg,
             schedule_file=_FakeUploadFile(b"XER-BYTES"),
             narrative_pdf=_FakeUploadFile(b"NARRATIVE-BYTES"),
         ))
 
     minted_id = result["project_id"]
     assert minted_id  # a uuid4 string was minted since none was supplied
+    assert result["status"] == "processing"
     assert bucket.uploaded[f"user-1/{minted_id}/schedule.xer"] == b"XER-BYTES"
     assert bucket.uploaded[f"user-1/{minted_id}/narrative.pdf"] == b"NARRATIVE-BYTES"
-    assert result["schedule_file_path"] == f"user-1/{minted_id}/schedule.xer"
+    _, args, _ = bg.tasks[0]
+    assert args[9] == f"user-1/{minted_id}/schedule.xer"   # schedule_path
+
+
+def test_run_review_pipeline_background_success_sets_ready():
+    from app.api.review import _review_progress, _run_review_pipeline_background
+
+    _review_progress.clear()
+
+    def fake_pipeline(*args, **kwargs):
+        return {"project_id": "p1"}
+
+    with patch("app.api.review._run_review_pipeline", side_effect=fake_pipeline):
+        _run_review_pipeline_background(
+            "p1", b"XER", b"NARR", None, None, None, None, "user-1", None,
+            "sched-path", "narr-path", None, None, None,
+        )
+
+    assert _review_progress["p1"]["status"] == "ready"
+    assert _review_progress["p1"]["result"]["schedule_file_path"] == "sched-path"
+    assert _review_progress["p1"]["result"]["narrative_pdf_path"] == "narr-path"
+
+
+def test_run_review_pipeline_background_http_exception_sets_error():
+    from app.api.review import _review_progress, _run_review_pipeline_background
+
+    _review_progress.clear()
+
+    def fake_pipeline(*args, **kwargs):
+        raise HTTPException(status_code=502, detail="Compliance evaluation failed: boom")
+
+    with patch("app.api.review._run_review_pipeline", side_effect=fake_pipeline):
+        _run_review_pipeline_background(
+            "p1", b"XER", b"NARR", None, None, None, None, "user-1", None,
+            None, None, None, None, None,
+        )
+
+    assert _review_progress["p1"]["status"] == "error"
+    assert "boom" in _review_progress["p1"]["message"]
+
+
+def test_run_review_pipeline_background_generic_exception_sets_error():
+    from app.api.review import _review_progress, _run_review_pipeline_background
+
+    _review_progress.clear()
+
+    def fake_pipeline(*args, **kwargs):
+        raise RuntimeError("neo4j is down")
+
+    with patch("app.api.review._run_review_pipeline", side_effect=fake_pipeline):
+        _run_review_pipeline_background(
+            "p1", b"XER", b"NARR", None, None, None, None, "user-1", None,
+            None, None, None, None, None,
+        )
+
+    assert _review_progress["p1"]["status"] == "error"
+    assert "neo4j is down" in _review_progress["p1"]["message"]
 
 
 if __name__ == "__main__":

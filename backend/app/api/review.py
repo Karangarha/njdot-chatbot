@@ -887,6 +887,55 @@ def _run_review_pipeline(
     return shaped
 
 
+def _run_review_pipeline_background(
+    project_id: str,
+    schedule_bytes: bytes,
+    narrative_bytes: bytes,
+    sp_bytes: Optional[bytes],
+    keymap_bytes: Optional[bytes],
+    estimate_bytes: Optional[bytes],
+    selected_checks: Optional[List[CheckDef]],
+    user_id: Optional[str],
+    utility_plan_bytes_list: Optional[List[bytes]],
+    schedule_path: Optional[str],
+    narrative_path: Optional[str],
+    sp_path: Optional[str],
+    keymap_path: Optional[str],
+    estimate_path: Optional[str],
+) -> None:
+    """Runs _run_review_pipeline for the initial upload endpoint and stores
+    the outcome in _review_progress -- the actual work behind the
+    "processing" response review_endpoint returns immediately.
+
+    Must catch every exception itself: raised inside a BackgroundTasks
+    callback (not an actual request), FastAPI has nothing to return an
+    HTTPException to -- an uncaught one here would just be logged, leaving
+    _review_progress stuck at "queued"/"running" forever.
+    """
+    _set_review_progress(
+        project_id, status="running",
+        message="Running compliance review — this can take several minutes…",
+    )
+    try:
+        result = _run_review_pipeline(
+            schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
+            selected_checks, project_id, user_id=user_id,
+            utility_plan_bytes_list=utility_plan_bytes_list,
+        )
+        result["schedule_file_path"] = schedule_path
+        result["narrative_pdf_path"] = narrative_path
+        result["special_provision_pdf_path"] = sp_path
+        result["key_map_pdf_path"] = keymap_path
+        result["estimate_pdf_path"] = estimate_path
+        _set_review_progress(project_id, status="ready", message="Review complete.", result=result)
+    except HTTPException as exc:
+        logger.exception("Background review failed for project_id=%s", project_id)
+        _set_review_progress(project_id, status="error", message=str(exc.detail))
+    except Exception as exc:
+        logger.exception("Background review failed for project_id=%s", project_id)
+        _set_review_progress(project_id, status="error", message=str(exc))
+
+
 @router.post(
     "/review",
     summary="Schedule compliance review",
@@ -900,6 +949,7 @@ def _run_review_pipeline(
     ),
 )
 async def review_endpoint(
+    background_tasks: BackgroundTasks,
     schedule_file: Optional[UploadFile] = File(
         None, description="CPM schedule XER file. Omit if schedule_file_path is given."),
     narrative_pdf: Optional[UploadFile] = File(
@@ -1038,17 +1088,14 @@ async def review_endpoint(
                 logger.exception("Failed to persist review files to Storage for project_id=%s", project_id)
                 schedule_path = narrative_path = sp_path = keymap_path = estimate_path = None
 
-    result = _run_review_pipeline(
-        schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
-        selected_checks, project_id, user_id=user_id,
-        utility_plan_bytes_list=utility_plan_bytes_list,
+    _set_review_progress(project_id, status="queued", message="Review queued…")
+    background_tasks.add_task(
+        _run_review_pipeline_background,
+        project_id, schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
+        selected_checks, user_id, utility_plan_bytes_list,
+        schedule_path, narrative_path, sp_path, keymap_path, estimate_path,
     )
-    result["schedule_file_path"] = schedule_path
-    result["narrative_pdf_path"] = narrative_path
-    result["special_provision_pdf_path"] = sp_path
-    result["key_map_pdf_path"] = keymap_path
-    result["estimate_pdf_path"] = estimate_path
-    return result
+    return {"project_id": project_id, "status": "processing"}
 
 
 @router.post(
