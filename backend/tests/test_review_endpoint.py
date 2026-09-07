@@ -463,6 +463,85 @@ def test_stored_paths_rejects_encoded_slash_traversal():
         _review_progress.clear()
 
 
+def test_stored_paths_rejects_leading_dotdot_bucket_escape():
+    """Fix M (final-review-fixes-7-brief.md): round 6's _validate_owned_path
+    modeled storage3's fixed URL prefix as a single throwaway segment, but
+    storage3's real download()/upload() build ["object", _STORAGE_BUCKET,
+    *path_parts] -- TWO fixed segments. A path starting with a single
+    leading '../' pops only the round-6 dummy's one fixed segment in the
+    check's model, but pops the REAL bucket name in reality -- landing the
+    actual request in a completely different Storage bucket. Note the
+    caller's OWN user_id appears as the segment right after the escape
+    (the specific shape that let round 6's check still see resolved[0] ==
+    user_id and pass it)."""
+    _review_progress.clear()
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+             patch("app.api.review.get_db", return_value=_FakeDB()):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="../other-bucket/user-1/schedule.xer",
+                    narrative_pdf_path="user-1/p9/narrative.pdf",
+                    project_id="p9",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_stored_paths_rejects_malformed_encoded_slash_segment():
+    """Fix M (final-review-fixes-7-brief.md): a decoded path segment that
+    itself starts with a literal '/' (e.g. a doubly-encoded "%2Fx") makes
+    yarl's URL.joinpath raise ValueError instead of resolving cleanly.
+    Before this fix that propagated as an uncaught 500; it must be caught
+    and turned into the same clean 403 every other malformed/adversarial
+    path gets."""
+    _review_progress.clear()
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+             patch("app.api.review.get_db", return_value=_FakeDB()):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="user-1/%2Fx/y",
+                    narrative_pdf_path="user-1/p9/narrative.pdf",
+                    project_id="p9",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_raw_upload_rejects_dotdot_bucket_escape_project_id():
+    """Fix M (final-review-fixes-7-brief.md), raw-upload write path: the
+    cheap early check on project_id (`"/" in project_id or project_id in
+    (".", "..")`) doesn't touch percent-encoded slashes, so a project_id of
+    "..%2f..%2fother-bucket%2fuser-1" sails through it. Once interpolated
+    into f"{user_id}/{project_id}/schedule.xer", storage3's real
+    ["object", _STORAGE_BUCKET, *parts] request-building resolves the two
+    '..' past BOTH "user-1" and the bucket name itself, landing in
+    "other-bucket" with the caller's own user_id as the next segment --
+    exactly the shape round 6's under-counted dummy base would have let
+    through. Asserted via bucket.uploaded being empty, not just the
+    exception, to prove the write never happened."""
+    bucket = _FakeBucket()
+    with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+         patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+        try:
+            _run(_call_review_endpoint(
+                schedule_file=_FakeUploadFile(b"XER-BYTES"),
+                narrative_pdf=_FakeUploadFile(b"NARRATIVE-BYTES"),
+                project_id="..%2f..%2fother-bucket%2fuser-1",
+            ))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 403
+    assert bucket.uploaded == {}
+
+
 def test_stored_paths_rejects_non_string_utility_plan_path_entry():
     """Fix L (final-review-fixes-6-brief.md): a non-string entry in the
     caller's utility_plan_pdf_paths JSON array (e.g. `[123]`) must not reach

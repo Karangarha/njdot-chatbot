@@ -208,6 +208,30 @@ def test_rerun_rejects_percent_encoded_dotdot_traversal_in_row_path():
             assert e.status_code == 403
 
 
+def test_rerun_rejects_dotdot_bucket_escape_in_row_path():
+    """Fix M (final-review-fixes-7-brief.md): round 6's _validate_owned_path
+    modeled storage3's fixed URL prefix with only ONE dummy segment, but the
+    real download()/upload() build ["object", _STORAGE_BUCKET, *parts] --
+    TWO fixed segments. A DB row path starting with a single leading '../'
+    (populated via the client-side Supabase insert, not this backend) pops
+    only the dummy's one segment in the old check's model but the REAL
+    bucket name in reality, landing the actual request in a different
+    bucket -- while the caller's own user_id right after the escape still
+    let the old check's resolved[0] == user_id pass."""
+    row = {**ROW, "narrative_pdf_path": "../other-bucket/user-1/narrative.pdf"}
+    db = _FakeDB(row, downloads={"user-1/p1/schedule.xer": b"XER"})
+    with patch("app.api.review.user_id_from_token", return_value="user-1"), \
+         patch("app.api.review.get_db", return_value=db):
+        try:
+            _run(review_rerun_endpoint(
+                project_id="p1", background_tasks=_FakeBackgroundTasks(),
+                authorization="Bearer token", checks=None,
+            ))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 403
+
+
 def test_run_review_rerun_background_success_updates_db_and_sets_ready():
     db = _FakeDB(ROW)
 

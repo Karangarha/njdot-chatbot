@@ -326,6 +326,34 @@ def test_percent_encoded_dotdot_traversal_returns_403():
     asyncio.run(run_test())
 
 
+def test_dotdot_bucket_escape_returns_403():
+    """Fix M (final-review-fixes-7-brief.md): round 6's _validate_owned_path
+    modeled storage3's fixed URL prefix with only ONE dummy segment, but the
+    real download()/upload() build ["object", _STORAGE_BUCKET, *parts] --
+    TWO fixed segments. A DB row path starting with a single leading '../'
+    pops only the dummy's one segment in the old check's model but the REAL
+    bucket name in reality, landing the actual request in a different
+    bucket -- while the caller's own user_id right after the escape still
+    let the old check's resolved[0] == user_id pass."""
+    async def run_test():
+        with patch("app.api.review.get_db") as mock_get_db, \
+             patch("app.api.review.user_id_from_token") as mock_token:
+            mock_token.return_value = "user-123"
+            mock_get_db.return_value = _FakeDB(
+                table_data={
+                    "id": "proj-1",
+                    "user_id": "user-123",
+                    "narrative_pdf_path": "../other-bucket/user-123/narrative.pdf",
+                }
+            )
+            try:
+                await review_pdf_endpoint("proj-1", "narrative", "Bearer token")
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    asyncio.run(run_test())
+
+
 def test_bucket_download_raises_returns_502():
     """If bucket.download() raises an exception, should return 502."""
     async def run_test():

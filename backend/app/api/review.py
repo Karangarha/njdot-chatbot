@@ -129,10 +129,17 @@ def _set_review_progress(project_id: str, **kwargs: Any) -> None:
     _review_progress[project_id] = {**_review_progress.get(project_id, {}), **kwargs}
 
 
-# Arbitrary fixed base -- only used so `.joinpath()` can resolve '.'/'..'
-# segments exactly the way storage3's own request-building does; never
-# actually requested over the network.
-_PATH_RESOLUTION_BASE = _YarlURL("https://storage.invalid/prefix")
+# Mirrors the exact fixed prefix storage3's own request-building uses
+# ("object", then the bucket name) before appending the caller-controlled
+# path -- see backend/.venv's installed storage3/_sync/file_api.py's
+# download()/upload()/_upload_or_update(), which all build
+# ["object", self.id, *path_parts]. Anchoring to this exact shape (not an
+# arbitrary placeholder) is required: a mismatched placeholder lets a
+# leading '..' escape into the wrong number of fixed segments in the
+# check's model vs. reality, letting a caller redirect the request to a
+# DIFFERENT bucket entirely while still passing an ownership check scoped
+# to their own user_id.
+_PATH_RESOLUTION_BASE = _YarlURL(f"https://storage.invalid/object/{_STORAGE_BUCKET}")
 
 
 def _relative_path_parts(path: str) -> tuple:
@@ -152,18 +159,28 @@ def _relative_path_parts(path: str) -> tuple:
 def _validate_owned_path(path: str, user_id: str) -> None:
     """Raises 403 unless `path` resolves (after the SAME '.'/'..'
     resolution and percent-decoding storage3's own yarl-based request
-    building performs) to a path whose first segment is `user_id`, with
-    at least one segment after it. A raw-string prefix/segment check is
-    NOT sufficient here: yarl percent-decodes during parsing and
-    resolves '.'/'..' during `.joinpath()`, so e.g. "user-1/%2e%2e/x"
-    or "user-1/..%2fx" both look safe as strings but resolve outside
-    "user-1/" once storage3 actually builds its request. Resolving the
-    path ourselves through the identical yarl machinery, rather than
-    guessing at string patterns, is the only way to stay correct as that
-    decoding logic exists in a dependency we don't control."""
+    building performs) to a path anchored at "object/<_STORAGE_BUCKET>/
+    <user_id>/..." -- not just "<user_id>/...". Checking only the
+    trailing shape (as an earlier version of this function did) lets a
+    leading '../' escape past the fixed "object"/bucket-name segments
+    into a DIFFERENT bucket while still superficially "starting with the
+    caller's own user_id" one level too shallow. Anchoring the full
+    expected prefix closes that."""
     parts = _relative_path_parts(path)
-    resolved = _PATH_RESOLUTION_BASE.joinpath(*parts).parts[2:]
-    if len(resolved) < 2 or resolved[0] != user_id:
+    try:
+        resolved = _PATH_RESOLUTION_BASE.joinpath(*parts).parts[1:]
+    except ValueError:
+        # yarl's joinpath rejects a part that, after our own decoding,
+        # contains a literal leading '/' (e.g. a doubly-encoded "%2Fx"
+        # segment) -- that's exactly the class of malformed/adversarial
+        # input this check exists to reject, not a legitimate value.
+        raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
+    if (
+        len(resolved) < 4
+        or resolved[0] != "object"
+        or resolved[1] != _STORAGE_BUCKET
+        or resolved[2] != user_id
+    ):
         raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
 
 
