@@ -36,6 +36,7 @@ frontend field-shape changes going forward.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -45,7 +46,8 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
 import numpy as np
-from fastapi import APIRouter, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, Response, UploadFile
+from fastapi.responses import StreamingResponse
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
@@ -113,6 +115,64 @@ _STATUS_MAP = {"Pass": "pass", "Fail": "fail", "Missing": "warning"}
 # Fallback check_type by check_key, for `checks` payloads sent by a frontend
 # that predates the field — see _parse_checks.
 _BUILTIN_CHECK_TYPES = {c.check_key: c.check_type for c in BUILTIN_CHECKS}
+
+
+# ── In-process review progress store ────────────────────────────────────────
+# Dict is GIL-protected in CPython; safe for single-process FastAPI deploys
+# (mirrors app.api.session's identically-shaped _progress store).
+
+_review_progress: Dict[str, Dict[str, Any]] = {}
+
+
+def _set_review_progress(project_id: str, **kwargs: Any) -> None:
+    _review_progress[project_id] = {**_review_progress.get(project_id, {}), **kwargs}
+
+
+@router.get("/review/{project_id}/status", summary="Stream review progress via SSE")
+async def review_status(project_id: str) -> StreamingResponse:
+    """Server-Sent Events stream of a review's progress.
+
+    Each event is a JSON object: {status, message, result?}. status is one
+    of "queued"/"running"/"ready"/"error". Stream closes once status is
+    "ready" or "error". "result" (the full shaped review dict) is only
+    present once status is "ready".
+
+    If project_id isn't in the in-process store (e.g. after a server
+    restart), falls back to Supabase's review_projects.review_result — so a
+    review that actually finished before a restart still reports ready.
+    """
+    if project_id not in _review_progress:
+        try:
+            db = get_db()
+            rows = (
+                db.table("review_projects").select("review_result")
+                .eq("id", project_id).limit(1).execute().data
+            ) or []
+            result = rows[0].get("review_result") if rows else None
+            if result:
+                _set_review_progress(project_id, status="ready", message="Review complete.", result=result)
+            else:
+                _set_review_progress(project_id, status="error", message="Review not found.")
+        except Exception as exc:
+            logger.warning("DB check for review %s failed: %s", project_id, exc)
+            _set_review_progress(project_id, status="error", message="Review not found.")
+
+    async def _generator():
+        while True:
+            progress = _review_progress.get(
+                project_id,
+                {"status": "unknown", "message": "Review not found."},
+            )
+            yield f"data: {json.dumps(progress)}\n\n"
+            if progress.get("status") in ("ready", "error"):
+                break
+            await asyncio.sleep(0.8)
+
+    return StreamingResponse(
+        _generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 # ── PDF helpers ──────────────────────────────────────────────────────────────
