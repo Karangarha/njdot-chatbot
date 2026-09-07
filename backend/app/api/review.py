@@ -129,7 +129,7 @@ def _set_review_progress(project_id: str, **kwargs: Any) -> None:
 
 
 @router.get("/review/{project_id}/status", summary="Stream review progress via SSE")
-async def review_status(project_id: str) -> StreamingResponse:
+async def review_status(project_id: str, token: Optional[str] = None) -> StreamingResponse:
     """Server-Sent Events stream of a review's progress.
 
     Each event is a JSON object: {status, message, result?}. status is one
@@ -137,22 +137,41 @@ async def review_status(project_id: str) -> StreamingResponse:
     "ready" or "error". "result" (the full shaped review dict) is only
     present once status is "ready".
 
+    Ownership check: a review with a real owner (a signed-in submission,
+    not the anonymous flow) can only be streamed by that same user.
+    EventSource cannot send a custom Authorization header, so the caller's
+    token is passed as a query parameter instead -- the same JWT used
+    everywhere else, just relayed differently because of that one browser
+    API limitation. Anonymous reviews (no owner) stay openly readable,
+    matching the rest of this app's "usable signed-out" design.
+
     If project_id isn't in the in-process store (e.g. after a server
     restart), falls back to Supabase's review_projects.review_result — so a
     review that actually finished before a restart still reports ready.
     """
-    if project_id not in _review_progress:
+    caller_user_id = user_id_from_token_optional(f"Bearer {token}") if token else None
+
+    if project_id in _review_progress:
+        owner_user_id = _review_progress[project_id].get("user_id")
+        if owner_user_id and owner_user_id != caller_user_id:
+            raise HTTPException(status_code=403, detail="This review does not belong to you")
+    else:
         try:
             db = get_db()
             rows = (
-                db.table("review_projects").select("review_result")
+                db.table("review_projects").select("user_id, review_result")
                 .eq("id", project_id).limit(1).execute().data
             ) or []
-            result = rows[0].get("review_result") if rows else None
+            row = rows[0] if rows else None
+            if row and row.get("user_id") and row.get("user_id") != caller_user_id:
+                raise HTTPException(status_code=403, detail="This review does not belong to you")
+            result = row.get("review_result") if row else None
             if result:
                 _set_review_progress(project_id, status="ready", message="Review complete.", result=result)
             else:
                 _set_review_progress(project_id, status="error", message="Review not found.")
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.warning("DB check for review %s failed: %s", project_id, exc)
             _set_review_progress(project_id, status="error", message="Review not found.")
@@ -1088,7 +1107,8 @@ async def review_endpoint(
                 logger.exception("Failed to persist review files to Storage for project_id=%s", project_id)
                 schedule_path = narrative_path = sp_path = keymap_path = estimate_path = None
 
-    _set_review_progress(project_id, status="queued", message="Review queued…")
+    _review_progress.pop(project_id, None)  # clear any stale entry from a prior run under this id
+    _set_review_progress(project_id, status="queued", message="Review queued…", user_id=user_id)
     background_tasks.add_task(
         _run_review_pipeline_background,
         project_id, schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,
@@ -1199,7 +1219,8 @@ async def review_rerun_endpoint(
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Failed to fetch stored files: {exc}") from exc
 
-    _set_review_progress(project_id, status="queued", message="Rerun queued…")
+    _review_progress.pop(project_id, None)  # clear the previous run's stale "ready" entry under this same id
+    _set_review_progress(project_id, status="queued", message="Rerun queued…", user_id=user_id)
     background_tasks.add_task(
         _run_review_rerun_background,
         project_id, schedule_bytes, narrative_bytes, sp_bytes, keymap_bytes, estimate_bytes,

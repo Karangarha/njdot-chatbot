@@ -292,11 +292,17 @@ export default function DocumentReview({
   // the isLoading/isRerunning state update has re-rendered the button away.
   const submittingRef = useRef(false)
   const rerunningRef  = useRef(false)
+  const activeReviewStreamRef = useRef<EventSource | null>(null)
 
   // ── Load the user's effective checklist (built-ins or their own fork) ──────
   useEffect(() => {
     getEffectiveChecks(userId).then(setEffectiveChecks)
   }, [userId])
+
+  // ── Close any in-flight review stream on unmount ────────────────────────────
+  useEffect(() => {
+    return () => { activeReviewStreamRef.current?.close() }
+  }, [])
 
   // ── Load selected project from DB when parent changes selection ────────────
   useEffect(() => {
@@ -465,7 +471,10 @@ export default function DocumentReview({
       // via SSE instead of waiting on this one request. isLoading/
       // submittingRef only clear once the stream reports ready or error,
       // not when this function returns.
-      const es = new EventSource(`${API_BASE}/api/review/${reviewProjectId}/status`)
+      const tokenParam = session?.access_token ? `?token=${encodeURIComponent(session.access_token)}` : ''
+      activeReviewStreamRef.current?.close()
+      const es = new EventSource(`${API_BASE}/api/review/${reviewProjectId}/status${tokenParam}`)
+      activeReviewStreamRef.current = es
 
       es.onmessage = async (e) => {
         let progress: { status: string; message?: string; result?: ReviewResult }
@@ -489,6 +498,7 @@ export default function DocumentReview({
         setResult(data)
         setStatusFilter(null)
 
+        try {
         // /api/review already chunks, embeds, and stores the schedule/
         // narrative/SP data under project_id. Session upload reuses that
         // same data (passing project_id instead of re-uploading the files)
@@ -543,15 +553,29 @@ export default function DocumentReview({
           }
         }
 
-        setIsLoading(false)
-        submittingRef.current = false
+        } catch (err) {
+          setError(err instanceof Error ? err.message : 'The review finished, but saving it failed.')
+        } finally {
+          setIsLoading(false)
+          submittingRef.current = false
+        }
       }
 
+      let onErrorCount = 0
       es.onerror = () => {
-        es.close()
-        setError('Lost connection while waiting for the review to finish.')
-        setIsLoading(false)
-        submittingRef.current = false
+        onErrorCount += 1
+        // EventSource retries automatically unless we close it -- only give
+        // up after several consecutive failures, so a brief network blip
+        // during a multi-minute review doesn't discard the result, which
+        // (for a first-time review) exists only in the server's in-memory
+        // progress store until the review finishes and this component's
+        // own Supabase insert runs.
+        if (onErrorCount >= 5) {
+          es.close()
+          setError('Lost connection while waiting for the review to finish. Please check the review list in a moment — it may have completed.')
+          setIsLoading(false)
+          submittingRef.current = false
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An unexpected error occurred.')
@@ -603,7 +627,10 @@ export default function DocumentReview({
       }
       await res.json()   // {project_id, status: "processing"} -- projectId is already known
 
-      const es = new EventSource(`${API_BASE}/api/review/${projectId}/status`)
+      const tokenParam = session?.access_token ? `?token=${encodeURIComponent(session.access_token)}` : ''
+      activeReviewStreamRef.current?.close()
+      const es = new EventSource(`${API_BASE}/api/review/${projectId}/status${tokenParam}`)
+      activeReviewStreamRef.current = es
 
       es.onmessage = (e) => {
         let progress: { status: string; message?: string; result?: ReviewResult }
@@ -629,11 +656,15 @@ export default function DocumentReview({
         rerunningRef.current = false
       }
 
+      let onErrorCount = 0
       es.onerror = () => {
-        es.close()
-        setRerunError('Lost connection while waiting for the review to finish.')
-        setIsRerunning(false)
-        rerunningRef.current = false
+        onErrorCount += 1
+        if (onErrorCount >= 5) {
+          es.close()
+          setRerunError('Lost connection while waiting for the review to finish. Please check back in a moment — it may have completed.')
+          setIsRerunning(false)
+          rerunningRef.current = false
+        }
       }
     } catch (err) {
       setRerunError(err instanceof Error ? err.message : 'An unexpected error occurred.')

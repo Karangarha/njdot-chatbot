@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+from fastapi import HTTPException
+
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -111,6 +113,47 @@ def test_review_status_reports_error_when_truly_not_found():
 
     assert len(events) == 1
     assert '"status": "error"' in events[0]
+
+
+def test_review_status_rejects_wrong_owner_in_memory():
+    _set_review_progress("p1", status="ready", message="Review complete.", result={"project_id": "p1"}, user_id="owner-1")
+
+    with patch("app.api.review.user_id_from_token_optional", return_value="someone-else"):
+        try:
+            asyncio.run(review_status("p1", token="wrong-persons-token"))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 403
+
+
+def test_review_status_allows_matching_owner_in_memory():
+    _set_review_progress("p1", status="ready", message="Review complete.", result={"project_id": "p1"}, user_id="owner-1")
+
+    with patch("app.api.review.user_id_from_token_optional", return_value="owner-1"):
+        response = asyncio.run(review_status("p1", token="owners-own-token"))
+        events = asyncio.run(_collect_events(response))
+
+    assert '"status": "ready"' in events[0]
+
+
+def test_review_status_allows_anonymous_review_with_no_token():
+    _set_review_progress("p1", status="ready", message="Review complete.", result={"project_id": "p1"})  # no user_id -- anonymous
+
+    response = asyncio.run(review_status("p1"))
+    events = asyncio.run(_collect_events(response))
+
+    assert '"status": "ready"' in events[0]
+
+
+def test_review_status_rejects_wrong_owner_via_supabase_fallback():
+    stored_result = {"project_id": "p2"}
+    with patch("app.api.review.get_db", return_value=_FakeDB([{"user_id": "owner-1", "review_result": stored_result}])), \
+         patch("app.api.review.user_id_from_token_optional", return_value="someone-else"):
+        try:
+            asyncio.run(review_status("p2", token="wrong-persons-token"))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 403
 
 
 if __name__ == "__main__":
