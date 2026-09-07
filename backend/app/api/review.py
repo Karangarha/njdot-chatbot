@@ -163,13 +163,14 @@ async def review_status(project_id: str, token: Optional[str] = None) -> Streami
                 .eq("id", project_id).limit(1).execute().data
             ) or []
             row = rows[0] if rows else None
-            if row and row.get("user_id") and row.get("user_id") != caller_user_id:
+            owner_user_id = row.get("user_id") if row else None
+            if owner_user_id and owner_user_id != caller_user_id:
                 raise HTTPException(status_code=403, detail="This review does not belong to you")
             result = row.get("review_result") if row else None
             if result:
-                _set_review_progress(project_id, status="ready", message="Review complete.", result=result)
+                _set_review_progress(project_id, status="ready", message="Review complete.", result=result, user_id=owner_user_id)
             else:
-                _set_review_progress(project_id, status="error", message="Review not found.")
+                _set_review_progress(project_id, status="error", message="Review not found.", user_id=owner_user_id)
         except HTTPException:
             raise
         except Exception as exc:
@@ -1071,6 +1072,10 @@ async def review_endpoint(
                 detail="schedule_file and narrative_pdf are required "
                        "(either as files, or as schedule_file_path/narrative_pdf_path).",
             )
+        if project_id:
+            existing_owner = _review_progress.get(project_id, {}).get("user_id")
+            if existing_owner and existing_owner != user_id:
+                raise HTTPException(status_code=403, detail="This project_id belongs to another review.")
         project_id = project_id or str(uuid.uuid4())
         try:
             schedule_bytes = await schedule_file.read()

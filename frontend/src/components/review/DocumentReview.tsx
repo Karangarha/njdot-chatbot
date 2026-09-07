@@ -483,6 +483,7 @@ export default function DocumentReview({
         } catch {
           return
         }
+        onErrorCount = 0
 
         if (progress.status === 'error') {
           es.close()
@@ -569,8 +570,11 @@ export default function DocumentReview({
         // during a multi-minute review doesn't discard the result, which
         // (for a first-time review) exists only in the server's in-memory
         // progress store until the review finishes and this component's
-        // own Supabase insert runs.
-        if (onErrorCount >= 5) {
+        // own Supabase insert runs. A CLOSED readyState means the browser
+        // has already given up retrying (e.g. the server returned a
+        // terminal HTTP error like 403/404), so there is no point waiting
+        // for more failures.
+        if (onErrorCount >= 5 || es.readyState === EventSource.CLOSED) {
           es.close()
           setError('Lost connection while waiting for the review to finish. Please check the review list in a moment — it may have completed.')
           setIsLoading(false)
@@ -639,6 +643,7 @@ export default function DocumentReview({
         } catch {
           return
         }
+        onErrorCount = 0
 
         if (progress.status === 'error') {
           es.close()
@@ -659,7 +664,8 @@ export default function DocumentReview({
       let onErrorCount = 0
       es.onerror = () => {
         onErrorCount += 1
-        if (onErrorCount >= 5) {
+        // See runReview()'s matching handler for why readyState is checked.
+        if (onErrorCount >= 5 || es.readyState === EventSource.CLOSED) {
           es.close()
           setRerunError('Lost connection while waiting for the review to finish. Please check back in a moment — it may have completed.')
           setIsRerunning(false)

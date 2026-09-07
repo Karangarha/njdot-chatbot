@@ -29,7 +29,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from fastapi import HTTPException  # noqa: E402
-from app.api.review import review_endpoint  # noqa: E402
+from app.api.review import review_endpoint, _review_progress  # noqa: E402
 
 
 class _FakeUploadFile:
@@ -287,6 +287,51 @@ def test_raw_upload_signed_in_uploads_and_mints_project_id():
     assert bucket.uploaded[f"user-1/{minted_id}/narrative.pdf"] == b"NARRATIVE-BYTES"
     _, args, _ = bg.tasks[0]
     assert args[9] == f"user-1/{minted_id}/schedule.xer"   # schedule_path
+
+
+def test_raw_upload_rejects_project_id_owned_by_another_review():
+    """A caller-supplied project_id in the raw-upload branch must not be
+    allowed to hijack an in-flight review owned by someone else -- see Fix C
+    in final-review-fixes-2-brief.md. Without the check, this wipes the
+    legitimate owner's in-memory progress entry (review_endpoint pops it
+    before writing "queued") and the owner's already-streaming EventSource
+    would receive the attacker's result instead of their own."""
+    _review_progress.clear()
+    _review_progress["shared-id"] = {"status": "running", "user_id": "owner-123"}
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="attacker-456"):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file=_FakeUploadFile(b"XER-BYTES"),
+                    narrative_pdf=_FakeUploadFile(b"NARRATIVE-BYTES"),
+                    project_id="shared-id",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_raw_upload_allows_same_owner_to_reuse_their_own_project_id():
+    """The Fix C ownership check must not block a legitimate retry/resubmit
+    by the SAME owner reusing their own project_id."""
+    bucket = _FakeBucket()
+    _review_progress.clear()
+    _review_progress["shared-id"] = {"status": "running", "user_id": "owner-123"}
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="owner-123"), \
+             patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+            bg = _FakeBackgroundTasks()
+            result = _run(_call_review_endpoint(
+                background_tasks=bg,
+                schedule_file=_FakeUploadFile(b"XER-BYTES"),
+                narrative_pdf=_FakeUploadFile(b"NARRATIVE-BYTES"),
+                project_id="shared-id",
+            ))
+        assert result == {"project_id": "shared-id", "status": "processing"}
+    finally:
+        _review_progress.clear()
 
 
 def test_run_review_pipeline_background_success_sets_ready():

@@ -156,6 +156,31 @@ def test_review_status_rejects_wrong_owner_via_supabase_fallback():
             assert e.status_code == 403
 
 
+def test_review_status_caches_owner_from_supabase_fallback():
+    """The DB-fallback branch must record the row's real owner into the
+    in-memory cache it populates -- otherwise a SECOND request for the same
+    project_id (e.g. no token, or a different caller) hits the now-warmed
+    in-memory branch, finds an ownerless entry, and the ownership check
+    there passes it through. This is Fix 1 (the original review_status
+    ownership check) reopened via its own cache."""
+    stored_result = {"project_id": "p3"}
+    with patch("app.api.review.get_db", return_value=_FakeDB([{"user_id": "owner-1", "review_result": stored_result}])), \
+         patch("app.api.review.user_id_from_token_optional", return_value="owner-1"):
+        # First request, as the legitimate owner -- populates the DB-fallback
+        # branch and (before the fix) caches an ownerless entry.
+        response = asyncio.run(review_status("p3", token="owners-own-token"))
+        events = asyncio.run(_collect_events(response))
+    assert '"status": "ready"' in events[0]
+
+    # Second request for the same project_id, no token at all (any other
+    # caller) -- now hits the in-memory branch warmed by the first request.
+    try:
+        asyncio.run(review_status("p3", token=None))
+        assert False, "Should have raised HTTPException"
+    except HTTPException as e:
+        assert e.status_code == 403
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
