@@ -26,6 +26,19 @@ class Neo4jClient:
                 password=config.NEO4J_PASSWORD,
                 database=config.NEO4J_DATABASE,
                 enhanced_schema=True,
+                # This client is a process-wide singleton (see below), so its
+                # driver's connection pool can sit idle for minutes between
+                # requests. The neo4j driver's liveness_check_timeout defaults
+                # to None (never verify a pooled connection before reuse), so
+                # a connection silently killed by an intermediate NAT/idle
+                # timeout (Azure's outbound NAT, Aura's own reaping, etc.)
+                # looks fine in the pool until a query actually tries to use
+                # it, raising SessionExpired/ServiceUnavailable -- reproduced
+                # in production after a ~4min idle gap between two reviews.
+                # A short liveness check makes the driver ping (and silently
+                # replace) a connection that's been idle this long, before
+                # ever handing it to a query.
+                driver_config={"liveness_check_timeout": 60},
             )
             print("OK Neo4j client initialized")
 
