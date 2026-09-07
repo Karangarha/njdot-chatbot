@@ -50,6 +50,34 @@ class _FakeDB:
         return _FakeQuery(self._rows)
 
 
+class _RaisingQuery:
+    """Mimics a Supabase query that fails at .execute() -- a transient
+    network blip, not a genuine "row not found"."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def select(self, *args, **kwargs):
+        return self
+
+    def eq(self, *args, **kwargs):
+        return self
+
+    def limit(self, *args, **kwargs):
+        return self
+
+    def execute(self):
+        raise self._exc
+
+
+class _RaisingDB:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def table(self, name):
+        return _RaisingQuery(self._exc)
+
+
 async def _collect_events(response, max_events: int = 5):
     """Consume a StreamingResponse's async generator up to max_events (a
     safety cap — every test here expects the stream to close on its own
@@ -179,6 +207,30 @@ def test_review_status_caches_owner_from_supabase_fallback():
         assert False, "Should have raised HTTPException"
     except HTTPException as e:
         assert e.status_code == 403
+
+
+def test_review_status_db_exception_does_not_poison_cache_for_next_request():
+    """Fix E (final-review-fixes-3-brief.md): a transient Supabase query
+    failure (network blip) must not be cached in _review_progress as a
+    permanent "error" -- that would make a review that actually completed
+    (or is still running) unreachable forever after one bad network tick."""
+    with patch("app.api.review.get_db", return_value=_RaisingDB(RuntimeError("network blip"))):
+        response = asyncio.run(review_status("p4", token=None))
+        events = asyncio.run(_collect_events(response))
+
+    assert len(events) == 1
+    assert '"status": "error"' in events[0]
+    assert "p4" not in _review_progress  # NOT cached -- the failure was transient
+
+    # Follow-up: the blip has cleared, Supabase now answers normally with a
+    # ready result. The retry must actually reach Supabase again instead of
+    # returning a permanently-cached error.
+    stored_result = {"project_id": "p4"}
+    with patch("app.api.review.get_db", return_value=_FakeDB([{"user_id": None, "review_result": stored_result}])):
+        response = asyncio.run(review_status("p4", token=None))
+        events = asyncio.run(_collect_events(response))
+
+    assert '"status": "ready"' in events[0]
 
 
 if __name__ == "__main__":

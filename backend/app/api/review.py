@@ -150,6 +150,7 @@ async def review_status(project_id: str, token: Optional[str] = None) -> Streami
     review that actually finished before a restart still reports ready.
     """
     caller_user_id = user_id_from_token_optional(f"Bearer {token}") if token else None
+    transient_error: Optional[str] = None
 
     if project_id in _review_progress:
         owner_user_id = _review_progress[project_id].get("user_id")
@@ -175,9 +176,12 @@ async def review_status(project_id: str, token: Optional[str] = None) -> Streami
             raise
         except Exception as exc:
             logger.warning("DB check for review %s failed: %s", project_id, exc)
-            _set_review_progress(project_id, status="error", message="Review not found.")
+            transient_error = "Review not found."
 
     async def _generator():
+        if transient_error is not None:
+            yield f"data: {json.dumps({'status': 'error', 'message': transient_error})}\n\n"
+            return
         while True:
             progress = _review_progress.get(
                 project_id,
@@ -1037,6 +1041,21 @@ async def review_endpoint(
     user_id = user_id_from_token_optional(authorization)
     using_stored_paths = bool(schedule_file_path or narrative_pdf_path)
 
+    if project_id:
+        existing_owner = _review_progress.get(project_id, {}).get("user_id")
+        if not existing_owner:
+            try:
+                existing_rows = (
+                    get_db().table("review_projects").select("user_id")
+                    .eq("id", project_id).limit(1).execute().data
+                ) or []
+                if existing_rows:
+                    existing_owner = existing_rows[0].get("user_id")
+            except Exception as exc:
+                logger.warning("Ownership pre-check for project_id=%s failed: %s", project_id, exc)
+        if existing_owner and existing_owner != user_id:
+            raise HTTPException(status_code=403, detail="This project_id belongs to another review.")
+
     if using_stored_paths:
         if not user_id:
             raise HTTPException(status_code=400, detail="*_path fields require a signed-in session.")
@@ -1072,10 +1091,6 @@ async def review_endpoint(
                 detail="schedule_file and narrative_pdf are required "
                        "(either as files, or as schedule_file_path/narrative_pdf_path).",
             )
-        if project_id:
-            existing_owner = _review_progress.get(project_id, {}).get("user_id")
-            if existing_owner and existing_owner != user_id:
-                raise HTTPException(status_code=403, detail="This project_id belongs to another review.")
         project_id = project_id or str(uuid.uuid4())
         try:
             schedule_bytes = await schedule_file.read()

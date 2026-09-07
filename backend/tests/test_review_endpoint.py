@@ -67,9 +67,33 @@ class _FakeStorage:
         return self.bucket
 
 
+class _FakeQuery:
+    """Mimics Supabase's chainable table-query builder — see
+    test_review_status.py's identically-shaped _FakeQuery."""
+
+    def __init__(self, data):
+        self._data = data
+
+    def select(self, *args, **kwargs):
+        return self
+
+    def eq(self, *args, **kwargs):
+        return self
+
+    def limit(self, *args, **kwargs):
+        return self
+
+    def execute(self):
+        return type("Executed", (), {"data": self._data})()
+
+
 class _FakeDB:
-    def __init__(self, bucket: _FakeBucket | None = None):
+    def __init__(self, bucket: _FakeBucket | None = None, table_rows: list | None = None):
         self.storage = _FakeStorage(bucket or _FakeBucket())
+        self._table_rows = table_rows or []
+
+    def table(self, name):
+        return _FakeQuery(self._table_rows)
 
 
 def _run(coro):
@@ -236,6 +260,72 @@ def test_stored_paths_decodes_utility_plan_path_list():
 
     _, args, _ = bg.tasks[0]
     assert args[8] == [b"UP0", b"UP1"]  # utility_plan_bytes_list
+
+
+def test_stored_paths_rejects_project_id_owned_by_another_review_in_memory():
+    """Fix D (final-review-fixes-3-brief.md): the ownership check must also
+    cover the stored-paths branch, not just raw-upload -- this is the branch
+    every signed-in client's normal flow actually uses."""
+    _review_progress.clear()
+    _review_progress["p1"] = {"status": "running", "user_id": "owner-123"}
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="attacker-456"):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="u1/p1/schedule.xer",
+                    narrative_pdf_path="u1/p1/narrative.pdf",
+                    project_id="p1",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_stored_paths_rejects_project_id_owned_by_another_review_via_db():
+    """Same hijack, but for a project_id that finished (and dropped out of
+    the in-memory dict, e.g. after a process restart) -- the ownership check
+    must also fall back to the review_projects table."""
+    _review_progress.clear()
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="attacker-456"), \
+             patch("app.api.review.get_db", return_value=_FakeDB(table_rows=[{"user_id": "owner-123"}])):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="u1/p1/schedule.xer",
+                    narrative_pdf_path="u1/p1/narrative.pdf",
+                    project_id="p1",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_stored_paths_allows_same_owner_to_reuse_their_own_project_id():
+    """The hoisted ownership check must not block a legitimate resubmit by
+    the same owner reusing their own project_id in the stored-paths branch."""
+    bucket = _FakeBucket(downloads={
+        "u1/p1/schedule.xer": b"XER-BYTES",
+        "u1/p1/narrative.pdf": b"NARRATIVE-BYTES",
+    })
+    _review_progress.clear()
+    _review_progress["p1"] = {"status": "running", "user_id": "owner-123"}
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="owner-123"), \
+             patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+            bg = _FakeBackgroundTasks()
+            result = _run(_call_review_endpoint(
+                background_tasks=bg,
+                schedule_file_path="u1/p1/schedule.xer",
+                narrative_pdf_path="u1/p1/narrative.pdf",
+                project_id="p1",
+            ))
+        assert result == {"project_id": "p1", "status": "processing"}
+    finally:
+        _review_progress.clear()
 
 
 # ── Raw-upload branch (unchanged behavior, now explicitly validated) ────────
