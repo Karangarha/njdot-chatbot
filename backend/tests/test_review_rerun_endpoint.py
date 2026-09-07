@@ -185,6 +185,29 @@ def test_rerun_rejects_row_with_mismatched_narrative_path():
             assert e.status_code == 403
 
 
+def test_rerun_rejects_percent_encoded_dotdot_traversal_in_row_path():
+    """Fix J (final-review-fixes-6-brief.md): round 5's _validate_owned_path
+    only rejected a LITERAL '..' path segment via raw-string splitting.
+    "%2e%2e" is not the string '..', so it passed that check -- but
+    storage3's actual yarl-based request building percent-decodes it to
+    '..' and resolves it out of the owner's directory. A DB row whose path
+    column was populated (via the client-side Supabase insert, not this
+    backend -- see test_rerun_rejects_row_with_mismatched_narrative_path
+    above) with such a payload must still be rejected with a 403."""
+    row = {**ROW, "narrative_pdf_path": "user-1/%2e%2e/victim/proj/narrative.pdf"}
+    db = _FakeDB(row, downloads={"user-1/p1/schedule.xer": b"XER"})
+    with patch("app.api.review.user_id_from_token", return_value="user-1"), \
+         patch("app.api.review.get_db", return_value=db):
+        try:
+            _run(review_rerun_endpoint(
+                project_id="p1", background_tasks=_FakeBackgroundTasks(),
+                authorization="Bearer token", checks=None,
+            ))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 403
+
+
 def test_run_review_rerun_background_success_updates_db_and_sets_ready():
     db = _FakeDB(ROW)
 

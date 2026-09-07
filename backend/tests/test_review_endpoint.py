@@ -417,6 +417,81 @@ def test_stored_paths_rejects_dotdot_traversal_disguised_as_own_prefix():
         _review_progress.clear()
 
 
+def test_stored_paths_rejects_percent_encoded_dotdot_traversal():
+    """Fix J (final-review-fixes-6-brief.md): round 5's _validate_owned_path
+    split the RAW string on '/' and rejected literal '..' segments -- but
+    "%2e%2e" is not the string '..', so it slipped past that check. storage3
+    builds its actual request via yarl, which percent-decodes "%2e%2e" to
+    '..' and then resolves it during URL.joinpath -- escaping user-1/ on
+    the wire even though the raw string never contained a literal '..'
+    segment."""
+    _review_progress.clear()
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+             patch("app.api.review.get_db", return_value=_FakeDB()):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="user-1/%2e%2e/victim/p/schedule.xer",
+                    narrative_pdf_path="user-1/p9/narrative.pdf",
+                    project_id="p9",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_stored_paths_rejects_encoded_slash_traversal():
+    """Companion to the above -- "..%2f" (a percent-encoded slash after a
+    literal '..') is also not caught by a raw-string segment check, but
+    yarl's joinpath still resolves it out of user-1/'s directory."""
+    _review_progress.clear()
+    try:
+        with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+             patch("app.api.review.get_db", return_value=_FakeDB()):
+            try:
+                _run(_call_review_endpoint(
+                    schedule_file_path="user-1/..%2fvictim/p/schedule.xer",
+                    narrative_pdf_path="user-1/p9/narrative.pdf",
+                    project_id="p9",
+                ))
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    finally:
+        _review_progress.clear()
+
+
+def test_stored_paths_rejects_non_string_utility_plan_path_entry():
+    """Fix L (final-review-fixes-6-brief.md): a non-string entry in the
+    caller's utility_plan_pdf_paths JSON array (e.g. `[123]`) must not reach
+    _validate_owned_path (which would raise an unrelated AttributeError/
+    TypeError that the generic except-Exception handler would then wrap into
+    a misleading 502 leaking raw Python error text). It must be rejected
+    with a clean 400 naming the offending field."""
+    bucket = _FakeBucket(downloads={
+        "user-1/p1/schedule.xer": b"XER",
+        "user-1/p1/narrative.pdf": b"NARR",
+    })
+    with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+         patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+        try:
+            _run(_call_review_endpoint(
+                schedule_file_path="user-1/p1/schedule.xer",
+                narrative_pdf_path="user-1/p1/narrative.pdf",
+                utility_plan_pdf_paths="[123]",
+                project_id="p1",
+            ))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 400
+            assert "utility_plan_pdf_paths" in e.detail
+            # No leaked raw Python type-error text.
+            assert "attribute" not in e.detail.lower()
+            assert "'int'" not in e.detail
+
+
 def test_raw_upload_rejects_project_id_containing_path_traversal():
     """Fix H step 3 (final-review-fixes-5-brief.md): the raw-upload branch
     interpolates project_id directly into the Storage upload path
@@ -435,6 +510,36 @@ def test_raw_upload_rejects_project_id_containing_path_traversal():
             assert False, "Should have raised HTTPException"
         except HTTPException as e:
             assert e.status_code == 400
+
+
+def test_raw_upload_rejects_percent_encoded_dotdot_project_id():
+    """Fix K (final-review-fixes-6-brief.md): the raw-upload branch's cheap
+    early check (`"/" in project_id or project_id in (".", "..")`) only
+    catches LITERAL '..' -- "%2e%2e" is not equal to '..' as a string and
+    contains no '/', so it passes that check by design and reaches the
+    upload block. Once interpolated into
+    f"{user_id}/{project_id}/schedule.xer" = "user-1/%2e%2e/schedule.xer",
+    that path resolves (via the same yarl decoding Fix J fixes) outside
+    user-1/'s own directory -- bucket.upload() would silently overwrite
+    whatever file already exists there. The now-fixed _validate_owned_path,
+    called on each fully-constructed upload path immediately before its own
+    bucket.upload(), must reject this with a 403 BEFORE any upload call --
+    asserted here via bucket.uploaded being empty afterward, not just via
+    the exception, since an exception alone wouldn't prove the write was
+    prevented rather than merely failing after the fact."""
+    bucket = _FakeBucket()
+    with patch("app.api.review.user_id_from_token_optional", return_value="user-1"), \
+         patch("app.api.review.get_db", return_value=_FakeDB(bucket)):
+        try:
+            _run(_call_review_endpoint(
+                schedule_file=_FakeUploadFile(b"XER-BYTES"),
+                narrative_pdf=_FakeUploadFile(b"NARRATIVE-BYTES"),
+                project_id="%2e%2e",
+            ))
+            assert False, "Should have raised HTTPException"
+        except HTTPException as e:
+            assert e.status_code == 403
+    assert bucket.uploaded == {}
 
 
 # ── Raw-upload branch (unchanged behavior, now explicitly validated) ────────

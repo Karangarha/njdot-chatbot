@@ -50,6 +50,7 @@ from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPExceptio
 from fastapi.responses import StreamingResponse
 from langchain_anthropic import ChatAnthropic
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from yarl import URL as _YarlURL
 
 from app.auth import user_id_from_token, user_id_from_token_optional
 from app.compliance.catalog import BUILTIN_CHECKS, MANUAL_REVIEW_KEYS, CheckDef
@@ -128,17 +129,41 @@ def _set_review_progress(project_id: str, **kwargs: Any) -> None:
     _review_progress[project_id] = {**_review_progress.get(project_id, {}), **kwargs}
 
 
+# Arbitrary fixed base -- only used so `.joinpath()` can resolve '.'/'..'
+# segments exactly the way storage3's own request-building does; never
+# actually requested over the network.
+_PATH_RESOLUTION_BASE = _YarlURL("https://storage.invalid/prefix")
+
+
+def _relative_path_parts(path: str) -> tuple:
+    """Mirrors storage3's own relative_path_to_parts (strips a leading
+    absolute-path marker before returning yarl's parsed segments). Kept
+    as a local copy rather than importing storage3's private
+    `_sync.file_api` submodule -- this piece is 4 lines and trivial to
+    keep in sync; the private import would be more fragile across
+    storage3 version bumps than reimplementing this specific, tiny,
+    documented behavior."""
+    url = _YarlURL(path)
+    if url.absolute or (url.parts and url.parts[0] == "/"):
+        return url.parts[1:]
+    return url.parts
+
+
 def _validate_owned_path(path: str, user_id: str) -> None:
-    """Raises 403 unless `path`'s first segment is exactly `user_id` and
-    no segment is empty, '.', or '..'. A plain `path.startswith(f"{user_id}/")`
-    check is NOT sufficient: storage3 (the Supabase Storage client) builds
-    its request URL via yarl's URL.joinpath, which collapses '..' segments
-    per normal URL-path resolution -- "attacker/../victim/p/x" passes a
-    startswith("attacker/") check as a string but resolves on the wire to
-    ".../victim/p/x". Splitting into segments and rejecting '.'/'..'
-    anywhere closes that."""
-    parts = path.split("/")
-    if not parts or parts[0] != user_id or any(p in ("", ".", "..") for p in parts):
+    """Raises 403 unless `path` resolves (after the SAME '.'/'..'
+    resolution and percent-decoding storage3's own yarl-based request
+    building performs) to a path whose first segment is `user_id`, with
+    at least one segment after it. A raw-string prefix/segment check is
+    NOT sufficient here: yarl percent-decodes during parsing and
+    resolves '.'/'..' during `.joinpath()`, so e.g. "user-1/%2e%2e/x"
+    or "user-1/..%2fx" both look safe as strings but resolve outside
+    "user-1/" once storage3 actually builds its request. Resolving the
+    path ourselves through the identical yarl machinery, rather than
+    guessing at string patterns, is the only way to stay correct as that
+    decoding logic exists in a dependency we don't control."""
+    parts = _relative_path_parts(path)
+    resolved = _PATH_RESOLUTION_BASE.joinpath(*parts).parts[2:]
+    if len(resolved) < 2 or resolved[0] != user_id:
         raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
 
 
@@ -1096,6 +1121,8 @@ async def review_endpoint(
             estimate_bytes = bucket.download(estimate_pdf_path) if estimate_pdf_path else None
             utility_plan_paths_list = json.loads(utility_plan_pdf_paths) if utility_plan_pdf_paths else []
             for _p in utility_plan_paths_list:
+                if not isinstance(_p, str):
+                    raise HTTPException(status_code=400, detail="utility_plan_pdf_paths entries must be strings.")
                 _validate_owned_path(_p, user_id)
             utility_plan_bytes_list = [bucket.download(p) for p in utility_plan_paths_list]
         except HTTPException:
@@ -1133,18 +1160,25 @@ async def review_endpoint(
                 bucket = db.storage.from_(_STORAGE_BUCKET)
                 base = f"{user_id}/{project_id}"
                 schedule_path = f"{base}/schedule.xer"
+                _validate_owned_path(schedule_path, user_id)
                 bucket.upload(schedule_path, schedule_bytes, {"upsert": "true"})
                 narrative_path = f"{base}/narrative.pdf"
+                _validate_owned_path(narrative_path, user_id)
                 bucket.upload(narrative_path, narrative_bytes, {"upsert": "true"})
                 if sp_bytes:
                     sp_path = f"{base}/special_provision.pdf"
+                    _validate_owned_path(sp_path, user_id)
                     bucket.upload(sp_path, sp_bytes, {"upsert": "true"})
                 if keymap_bytes:
                     keymap_path = f"{base}/key_map.pdf"
+                    _validate_owned_path(keymap_path, user_id)
                     bucket.upload(keymap_path, keymap_bytes, {"upsert": "true"})
                 if estimate_bytes:
                     estimate_path = f"{base}/estimate.pdf"
+                    _validate_owned_path(estimate_path, user_id)
                     bucket.upload(estimate_path, estimate_bytes, {"upsert": "true"})
+            except HTTPException:
+                raise
             except Exception:
                 # Best-effort — "Re-run" just won't be offered for this project;
                 # the review itself should still succeed.

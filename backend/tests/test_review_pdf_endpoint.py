@@ -299,6 +299,33 @@ def test_path_belonging_to_different_user_returns_403():
     asyncio.run(run_test())
 
 
+def test_percent_encoded_dotdot_traversal_returns_403():
+    """Fix J (final-review-fixes-6-brief.md): round 5's _validate_owned_path
+    only rejected a LITERAL '..' path segment via raw-string splitting.
+    "%2e%2e" is not the string '..', so it passed that check -- but
+    storage3's actual yarl-based request building percent-decodes it to
+    '..' and resolves it out of the owner's directory. A DB row whose path
+    column carries such a payload (not a literal '..') must still be
+    rejected with a 403."""
+    async def run_test():
+        with patch("app.api.review.get_db") as mock_get_db, \
+             patch("app.api.review.user_id_from_token") as mock_token:
+            mock_token.return_value = "user-123"
+            mock_get_db.return_value = _FakeDB(
+                table_data={
+                    "id": "proj-1",
+                    "user_id": "user-123",
+                    "narrative_pdf_path": "user-123/%2e%2e/victim/proj-1/narrative.pdf",
+                }
+            )
+            try:
+                await review_pdf_endpoint("proj-1", "narrative", "Bearer token")
+                assert False, "Should have raised HTTPException"
+            except HTTPException as e:
+                assert e.status_code == 403
+    asyncio.run(run_test())
+
+
 def test_bucket_download_raises_returns_502():
     """If bucket.download() raises an exception, should return 502."""
     async def run_test():
@@ -338,6 +365,7 @@ if __name__ == "__main__":
         test_key_map_happy_path,
         test_estimate_happy_path,
         test_path_belonging_to_different_user_returns_403,
+        test_percent_encoded_dotdot_traversal_returns_403,
         test_bucket_download_raises_returns_502,
     ]
 
