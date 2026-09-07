@@ -74,7 +74,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: backend-app
-          path: backend
+          # A bare directory path (e.g. "backend") preserves it as a prefix
+          # inside the artifact -- the deployed content would then have
+          # requirements.txt at backend/requirements.txt instead of the
+          # root, and Oryx's "No framework detected" build step never finds
+          # it. "backend/*" flattens everything after the wildcard instead,
+          # so requirements.txt lands at the artifact's root as intended.
+          path: backend/*
           # Oryx re-installs dependencies server-side (SCM_DO_BUILD_DURING_DEPLOYMENT=1)
           # from requirements.txt at the deployed root, so a local venv isn't needed here.
 
