@@ -266,6 +266,7 @@ export default function DocumentReview({
   const [estimateFile,  setEstimateFile]  = useState<File | null>(null)
   const [utilityPlanFiles, setUtilityPlanFiles] = useState<File[]>([])
   const [isLoading,     setIsLoading]     = useState(false)
+  const [loadingMessage, setLoadingMessage] = useState('Starting review…')
   const [error,         setError]         = useState<string | null>(null)
   const [result,        setResult]        = useState<ReviewResult | null>(null)
   const [sessionId,     setSessionId]     = useState<string | null>(null)
@@ -399,6 +400,7 @@ export default function DocumentReview({
     }
 
     setIsLoading(true)
+    setLoadingMessage('Starting review…')
     setError(null)
 
     try {
@@ -491,6 +493,9 @@ export default function DocumentReview({
           setIsLoading(false)
           submittingRef.current = false
           return
+        }
+        if (progress.message) {
+          setLoadingMessage(progress.message)
         }
         if (progress.status !== 'ready' || !progress.result) return
         es.close()
@@ -958,7 +963,7 @@ export default function DocumentReview({
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
             <span className="text-sm font-medium text-[#1B3A6B]">
-              Analyzing documents… this may take up to 1 min 30 seconds
+              {loadingMessage}
             </span>
           </div>
         ) : (
