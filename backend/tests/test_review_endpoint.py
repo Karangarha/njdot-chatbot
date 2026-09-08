@@ -22,14 +22,15 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import patch
+import contextlib
+from unittest.mock import MagicMock, patch
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from fastapi import HTTPException  # noqa: E402
-from app.api.review import review_endpoint, _review_progress  # noqa: E402
+from app.api.review import review_endpoint, _review_progress, _run_review_pipeline  # noqa: E402
 
 
 class _FakeUploadFile:
@@ -775,6 +776,87 @@ def test_run_review_pipeline_background_generic_exception_sets_error():
     assert _review_progress["p1"]["status"] == "error"
     assert _review_progress["p1"]["message"] == "An unexpected error occurred while running the review."
     assert "neo4j is down" not in _review_progress["p1"]["message"]
+
+
+def _common_pipeline_patches(graph=None):
+    """Context-manager stack patching every external dependency
+    `_run_review_pipeline` touches to a safe no-op, for tests that only
+    care about the sequence of `_set_review_progress` calls it makes.
+    `graph` lets a test control what `get_neo4j()` returns (e.g. to
+    control the reseed=False fast-path detection query)."""
+    graph = graph if graph is not None else MagicMock()
+    stack = contextlib.ExitStack()
+    stack.enter_context(patch("app.api.review.get_neo4j", return_value=graph))
+    stack.enter_context(patch("app.api.review.get_db", return_value=MagicMock()))
+    stack.enter_context(patch("app.api.review.OpenAIEmbeddings", return_value=MagicMock()))
+    stack.enter_context(patch("app.api.review.ChatOpenAI", return_value=MagicMock()))
+    stack.enter_context(patch("app.api.review.ChatAnthropic", return_value=MagicMock()))
+    stack.enter_context(patch(
+        "app.api.review.parse_xer_all",
+        return_value={"activities": [], "calendars": [], "project": {}},
+    ))
+    stack.enter_context(patch("app.api.review.seed_schedule"))
+    stack.enter_context(patch("app.api.review._bytes_to_pdf_pages", return_value=[]))
+    stack.enter_context(patch("app.api.review.chunk_narrative", return_value=[]))
+    stack.enter_context(patch("app.api.review.seed_narrative"))
+    stack.enter_context(patch("app.api.review._seed_edq_items_if_needed"))
+    stack.enter_context(patch("app.api.review.evaluate_edq_coverage", return_value=None))
+    stack.enter_context(patch("app.api.review._build_static_doc_search_fn", return_value=None))
+    stack.enter_context(patch("app.api.review.evaluate_checks", return_value=[]))
+    return stack
+
+
+def test_run_review_pipeline_fresh_review_reports_unconditional_stage_messages():
+    _review_progress.clear()
+    try:
+        with _common_pipeline_patches(), \
+             patch("app.api.review._set_review_progress") as mock_progress:
+            _run_review_pipeline(
+                schedule_bytes=b"", narrative_bytes=b"", sp_bytes=None,
+                keymap_bytes=None, estimate_bytes=None, selected_checks=None,
+                project_id="p1", reseed=True, user_id="user-1",
+            )
+
+        messages = [c.kwargs.get("message") for c in mock_progress.call_args_list]
+        assert messages == [
+            "Seeding schedule graph…",
+            "Seeding narrative graph…",
+            "Preparing compliance checklist…",
+            "Running compliance checks (0/57)…",
+        ]
+    finally:
+        _review_progress.clear()
+
+
+def test_run_review_pipeline_fresh_review_reports_conditional_stage_messages():
+    _review_progress.clear()
+    try:
+        with _common_pipeline_patches(), \
+             patch("app.api.review._bytes_to_sp_chunks", return_value=[]), \
+             patch("app.api.review._extract_and_store_keymap", return_value=None), \
+             patch("app.api.review._extract_and_store_estimate", return_value=None), \
+             patch("app.api.review.extract_utility_plan", return_value=None), \
+             patch("app.api.review._set_review_progress") as mock_progress:
+            _run_review_pipeline(
+                schedule_bytes=b"", narrative_bytes=b"", sp_bytes=b"sp",
+                keymap_bytes=b"km", estimate_bytes=b"est", selected_checks=None,
+                project_id="p1", reseed=True, user_id="user-1",
+                utility_plan_bytes_list=[b"up"],
+            )
+
+        messages = [c.kwargs.get("message") for c in mock_progress.call_args_list]
+        assert messages == [
+            "Seeding schedule graph…",
+            "Seeding narrative graph…",
+            "Processing special provision…",
+            "Extracting key map…",
+            "Extracting engineer's estimate…",
+            "Processing utility plans…",
+            "Preparing compliance checklist…",
+            "Running compliance checks (0/57)…",
+        ]
+    finally:
+        _review_progress.clear()
 
 
 if __name__ == "__main__":

@@ -454,6 +454,7 @@ def evaluate_checks(
     utility_plan_search_fn: Optional[Callable[[str], str]] = None,
     project_id: str = "default",
     user_id: Optional[str] = None,
+    on_progress: Optional[Callable[[int, int], None]] = None,
 ) -> List[ReviewCheckResult]:
     """Run the batch checklist: one structured-output LLM call per check, up
     to ``config.REVIEW_CHECK_CONCURRENCY`` running at once.
@@ -479,6 +480,11 @@ def evaluate_checks(
     reassembled in the original catalog order regardless of completion
     order, since callers (the frontend's checklist grouping) depend on that
     order.
+
+    If given, ``on_progress(completed_count, total_count)`` is called once
+    per finished check, from the same thread that called ``evaluate_checks``
+    (the completion loop below, never a worker thread) -- safe to use for
+    UI progress reporting without any locking.
 
     Logs a token-usage summary (input/output/total, plus any cached input
     tokens) to the server console when done — ``include_raw=True`` is needed
@@ -540,6 +546,7 @@ def evaluate_checks(
                 ): i
                 for i, check in enumerate(checks)
             }
+            completed = 0
             for future in as_completed(future_to_index):
                 i = future_to_index[future]
                 result, usage = future.result()
@@ -548,6 +555,9 @@ def evaluate_checks(
                 total_output_tokens += usage["output_tokens"]
                 total_cached_tokens += usage["cached_tokens"]
                 llm_call_count += usage["llm_call_count"]
+                completed += 1
+                if on_progress is not None:
+                    on_progress(completed, len(checks))
 
         if review_span is not None:
             try:

@@ -14,7 +14,8 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import patch
+import contextlib
+from unittest.mock import MagicMock, patch
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
@@ -23,6 +24,7 @@ if str(_ROOT) not in sys.path:
 from fastapi import HTTPException  # noqa: E402
 from app.api.review import (  # noqa: E402
     _review_progress,
+    _run_review_pipeline,
     _run_review_rerun_background,
     review_rerun_endpoint,
 )
@@ -266,6 +268,43 @@ def test_run_review_rerun_background_failure_sets_error():
     assert _review_progress["p1"]["message"] == "An unexpected error occurred while running the review."
     assert "neo4j is down" not in _review_progress["p1"]["message"]
     assert len(db._table.updates) == 0  # never reached the DB update
+
+
+def test_run_review_pipeline_rerun_reports_single_fast_path_message():
+    """reseed=False, project already seeded (graph.query returns a nonzero
+    count so it doesn't fall back to a full reseed) -- the fast path is a
+    single stage, not six conditional ones. No manual _review_progress
+    clear needed -- this file's setup_function (above) already clears it
+    before every test."""
+    graph = MagicMock()
+    graph.query.return_value = [{"c": 1}]
+    with patch("app.api.review.get_neo4j", return_value=graph), \
+         patch("app.api.review.get_db", return_value=MagicMock()), \
+         patch("app.api.review.OpenAIEmbeddings", return_value=MagicMock()), \
+         patch("app.api.review.ChatOpenAI", return_value=MagicMock()), \
+         patch("app.api.review.ChatAnthropic", return_value=MagicMock()), \
+         patch("app.api.review._read_project_summary", return_value=("Proj", 10)), \
+         patch("app.api.review._build_sp_search_fn_from_supabase", return_value=None), \
+         patch("app.api.review._build_utility_plan_search_fn_from_supabase", return_value=None), \
+         patch("app.api.review._read_keymap_extraction_from_supabase", return_value=None), \
+         patch("app.api.review._read_estimate_extraction_from_supabase", return_value=None), \
+         patch("app.api.review._seed_edq_items_if_needed"), \
+         patch("app.api.review.evaluate_edq_coverage", return_value=None), \
+         patch("app.api.review._build_static_doc_search_fn", return_value=None), \
+         patch("app.api.review.evaluate_checks", return_value=[]), \
+         patch("app.api.review._set_review_progress") as mock_progress:
+        _run_review_pipeline(
+            schedule_bytes=b"", narrative_bytes=b"", sp_bytes=None,
+            keymap_bytes=None, estimate_bytes=None, selected_checks=None,
+            project_id="p1", reseed=False, user_id="user-1",
+        )
+
+    messages = [c.kwargs.get("message") for c in mock_progress.call_args_list]
+    assert messages == [
+        "Loading saved project data…",
+        "Preparing compliance checklist…",
+        "Running compliance checks (0/57)…",
+    ]
 
 
 if __name__ == "__main__":
