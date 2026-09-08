@@ -780,8 +780,10 @@ def _run_review_pipeline(
             logger.exception("CPM computation failed; review proceeds without computed values")
 
         # ── Seed Neo4j (schedule + narrative + SP), fenced to this project_id ──
+        _set_review_progress(project_id, status="running", message="Seeding schedule graph…")
         seed_schedule(graph, activities, calendars, cpm, xcheck, project, project_id=project_id)
 
+        _set_review_progress(project_id, status="running", message="Seeding narrative graph…")
         narrative_pages = _bytes_to_pdf_pages(narrative_bytes)
         nar_chunks = chunk_narrative(narrative_pages)
         nar_vectors = embeddings.embed_documents([c["content"] for c in nar_chunks]) if nar_chunks else []
@@ -797,6 +799,7 @@ def _run_review_pipeline(
         # them here.
         sp_search_fn = None
         if sp_bytes:
+            _set_review_progress(project_id, status="running", message="Processing special provision…")
             sp_chunks = _bytes_to_sp_chunks(sp_bytes)
             if sp_chunks:
                 sp_vectors = embeddings.embed_documents([c["content"] for c in sp_chunks])
@@ -806,12 +809,14 @@ def _run_review_pipeline(
 
         keymap_extraction: Optional[KeyMapExtraction] = None
         if keymap_bytes:
+            _set_review_progress(project_id, status="running", message="Extracting key map…")
             keymap_extraction = _extract_and_store_keymap(
                 db, embeddings, llm, keymap_bytes, project_id, user_id,
             )
 
         estimate_extraction: Optional[EstimateExtraction] = None
         if estimate_bytes:
+            _set_review_progress(project_id, status="running", message="Extracting engineer's estimate…")
             estimate_extraction = _extract_and_store_estimate(
                 db, embeddings, llm, estimate_bytes, project_id, user_id,
             )
@@ -823,6 +828,7 @@ def _run_review_pipeline(
         # missing_sources handling for why an absent one never blocks a check.
         utility_plan_search_fn = None
         if utility_plan_bytes_list:
+            _set_review_progress(project_id, status="running", message="Processing utility plans…")
             utility_plan_chunks = []
             for b in utility_plan_bytes_list:
                 extraction = extract_utility_plan(b, llm, project_id=project_id, user_id=user_id)
@@ -846,6 +852,7 @@ def _run_review_pipeline(
             duration_days = (cpm.project_finish - cpm.data_date).days
     else:
         # ── Fast path: project already seeded — reuse existing chunks ───────
+        _set_review_progress(project_id, status="running", message="Loading saved project data…")
         project_name, duration_days = _read_project_summary(graph, project_id)
         sp_search_fn = _build_sp_search_fn_from_supabase(db, embeddings, project_id)
         if sp_search_fn is None and sp_bytes:
@@ -879,6 +886,7 @@ def _run_review_pipeline(
                 db, embeddings, llm, estimate_bytes, project_id, user_id,
             )
 
+    _set_review_progress(project_id, status="running", message="Preparing compliance checklist…")
     _seed_edq_items_if_needed(graph, llm, embeddings, estimate_bytes, project_id, user_id)
 
     # Geo and the cost gap are recomputed on every run (both are pure
@@ -907,6 +915,11 @@ def _run_review_pipeline(
     spec_search_fn = _build_static_doc_search_fn(_SPEC_COLLECTION)
     csm_search_fn = _build_static_doc_search_fn(_CSM_COLLECTION)
 
+    total_checks = len(selected_checks or BUILTIN_CHECKS)
+    _set_review_progress(
+        project_id, status="running",
+        message=f"Running compliance checks (0/{total_checks})…",
+    )
     try:
         check_results = evaluate_checks(
             selected_checks or BUILTIN_CHECKS, graph, llm,
@@ -916,6 +929,10 @@ def _run_review_pipeline(
             edq_coverage=edq_coverage,
             utility_plan_search_fn=utility_plan_search_fn,
             project_id=project_id, user_id=user_id,
+            on_progress=lambda done, total: _set_review_progress(
+                project_id, status="running",
+                message=f"Running compliance checks ({done}/{total})…",
+            ),
         )
     except Exception as exc:
         logger.exception("Compliance evaluation failed")
