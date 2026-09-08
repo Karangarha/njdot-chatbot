@@ -42,10 +42,19 @@ class Config:
     ENVIRONMENT: str = os.getenv("ENVIRONMENT", "development")
 
     # Max concurrent LLM calls when evaluating a review's checklist
-    # (app.compliance.eval_engine.evaluate_checks) — each check is one
-    # structured-output call; running several at once cuts wall-clock review
-    # time, but too high a value risks tripping provider rate limits.
+    # (app.compliance.eval_engine.evaluate_checks) — each check is at least
+    # one structured-output call, and up to 4 when the grounding judge
+    # retries (original + judge + retry + re-judge); running several checks
+    # at once cuts wall-clock review time, but too high a value risks
+    # tripping provider rate limits.
     REVIEW_CHECK_CONCURRENCY: int = int(os.getenv("REVIEW_CHECK_CONCURRENCY", "8"))
+
+    # Second-pass grounding judge for compliance checks (app.compliance.
+    # eval_engine._evaluate_one_check) — verifies a Pass/Fail verdict's
+    # evidence actually supports it before trusting it, at the cost of extra
+    # LLM calls per check. Set to "false" to disable instantly (no redeploy)
+    # if it misbehaves; each check then falls back to its unjudged first answer.
+    REVIEW_GROUNDING_JUDGE: bool = os.getenv("REVIEW_GROUNDING_JUDGE", "true").lower() == "true"
 
     # Frontend origin for CORS (set to Vercel URL in production)
     FRONTEND_URL: str = os.getenv("FRONTEND_URL", "http://localhost:3000")

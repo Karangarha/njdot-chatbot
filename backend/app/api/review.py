@@ -6,10 +6,11 @@ Memo carrying the Engineer's Estimate. Seeds the schedule +
 narrative into Neo4j under a fresh per-review ``project_id`` (multi-project
 isolation — see ``graph_neo4j.tools``'s Cypher fencing and
 ``graph_neo4j.seed``'s composite-key ``MERGE`` writes) and runs the built-in
-check catalog through ``app.compliance.eval_engine.evaluate_checks``: one
-Pydantic-structured LLM call per check (GPT-4o primary, Claude fallback via
-LangChain's ``.with_fallbacks()``), replacing the old single-mega-prompt +
-manual JSON parsing.
+check catalog through ``app.compliance.eval_engine.evaluate_checks``: at
+least one Pydantic-structured LLM call per check (GPT-4o primary, Claude
+fallback via LangChain's ``.with_fallbacks()``), up to 4 when the grounding
+judge retries (original + judge + retry + re-judge), replacing the old
+single-mega-prompt + manual JSON parsing.
 
 The Special Provision (if uploaded) is chunked, embedded, and persisted to
 Supabase ``session_chunks`` (``app.ingestion.chunk_store.insert_session_chunks``)
