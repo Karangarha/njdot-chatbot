@@ -859,7 +859,9 @@ no brackets, no "cite:" prefix) into cited_chunk_ids. Passages without a tag \
 """
 ```
 
-Replace `_evaluate_one_check`'s signature (currently lines 439-455) and its evidence-building block (currently lines 514-535), and add the citation-resolution block right before the final `return` (currently lines 613-616). The full function becomes:
+**Correction (recorded during implementation, 2026-09-10):** this plan was originally drafted while reading `eval_engine.py` on the `grounding-judge-review-fixes` branch, which carries a separate, already-in-review fail-closed rewrite of the judge/retry block (`_judge_grounding` returning `Optional[GroundingJudgment]`, a try/except around the whole judge/retry orchestration, re-judge gated on `retried.status`). `review-citations` was later rebased to branch off `main` instead (per an explicit user decision to keep this feature independent of that unmerged, unrelated branch), so the actual judge/retry code in this checkout is the OLDER version: `_judge_grounding` returns a plain `Tuple[GroundingJudgment, Dict[str, int]]` (never `None` — fails open by fabricating `grounded=True` internally on error), no try/except wraps the judge/retry block, and the re-judge call is unconditional (no `retried.status in ("Pass", "Fail")` gate). The replacement function below has been corrected to build the citation logic on top of that actual, current code — do **not** introduce the try/except wrapping, `Optional` judgment handling, or status-gated re-judge from the other branch; that rewrite is out of scope here and belongs to `grounding-judge-review-fixes` alone.
+
+Replace `_evaluate_one_check`'s signature, its evidence-building block, and add the citation-resolution block right before the final `return`. The full function becomes:
 
 ```python
 def _evaluate_one_check(
@@ -909,10 +911,41 @@ def _evaluate_one_check(
             source="no data provided",
         ), usage_totals
 
+    # Deterministic checks bypass the LLM entirely.
     deterministic_fn = _DETERMINISTIC_EVALUATORS.get(check.check_type)
     if deterministic_fn is not None:
         return deterministic_fn(check, deterministic), usage_totals
 
+    citation_lookup: Dict[str, EvidenceCandidate] = {}
+
+    evidence_parts: List[str] = []
+    if "schedule" in sources:
+        evidence_parts.append(schedule_facts)
+    if "narrative" in sources:
+        narrative_text, narrative_candidates = narrative_result
+        evidence_parts.append(narrative_text)
+        citation_lookup.update(narrative_candidates)
+    if "sp" in sources:
+        sp_text, sp_candidates = sp_search_fn(check.instruction)
+        evidence_parts.append(sp_text)
+        citation_lookup.update(sp_candidates)
+    if "keymap" in sources:
+        evidence_parts.append(keymap_facts)
+    if "estimate" in sources:
+        evidence_parts.append(estimate_facts)
+    if "spec" in sources:
+        spec_text, spec_candidates = spec_search_fn(check.instruction)
+        evidence_parts.append(spec_text)
+        citation_lookup.update(spec_candidates)
+    if "csm" in sources:
+        csm_text, csm_candidates = csm_search_fn(check.instruction)
+        evidence_parts.append(csm_text)
+        citation_lookup.update(csm_candidates)
+    if "utility_plan" in sources and utility_plan_search_fn is not None:
+        evidence_parts.append(utility_plan_search_fn(check.instruction))
+    evidence = "\n\n".join(evidence_parts) if evidence_parts else schedule_facts
+
+    user_msg = f"{evidence}\n\nCHECK: {check.name}\n{check.instruction}"
     invoke_config = {
         "callbacks": [langfuse_handler] if langfuse_handler else [],
         "run_name": f"evaluate-check:{check.check_key}",
@@ -922,35 +955,7 @@ def _evaluate_one_check(
             "langfuse_tags": ["compliance_review", check.check_key],
         },
     }
-    evidence = ""
-    user_msg = ""
-    citation_lookup: Dict[str, EvidenceCandidate] = {}
     try:
-        evidence_parts: List[str] = []
-
-        def _add(text: str, candidates: Dict[str, EvidenceCandidate]) -> None:
-            evidence_parts.append(text)
-            citation_lookup.update(candidates)
-
-        if "schedule" in sources:
-            evidence_parts.append(schedule_facts)
-        if "narrative" in sources:
-            _add(*narrative_result)
-        if "sp" in sources:
-            _add(*sp_search_fn(check.instruction))
-        if "keymap" in sources:
-            evidence_parts.append(keymap_facts)
-        if "estimate" in sources:
-            evidence_parts.append(estimate_facts)
-        if "spec" in sources:
-            _add(*spec_search_fn(check.instruction))
-        if "csm" in sources:
-            _add(*csm_search_fn(check.instruction))
-        if "utility_plan" in sources and utility_plan_search_fn is not None:
-            evidence_parts.append(utility_plan_search_fn(check.instruction))
-        evidence = "\n\n".join(evidence_parts) if evidence_parts else schedule_facts
-        user_msg = f"{evidence}\n\nCHECK: {check.name}\n{check.instruction}"
-
         raw_result = structured_llm.invoke(
             [SystemMessage(content=_STATIC_SYSTEM_PROMPT), HumanMessage(content=user_msg)],
             config=invoke_config,
@@ -968,56 +973,50 @@ def _evaluate_one_check(
         )
 
     if config.REVIEW_GROUNDING_JUDGE and result.status in ("Pass", "Fail"):
-        try:
-            judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:judge"}
-            judgment, judge_usage = _judge_grounding(check, evidence, result, structured_judge_llm, judge_config)
-            _accumulate_usage(usage_totals, judge_usage)
-            if judgment is not None:
-                usage_totals["judged"] = 1
+        judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:judge"}
+        judgment, judge_usage = _judge_grounding(check, evidence, result, structured_judge_llm, judge_config)
+        _accumulate_usage(usage_totals, judge_usage)
+        usage_totals["judged"] = 1
 
-            if judgment is not None and not judgment.grounded:
-                logger.warning(
-                    "evaluate_checks: check %s judged ungrounded (%s)", check.check_key, judgment.reason,
+        if not judgment.grounded:
+            logger.warning(
+                "evaluate_checks: check %s judged ungrounded (%s)", check.check_key, judgment.reason,
+            )
+            usage_totals["ungrounded"] = 1
+            retry_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:retry"}
+            retried, retry_usage = _retry_with_correction(structured_llm, user_msg, judgment.reason, retry_config)
+            _accumulate_usage(usage_totals, retry_usage)
+
+            re_judgment = None
+            if retried is not None:
+                re_judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:rejudge"}
+                re_judgment, re_judge_usage = _judge_grounding(
+                    check, evidence, retried, structured_judge_llm, re_judge_config,
                 )
-                usage_totals["ungrounded"] = 1
-                retry_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:retry"}
-                retried, retry_usage = _retry_with_correction(structured_llm, user_msg, judgment.reason, retry_config)
-                _accumulate_usage(usage_totals, retry_usage)
+                _accumulate_usage(usage_totals, re_judge_usage)
 
-                re_judgment = None
-                if retried is not None and retried.status in ("Pass", "Fail"):
-                    re_judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:rejudge"}
-                    re_judgment, re_judge_usage = _judge_grounding(
-                        check, evidence, retried, structured_judge_llm, re_judge_config,
-                    )
-                    _accumulate_usage(usage_totals, re_judge_usage)
-
-                if retried is not None and retried.status not in ("Pass", "Fail"):
-                    result = retried
-                elif retried is not None and re_judgment is not None and re_judgment.grounded:
-                    result = retried
-                else:
-                    failure_reason = re_judgment.reason if re_judgment is not None else judgment.reason
-                    logger.warning(
-                        "evaluate_checks: check %s downgraded to Missing after retry (%s)",
-                        check.check_key, failure_reason,
-                    )
-                    usage_totals["downgraded"] = 1
-                    result = EvaluationSchema(
-                        status="Missing",
-                        evidence=f"Could not verify grounding after retry: {failure_reason}",
-                        source="grounding verification failed",
-                    )
-        except Exception:
-            logger.exception(
-                "evaluate_checks: grounding judge/retry orchestration failed for check %s", check.check_key,
-            )
-            usage_totals["downgraded"] = 1
-            result = EvaluationSchema(
-                status="Missing",
-                evidence="Could not verify grounding due to an internal error.",
-                source="grounding verification failed",
-            )
+            if retried is not None and re_judgment is not None and re_judgment.grounded:
+                # Note the asymmetry: if the FIRST judge call errors, _judge_grounding
+                # fails open and we keep the original answer unverified (safe — it's
+                # what we already had). If the RE-judge errors, it also fails open,
+                # and we accept the RETRIED answer unverified here — a different
+                # answer we've never actually verified. Both follow "an unreachable
+                # judge never blocks a check," and accepting the correction is the
+                # better of the two options, but it's worth being explicit that this
+                # branch can be reached without the retry ever being judged.
+                result = retried
+            else:
+                failure_reason = re_judgment.reason if re_judgment is not None else judgment.reason
+                logger.warning(
+                    "evaluate_checks: check %s downgraded to Missing after retry (%s)",
+                    check.check_key, failure_reason,
+                )
+                usage_totals["downgraded"] = 1
+                result = EvaluationSchema(
+                    status="Missing",
+                    evidence=f"Could not verify grounding after retry: {failure_reason}",
+                    source="grounding verification failed",
+                )
 
     citations: List[ReviewCitation] = []
     for tag in result.cited_chunk_ids:
@@ -1048,7 +1047,7 @@ def _evaluate_one_check(
     ), usage_totals
 ```
 
-(Only the signature, the evidence-building block inside the `try:`, and the new citation block before the final `return` are new/changed — the judge/retry orchestration in the middle is reproduced above verbatim, unchanged, to show the complete function.)
+(Only the signature, the evidence-building block, and the new citation block before the final `return` are new/changed — the judge/retry orchestration in the middle is reproduced above verbatim, unchanged, matching the code as it actually exists on this branch today, to show the complete function.)
 
 Now update `evaluate_checks`'s signature (currently lines 619-635) — retype the three search-fn parameters:
 
