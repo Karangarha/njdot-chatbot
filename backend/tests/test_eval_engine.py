@@ -23,11 +23,13 @@ if str(_ROOT) not in sys.path:
 
 from app.compliance.catalog import CheckDef  # noqa: E402
 from app.compliance.eval_engine import (  # noqa: E402
+    EvidenceCandidate,
     _DeterministicContext,
     _accumulate_usage,
     _evaluate_one_check,
     _judge_grounding,
     _retry_with_correction,
+    build_narrative_text,
     evaluate_checks,
 )
 from app.config import config  # noqa: E402
@@ -39,6 +41,35 @@ def _fake_checks(n: int) -> list[CheckDef]:
         CheckDef(check_key=f"c{i}", category="Cat", name=f"Check {i}", instruction="do it")
         for i in range(n)
     ]
+
+
+def test_build_narrative_text_tags_chunks_with_page_pdf():
+    graph = MagicMock()
+    graph.query.return_value = [
+        {"id": "n1", "heading": "Site Overview", "text": "Utilities cross Route 49.", "pagePdf": 3},
+        {"id": "n2", "heading": None, "text": "No further utility work planned.", "pagePdf": 4},
+    ]
+
+    text, candidates = build_narrative_text(graph, project_id="proj1")
+
+    assert "[cite:narrative-0]" in text
+    assert "[cite:narrative-1]" in text
+    assert "Utilities cross Route 49." in text
+    assert candidates["narrative-0"] == EvidenceCandidate(
+        kind="private", doc_type="narrative", label="Site Overview", page_pdf=3,
+    )
+    assert candidates["narrative-1"].label == "n2"
+    assert candidates["narrative-1"].page_pdf == 4
+
+
+def test_build_narrative_text_empty_when_no_chunks():
+    graph = MagicMock()
+    graph.query.return_value = []
+
+    text, candidates = build_narrative_text(graph)
+
+    assert text == "DESIGNER'S NARRATIVE: not provided."
+    assert candidates == {}
 
 
 def test_evaluate_checks_reports_progress_via_on_progress_callback():
@@ -59,7 +90,7 @@ def test_evaluate_checks_reports_progress_via_on_progress_callback():
     with patch("app.compliance.eval_engine.build_compliance_facts", return_value=""), \
          patch("app.compliance.eval_engine.build_milestones", return_value=""), \
          patch("app.compliance.eval_engine.build_activity_roster", return_value=""), \
-         patch("app.compliance.eval_engine.build_narrative_text", return_value=""), \
+         patch("app.compliance.eval_engine.build_narrative_text", return_value=("", {})), \
          patch("app.compliance.eval_engine._evaluate_one_check", return_value=(fake_result, fake_usage)):
         evaluate_checks(checks, graph=MagicMock(), llm=MagicMock(), on_progress=on_progress)
 
@@ -81,7 +112,7 @@ def test_evaluate_checks_works_without_on_progress():
     with patch("app.compliance.eval_engine.build_compliance_facts", return_value=""), \
          patch("app.compliance.eval_engine.build_milestones", return_value=""), \
          patch("app.compliance.eval_engine.build_activity_roster", return_value=""), \
-         patch("app.compliance.eval_engine.build_narrative_text", return_value=""), \
+         patch("app.compliance.eval_engine.build_narrative_text", return_value=("", {})), \
          patch("app.compliance.eval_engine._evaluate_one_check", return_value=(fake_result, fake_usage)):
         results = evaluate_checks(checks, graph=MagicMock(), llm=MagicMock())
 

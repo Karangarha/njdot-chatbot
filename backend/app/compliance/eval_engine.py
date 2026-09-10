@@ -41,7 +41,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Literal, Optional, Tuple
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -57,6 +57,28 @@ from app.models import EvaluationSchema, GroundingJudgment, ReviewCheckResult
 from app.observability import get_langfuse_client, get_langfuse_handler, new_trace_id
 
 logger = logging.getLogger(__name__)
+
+@dataclass
+class EvidenceCandidate:
+    """One retrieved passage's citation metadata, keyed by the inline tag
+    (e.g. ``"sp-0"``) a search function embeds in its returned evidence text
+    -- lets ``_evaluate_one_check`` verify which passage (if any) the LLM's
+    ``cited_chunk_ids`` actually refers to, mirroring how
+    ``CitationSerializer`` validates chat citations against real retrieved
+    chunks (see docs/superpowers/specs/2026-09-10-review-citations-design.md).
+    """
+
+    kind:       Literal["public", "private"]
+    doc_type:   str
+    label:      str
+    page_pdf:   Optional[int] = None
+    section_id: Optional[str] = None
+
+
+# A citable search function returns (tagged_evidence_text, {tag: candidate})
+# instead of a plain string, so the tag(s) the LLM copies into
+# EvaluationSchema.cited_chunk_ids can be resolved back to real metadata.
+CitedSearch = Callable[[str], Tuple[str, Dict[str, EvidenceCandidate]]]
 
 _MAX_FACT_ROWS = 40
 
@@ -244,8 +266,11 @@ def build_activity_roster(graph: Neo4jGraph, project_id: str = "default") -> str
     return "\n".join(lines)
 
 
-def build_narrative_text(graph: Neo4jGraph, project_id: str = "default") -> str:
-    """Full designer-narrative text, concatenated in chunk order.
+def build_narrative_text(
+    graph: Neo4jGraph, project_id: str = "default",
+) -> Tuple[str, Dict[str, EvidenceCandidate]]:
+    """Full designer-narrative text, concatenated in chunk order and tagged
+    per-chunk for citation verification (e.g. ``[cite:narrative-0]``).
 
     The narrative is small (~10 pages) — cheaper and more reliable to include
     it whole (shared prefix, still cacheable across every check that
@@ -253,14 +278,22 @@ def build_narrative_text(graph: Neo4jGraph, project_id: str = "default") -> str:
     """
     rows = graph.query(
         "MATCH (c:NarrativeChunk {projectId: $pid}) "
-        "RETURN c.id AS id, c.heading AS heading, c.text AS text "
+        "RETURN c.id AS id, c.heading AS heading, c.text AS text, c.pagePdf AS pagePdf "
         "ORDER BY c.id",
         params={"pid": project_id},
     )
     if not rows:
-        return "DESIGNER'S NARRATIVE: not provided."
-    parts = [f"[{r['heading'] or r['id']}]\n{r['text']}" for r in rows]
-    return "DESIGNER'S NARRATIVE:\n\n" + "\n\n".join(parts)
+        return "DESIGNER'S NARRATIVE: not provided.", {}
+    parts: List[str] = []
+    candidates: Dict[str, EvidenceCandidate] = {}
+    for i, r in enumerate(rows):
+        tag = f"narrative-{i}"
+        heading = r["heading"] or r["id"]
+        parts.append(f"[cite:{tag}] [{heading}]\n{r['text']}")
+        candidates[tag] = EvidenceCandidate(
+            kind="private", doc_type="narrative", label=heading, page_pdf=r.get("pagePdf"),
+        )
+    return "DESIGNER'S NARRATIVE:\n\n" + "\n\n".join(parts), candidates
 
 
 def _result(check: CheckDef, status: str, evidence: str, source: str) -> ReviewCheckResult:
