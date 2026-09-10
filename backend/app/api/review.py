@@ -44,7 +44,7 @@ import os
 import tempfile
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, Response, UploadFile
@@ -57,7 +57,7 @@ from app.auth import user_id_from_token, user_id_from_token_optional
 from app.compliance.catalog import BUILTIN_CHECKS, MANUAL_REVIEW_KEYS, CheckDef
 from app.compliance.cost import CostGapResult, evaluate_cost_gap
 from app.compliance.edq import EdqCoverageResult, evaluate_edq_coverage, match_edq_items_to_activities
-from app.compliance.eval_engine import evaluate_checks
+from app.compliance.eval_engine import CitedSearch, EvidenceCandidate, evaluate_checks
 from app.compliance.geo import RegionResult, resolve_region
 from app.config import config
 from app.database import get_db
@@ -336,9 +336,10 @@ def _cosine(a: List[float], b: List[float]) -> float:
 
 def _build_sp_search_fn(
     sp_chunks: List[Dict[str, Any]], sp_vectors: List[List[float]], embeddings: OpenAIEmbeddings,
-) -> Optional[Callable[[str], str]]:
+) -> Optional[CitedSearch]:
     """In-process cosine-ranked Special Provision search over already-chunked
-    and already-embedded SP text.
+    and already-embedded SP text, tagging each returned passage for citation
+    verification (e.g. ``[cite:sp-0]``).
 
     Takes precomputed ``sp_chunks``/``sp_vectors`` rather than raw bytes so
     the caller (``_run_review_pipeline``) can chunk/embed the SP PDF exactly
@@ -349,20 +350,30 @@ def _build_sp_search_fn(
     """
     if not sp_chunks:
         return None
-    texts = [c["content"] for c in sp_chunks]
 
-    def _search(query: str, top_k: int = 5) -> str:
+    def _search(query: str, top_k: int = 5) -> Tuple[str, Dict[str, EvidenceCandidate]]:
         q_vec = embeddings.embed_query(query)
-        scored = sorted(zip(texts, sp_vectors), key=lambda tv: -_cosine(q_vec, tv[1]))
-        top = [t for t, _ in scored[:top_k]]
-        return "\n\n---\n\n".join(top) if top else "No matching Special Provision text found."
+        scored = sorted(zip(sp_chunks, sp_vectors), key=lambda cv: -_cosine(q_vec, cv[1]))
+        top = [c for c, _ in scored[:top_k]]
+        if not top:
+            return "No matching Special Provision text found.", {}
+        parts: List[str] = []
+        candidates: Dict[str, EvidenceCandidate] = {}
+        for i, chunk in enumerate(top):
+            tag = f"sp-{i}"
+            parts.append(f"[cite:{tag}] {chunk['content']}")
+            candidates[tag] = EvidenceCandidate(
+                kind="private", doc_type="special_provision", label="Special Provision",
+                page_pdf=(chunk.get("metadata") or {}).get("page_pdf"),
+            )
+        return "\n\n---\n\n".join(parts), candidates
 
     return _search
 
 
 def _build_sp_search_fn_from_supabase(
     db: Any, embeddings: OpenAIEmbeddings, project_id: str,
-) -> Optional[Callable[[str], str]]:
+) -> Optional[CitedSearch]:
     """Special Provision search backed by ``session_chunks`` -- the
     ``reseed=False`` fast path's equivalent of ``_build_sp_search_fn``,
     without re-parsing, re-chunking, or re-embedding the PDF. Reuses the same
@@ -378,11 +389,20 @@ def _build_sp_search_fn_from_supabase(
     if not existing.count:
         return None
 
-    def _search(query: str) -> str:
+    def _search(query: str) -> Tuple[str, Dict[str, EvidenceCandidate]]:
         rows = retrieve_sp_chunks(db, embeddings.embed_query, project_id, query)
         if not rows:
-            return "No matching Special Provision text found."
-        return "\n\n---\n\n".join(r["content"] for r in rows)
+            return "No matching Special Provision text found.", {}
+        parts: List[str] = []
+        candidates: Dict[str, EvidenceCandidate] = {}
+        for i, r in enumerate(rows):
+            tag = f"sp-{i}"
+            parts.append(f"[cite:{tag}] {r['content']}")
+            candidates[tag] = EvidenceCandidate(
+                kind="private", doc_type="special_provision", label="Special Provision",
+                page_pdf=(r.get("metadata") or {}).get("page_pdf"),
+            )
+        return "\n\n---\n\n".join(parts), candidates
 
     return _search
 
@@ -576,15 +596,17 @@ def _seed_edq_items_if_needed(
     seed_edq_items(graph, items, matches, project_id=project_id)
 
 
-def _build_static_doc_search_fn(collection: str, match_count: int = 5) -> Optional[Callable[[str], str]]:
+def _build_static_doc_search_fn(collection: str, match_count: int = 5) -> Optional[CitedSearch]:
     """Search-function factory for a static, pre-ingested reference
     collection (Standard Specifications or the Construction Scheduling
-    Manual). Unlike ``_build_sp_search_fn*``, this doesn't depend on any
-    per-review upload — the collection is embedded once, system-wide, by
-    ``backend/scripts/ingest_specs.py`` — so it's built unconditionally for
-    every review. Returns ``None`` only if the searcher itself can't be
-    constructed (e.g. missing OpenAI key), so a check requesting this source
-    degrades to "Missing" instead of crashing the whole review.
+    Manual), tagging each returned passage for citation verification (e.g.
+    ``[cite:specs_2019-0]``). Unlike ``_build_sp_search_fn*``, this doesn't
+    depend on any per-review upload — the collection is embedded once,
+    system-wide, by ``backend/scripts/ingest_specs.py`` — so it's built
+    unconditionally for every review. Returns ``None`` only if the searcher
+    itself can't be constructed (e.g. missing OpenAI key), so a check
+    requesting this source degrades to "Missing" instead of crashing the
+    whole review.
     """
     try:
         searcher = VectorSearcher()
@@ -592,15 +614,26 @@ def _build_static_doc_search_fn(collection: str, match_count: int = 5) -> Option
         logger.exception("Failed to initialize VectorSearcher for collection=%s", collection)
         return None
 
-    def _search(query: str) -> str:
+    def _search(query: str) -> Tuple[str, Dict[str, EvidenceCandidate]]:
         try:
             results = searcher.search(query, collection=collection, match_count=match_count)
         except Exception:
             logger.exception("Static-doc search failed for collection=%s", collection)
-            return "No matching reference text found (search error)."
+            return "No matching reference text found (search error).", {}
         if not results:
-            return "No matching reference text found."
-        return "\n\n---\n\n".join(r["content"] for r in results)
+            return "No matching reference text found.", {}
+        parts: List[str] = []
+        candidates: Dict[str, EvidenceCandidate] = {}
+        for i, r in enumerate(results):
+            tag = f"{collection}-{i}"
+            meta = r.get("metadata") or {}
+            parts.append(f"[cite:{tag}] {r['content']}")
+            candidates[tag] = EvidenceCandidate(
+                kind="public", doc_type=meta.get("doc", collection),
+                label=meta.get("section_title") or meta.get("doc") or collection,
+                page_pdf=meta.get("page_pdf"), section_id=meta.get("section_id"),
+            )
+        return "\n\n---\n\n".join(parts), candidates
 
     return _search
 
