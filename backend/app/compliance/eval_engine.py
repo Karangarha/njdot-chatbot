@@ -99,10 +99,17 @@ what was provided.
 number, narrative text) — keep it concise.
 - source: cite where the evidence came from (e.g. an activity ID, an SP \
 section number, "narrative", or "no data provided").
-- Some passages above are tagged like "[cite:sp-0]". If your evidence draws \
-on a tagged passage, copy its tag id (the part after "cite:", e.g. "sp-0" — \
-no brackets, no "cite:" prefix) into cited_chunk_ids. Passages without a tag \
-(schedule facts, key map facts, estimate facts) don't need one.
+- Some passages above are tagged like "[cite:sp-0]" immediately before their \
+text. NEVER write that bracket syntax, or any "[cite:...]" text, into your \
+evidence or source fields — those must read as plain prose with no tag \
+markup in them at all.
+- cited_chunk_ids: list a tag id (the part after "cite:", e.g. "sp-0" — no \
+brackets, no "cite:" prefix) here ONLY if your evidence field directly \
+quotes or closely paraphrases that specific tagged passage's own text. A \
+passage you merely consulted, or that is generally relevant to the rule but \
+not what your evidence actually quotes, does NOT get listed — leave \
+cited_chunk_ids empty rather than over-citing. Passages without a tag \
+(schedule facts, key map facts, estimate facts) never go in cited_chunk_ids.
 """
 
 _JUDGE_SYSTEM_PROMPT = """\
