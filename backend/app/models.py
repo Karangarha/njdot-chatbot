@@ -106,6 +106,7 @@ class EvaluationSchema(BaseModel):
     status:   Literal["Pass", "Fail", "Missing"]
     evidence: str   # verbatim extraction or exact metric found
     source:   str   # page number, document name, or Task ID
+    cited_chunk_ids: List[str] = []   # tags copied verbatim from tagged evidence passages
 
 
 class GroundingJudgment(BaseModel):
@@ -117,6 +118,27 @@ class GroundingJudgment(BaseModel):
     reason:   str   # brief explanation, especially when grounded=False
 
 
+class ReviewCitation(BaseModel):
+    """One source reference attached to a review check's evidence.
+
+    ``verified=True`` means either the LLM named a tagged passage that was
+    actually retrieved for this check (chunk-level citation, Spec/CSM/SP/
+    Narrative), or it's an automatic whole-document reference (Key Map/
+    Estimate, which have no per-passage retrieval to verify against).
+    ``verified=False`` means the LLM claimed a citation that couldn't be
+    matched to anything retrieved -- shown flagged, never clickable.
+    """
+
+    kind:       Literal["public", "private"]
+    # public  -> doc_type is the doc_name for GET /api/pdf/{doc_type}
+    # private -> doc_type is the doc_type for GET /api/review/{project_id}/pdf/{doc_type}
+    doc_type:   str
+    label:      str
+    page_pdf:   Optional[int] = None
+    section_id: Optional[str] = None
+    verified:   bool
+
+
 class ReviewCheckResult(BaseModel):
     """One evaluated check, with catalog identity attached to its EvaluationSchema result."""
 
@@ -126,6 +148,7 @@ class ReviewCheckResult(BaseModel):
     status:   Literal["Pass", "Fail", "Missing"]
     evidence: str
     source:   str
+    citations: List[ReviewCitation] = []
 
 
 class ReviewResponse(BaseModel):
