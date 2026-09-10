@@ -53,7 +53,7 @@ from app.compliance.cost import CostGapResult
 from app.compliance.edq import EdqCoverageResult
 from app.compliance.geo import RegionResult
 from app.config import config
-from app.models import EvaluationSchema, GroundingJudgment, ReviewCheckResult
+from app.models import EvaluationSchema, GroundingJudgment, ReviewCheckResult, ReviewCitation
 from app.observability import get_langfuse_client, get_langfuse_handler, new_trace_id
 
 logger = logging.getLogger(__name__)
@@ -98,6 +98,10 @@ what was provided.
 number, narrative text) — keep it concise.
 - source: cite where the evidence came from (e.g. an activity ID, an SP \
 section number, "narrative", or "no data provided").
+- Some passages above are tagged like "[cite:sp-0]". If your evidence draws \
+on a tagged passage, copy its tag id (the part after "cite:", e.g. "sp-0" — \
+no brackets, no "cite:" prefix) into cited_chunk_ids. Passages without a tag \
+(schedule facts, key map facts, estimate facts) don't need one.
 """
 
 _JUDGE_SYSTEM_PROMPT = """\
@@ -475,10 +479,10 @@ def _evaluate_one_check(
     structured_llm: Runnable,
     structured_judge_llm: Runnable,
     schedule_facts: str,
-    narrative_text: str,
-    sp_search_fn: Optional[Callable[[str], str]],
-    spec_search_fn: Optional[Callable[[str], str]],
-    csm_search_fn: Optional[Callable[[str], str]],
+    narrative_result: Tuple[str, Dict[str, EvidenceCandidate]],
+    sp_search_fn: Optional[CitedSearch],
+    spec_search_fn: Optional[CitedSearch],
+    csm_search_fn: Optional[CitedSearch],
     keymap_facts: Optional[str],
     estimate_facts: Optional[str],
     utility_plan_search_fn: Optional[Callable[[str], str]],
@@ -536,21 +540,31 @@ def _evaluate_one_check(
     if deterministic_fn is not None:
         return deterministic_fn(check, deterministic), usage_totals
 
+    citation_lookup: Dict[str, EvidenceCandidate] = {}
+
     evidence_parts: List[str] = []
     if "schedule" in sources:
         evidence_parts.append(schedule_facts)
     if "narrative" in sources:
+        narrative_text, narrative_candidates = narrative_result
         evidence_parts.append(narrative_text)
+        citation_lookup.update(narrative_candidates)
     if "sp" in sources:
-        evidence_parts.append(sp_search_fn(check.instruction))
+        sp_text, sp_candidates = sp_search_fn(check.instruction)
+        evidence_parts.append(sp_text)
+        citation_lookup.update(sp_candidates)
     if "keymap" in sources:
         evidence_parts.append(keymap_facts)
     if "estimate" in sources:
         evidence_parts.append(estimate_facts)
     if "spec" in sources:
-        evidence_parts.append(spec_search_fn(check.instruction))
+        spec_text, spec_candidates = spec_search_fn(check.instruction)
+        evidence_parts.append(spec_text)
+        citation_lookup.update(spec_candidates)
     if "csm" in sources:
-        evidence_parts.append(csm_search_fn(check.instruction))
+        csm_text, csm_candidates = csm_search_fn(check.instruction)
+        evidence_parts.append(csm_text)
+        citation_lookup.update(csm_candidates)
     if "utility_plan" in sources and utility_plan_search_fn is not None:
         evidence_parts.append(utility_plan_search_fn(check.instruction))
     evidence = "\n\n".join(evidence_parts) if evidence_parts else schedule_facts
@@ -628,9 +642,32 @@ def _evaluate_one_check(
                     source="grounding verification failed",
                 )
 
+    citations: List[ReviewCitation] = []
+    for tag in result.cited_chunk_ids:
+        candidate = citation_lookup.get(tag)
+        if candidate is not None:
+            citations.append(ReviewCitation(
+                kind=candidate.kind, doc_type=candidate.doc_type, label=candidate.label,
+                page_pdf=candidate.page_pdf, section_id=candidate.section_id, verified=True,
+            ))
+        else:
+            citations.append(ReviewCitation(
+                kind="private", doc_type="unknown", label=f"Unverified citation ({tag})",
+                verified=False,
+            ))
+    if "keymap" in sources and keymap_facts is not None:
+        citations.append(ReviewCitation(
+            kind="private", doc_type="key_map", label="Key Map", page_pdf=1, verified=True,
+        ))
+    if "estimate" in sources and estimate_facts is not None:
+        citations.append(ReviewCitation(
+            kind="private", doc_type="estimate", label="Estimate", page_pdf=1, verified=True,
+        ))
+
     return ReviewCheckResult(
         id=check.check_key, category=check.category, name=check.name,
         status=result.status, evidence=result.evidence, source=result.source,
+        citations=citations,
     ), usage_totals
 
 
@@ -638,9 +675,9 @@ def evaluate_checks(
     checks: List[CheckDef],
     graph: Neo4jGraph,
     llm: BaseChatModel,
-    sp_search_fn: Optional[Callable[[str], str]] = None,
-    spec_search_fn: Optional[Callable[[str], str]] = None,
-    csm_search_fn: Optional[Callable[[str], str]] = None,
+    sp_search_fn: Optional[CitedSearch] = None,
+    spec_search_fn: Optional[CitedSearch] = None,
+    csm_search_fn: Optional[CitedSearch] = None,
     keymap_facts: Optional[str] = None,
     keymap_geo: Optional[RegionResult] = None,
     estimate_facts: Optional[str] = None,
@@ -709,7 +746,7 @@ def evaluate_checks(
         build_milestones(graph, project_id),
         build_activity_roster(graph, project_id),
     ])
-    narrative_text = build_narrative_text(graph, project_id)
+    narrative_result = build_narrative_text(graph, project_id)
 
     # ── Langfuse: one trace per review, with every concurrent check nested
     # as a child generation under one root span — see app.observability's
@@ -742,7 +779,7 @@ def evaluate_checks(
             future_to_index = {
                 executor.submit(
                     _evaluate_one_check, check, structured_llm, structured_judge_llm,
-                    schedule_facts, narrative_text,
+                    schedule_facts, narrative_result,
                     sp_search_fn, spec_search_fn, csm_search_fn, keymap_facts, estimate_facts,
                     utility_plan_search_fn,
                     deterministic_ctx, project_id, user_id, langfuse_handler,

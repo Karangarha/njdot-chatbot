@@ -33,7 +33,7 @@ from app.compliance.eval_engine import (  # noqa: E402
     evaluate_checks,
 )
 from app.config import config  # noqa: E402
-from app.models import EvaluationSchema, GroundingJudgment, ReviewCheckResult  # noqa: E402
+from app.models import EvaluationSchema, GroundingJudgment, ReviewCheckResult, ReviewCitation  # noqa: E402
 
 
 def _fake_checks(n: int) -> list[CheckDef]:
@@ -229,7 +229,7 @@ def test_retry_with_correction_returns_none_on_error():
 def _call_evaluate_one_check(check, structured_llm, structured_judge_llm, **overrides):
     kwargs = dict(
         schedule_facts="PRECOMPUTED FACTS: B1010 starts 2024-09-01.",
-        narrative_text="",
+        narrative_result=("", {}),
         sp_search_fn=None,
         spec_search_fn=None,
         csm_search_fn=None,
@@ -409,6 +409,102 @@ def test_evaluate_one_check_retry_call_fails_entirely():
     assert usage["ungrounded"] == 1
     assert usage["downgraded"] == 1
     assert len(judge.calls) == 1  # no re-judge, since the retry never produced an answer
+
+
+def test_evaluate_one_check_builds_verified_citation_from_matched_tag():
+    check = _make_check(source_files=["sp"])
+    original = EvaluationSchema(
+        status="Fail", evidence="SP section bars gas work in July.", source="SP 105.03",
+        cited_chunk_ids=["sp-0"],
+    )
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def sp_search_fn(query):
+        return "[cite:sp-0] Gas work is prohibited in July.", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7),
+        }
+
+    result, _ = _call_evaluate_one_check(check, llm, judge, sp_search_fn=sp_search_fn)
+
+    assert len(result.citations) == 1
+    citation = result.citations[0]
+    assert citation.verified is True
+    assert citation.page_pdf == 7
+    assert citation.doc_type == "special_provision"
+
+
+def test_evaluate_one_check_flags_unmatched_citation_tag():
+    check = _make_check(source_files=["sp"])
+    original = EvaluationSchema(
+        status="Fail", evidence="claims to quote SP text", source="SP 105.03",
+        cited_chunk_ids=["sp-99"],
+    )
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def sp_search_fn(query):
+        return "[cite:sp-0] Gas work is prohibited in July.", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7),
+        }
+
+    result, _ = _call_evaluate_one_check(check, llm, judge, sp_search_fn=sp_search_fn)
+
+    assert len(result.citations) == 1
+    citation = result.citations[0]
+    assert citation.verified is False
+    assert citation.page_pdf is None
+
+
+def test_evaluate_one_check_adds_automatic_keymap_and_estimate_citations():
+    check = _make_check(source_files=["keymap", "estimate", "schedule"])
+    original = EvaluationSchema(status="Pass", evidence="utility crosses I-195", source="key map")
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    result, _ = _call_evaluate_one_check(
+        check, llm, judge, keymap_facts="KEY MAP FACTS: ...", estimate_facts="PROJECT COST FACTS: ...",
+    )
+
+    doc_types = {c.doc_type for c in result.citations}
+    assert doc_types == {"key_map", "estimate"}
+    assert all(c.verified for c in result.citations)
+    assert all(c.page_pdf == 1 for c in result.citations)
+
+
+def test_evaluate_one_check_downgraded_missing_keeps_automatic_citations_only():
+    check = _make_check(source_files=["sp", "keymap"])
+    original = EvaluationSchema(
+        status="Fail", evidence="wrong reading", source="schedule", cited_chunk_ids=["sp-0"],
+    )
+    retried = EvaluationSchema(status="Fail", evidence="still wrong", source="schedule")
+    llm = _FakeStructuredLLM([
+        (original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}),
+        (retried, {"input_tokens": 12, "output_tokens": 6, "input_token_details": {}}),
+    ])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=False, reason="dates show compliance"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+        (GroundingJudgment(grounded=False, reason="still contradicts dates"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def sp_search_fn(query):
+        return "[cite:sp-0] Some SP text.", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=1),
+        }
+
+    result, _ = _call_evaluate_one_check(
+        check, llm, judge, sp_search_fn=sp_search_fn, keymap_facts="KEY MAP FACTS: ...",
+    )
+
+    assert result.status == "Missing"
+    assert len(result.citations) == 1
+    assert result.citations[0].doc_type == "key_map"
 
 
 if __name__ == "__main__":
