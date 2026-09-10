@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { API_BASE } from '@/lib/api'
+import PDFViewerModal from '@/components/PDFViewerModal'
 import { createClient } from '@/lib/supabase/client'
 import jsPDF from 'jspdf'
 import autoTable from 'jspdf-autotable'
@@ -12,6 +13,15 @@ import type { ComplianceCheck, ReviewProject } from '@/lib/types'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
+interface ReviewCitationItem {
+  kind:        'public' | 'private'
+  doc_type:    string
+  label:       string
+  page_pdf?:   number | null
+  section_id?: string | null
+  verified:    boolean
+}
+
 interface CheckItem {
   id: string
   category: string
@@ -20,6 +30,7 @@ interface CheckItem {
   status: 'pass' | 'warning' | 'fail'
   finding: string
   evidence: string
+  citations?: ReviewCitationItem[]
 }
 
 interface ReviewResult {
@@ -176,7 +187,42 @@ function UploadZone({
   )
 }
 
-function CheckCard({ check }: { check: CheckItem }) {
+function CitationPill({ citation, sessionId, authToken, onOpen }: {
+  citation: ReviewCitationItem
+  sessionId: string | null
+  authToken?: string
+  onOpen: (citation: ReviewCitationItem) => void
+}) {
+  const clickable = citation.verified && citation.page_pdf != null && !!sessionId
+  const detail = citation.section_id ? citation.section_id
+    : citation.page_pdf != null ? `p.${citation.page_pdf}` : ''
+
+  if (!clickable) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-semibold text-gray-400"
+        title={citation.verified ? undefined : "AI referenced this but it couldn't be verified against retrieved evidence"}
+      >
+        {citation.verified ? '' : '⚠ '}{citation.label}{detail ? ` · ${detail}` : ''}
+      </span>
+    )
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => onOpen(citation)}
+      className="inline-flex items-center gap-1 rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-semibold text-blue-700 cursor-pointer hover:opacity-80"
+    >
+      {citation.label}{detail ? ` · ${detail}` : ''}
+    </button>
+  )
+}
+
+function CheckCard({ check, sessionId, authToken }: {
+  check: CheckItem; sessionId: string | null; authToken?: string
+}) {
+  const [pdfCitation, setPdfCitation] = useState<ReviewCitationItem | null>(null)
   const styles = {
     pass:    { border: 'border-green-500', labelColor: 'text-green-600', label: 'COMPLIANT',    iconBg: 'bg-green-100' },
     fail:    { border: 'border-red-500',   labelColor: 'text-red-600',   label: 'ISSUES FOUND', iconBg: 'bg-red-100' },
@@ -213,13 +259,34 @@ function CheckCard({ check }: { check: CheckItem }) {
           </div>
         )}
         {check.evidence && <p className="mt-1.5 text-[11px] text-gray-400 leading-relaxed italic">{check.evidence}</p>}
+        {check.citations && check.citations.length > 0 && (
+          <div className="mt-1.5 flex flex-wrap gap-1.5">
+            {check.citations.map((citation, i) => (
+              <CitationPill key={i} citation={citation} sessionId={sessionId} authToken={authToken} onOpen={setPdfCitation} />
+            ))}
+          </div>
+        )}
       </div>
+      {pdfCitation && sessionId && (
+        <PDFViewerModal
+          url={pdfCitation.kind === 'public'
+            ? `${API_BASE}/api/pdf/${pdfCitation.doc_type}`
+            : `${API_BASE}/api/review/${sessionId}/pdf/${pdfCitation.doc_type}`}
+          page={pdfCitation.page_pdf ?? 1}
+          authToken={pdfCitation.kind === 'private' ? authToken : undefined}
+          requireAuth={pdfCitation.kind === 'private'}
+          headerLabel={pdfCitation.label}
+          headerDetail={pdfCitation.section_id ?? undefined}
+          onClose={() => setPdfCitation(null)}
+        />
+      )}
     </div>
   )
 }
 
-function CollapsibleSection({ title, checks, expanded, onToggle }: {
+function CollapsibleSection({ title, checks, expanded, onToggle, sessionId, authToken }: {
   title: string; checks: CheckItem[]; expanded: boolean; onToggle: () => void
+  sessionId: string | null; authToken?: string
 }) {
   if (checks.length === 0) return null
   const warnCount = checks.filter(c => c.status === 'warning').length
@@ -247,7 +314,7 @@ function CollapsibleSection({ title, checks, expanded, onToggle }: {
       </button>
       {expanded && (
         <div className="space-y-2.5 border-t border-[#E8E8E8] px-4 py-4">
-          {checks.map(check => <CheckCard key={check.id} check={check} />)}
+          {checks.map(check => <CheckCard key={check.id} check={check} sessionId={sessionId} authToken={authToken} />)}
         </div>
       )}
     </div>
@@ -801,10 +868,11 @@ export default function DocumentReview({
                     <CollapsibleSection key={i} title={run.header}
                       checks={run.items}
                       expanded={expanded[run.header] ?? true}
-                      onToggle={() => toggleSection(run.header!)} />
+                      onToggle={() => toggleSection(run.header!)}
+                      sessionId={sessionId} authToken={authToken} />
                   ) : (
                     <div key={i} className="space-y-2.5">
-                      {run.items.map(check => <CheckCard key={check.id} check={check} />)}
+                      {run.items.map(check => <CheckCard key={check.id} check={check} sessionId={sessionId} authToken={authToken} />)}
                     </div>
                   )
                 ))
