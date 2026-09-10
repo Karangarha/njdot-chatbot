@@ -736,6 +736,7 @@ def _to_frontend_shape(response: ReviewResponse) -> dict:
                 "status": _STATUS_MAP.get(c.status, "warning"),
                 "finding": c.evidence,
                 "evidence": c.evidence,
+                "citations": [cit.model_dump() for cit in c.citations],
             }
             for c in response.checks
         ],
