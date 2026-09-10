@@ -58,6 +58,7 @@ from app.observability import get_langfuse_client, get_langfuse_handler, new_tra
 
 logger = logging.getLogger(__name__)
 
+
 @dataclass
 class EvidenceCandidate:
     """One retrieved passage's citation metadata, keyed by the inline tag
@@ -292,7 +293,7 @@ def build_narrative_text(
     candidates: Dict[str, EvidenceCandidate] = {}
     for i, r in enumerate(rows):
         tag = f"narrative-{i}"
-        heading = r["heading"] or r["id"]
+        heading = r["heading"] or "Narrative"
         parts.append(f"[cite:{tag}] [{heading}]\n{r['text']}")
         candidates[tag] = EvidenceCandidate(
             kind="private", doc_type="narrative", label=heading, page_pdf=r.get("pagePdf"),
@@ -642,27 +643,31 @@ def _evaluate_one_check(
                     source="grounding verification failed",
                 )
 
-    citations: List[ReviewCitation] = []
-    for tag in result.cited_chunk_ids:
-        candidate = citation_lookup.get(tag)
-        if candidate is not None:
+    try:
+        citations: List[ReviewCitation] = []
+        for tag in result.cited_chunk_ids:
+            candidate = citation_lookup.get(tag)
+            if candidate is not None:
+                citations.append(ReviewCitation(
+                    kind=candidate.kind, doc_type=candidate.doc_type, label=candidate.label,
+                    page_pdf=candidate.page_pdf, section_id=candidate.section_id, verified=True,
+                ))
+            else:
+                citations.append(ReviewCitation(
+                    kind="private", doc_type="unknown", label=f"Unverified citation ({tag})",
+                    verified=False,
+                ))
+        if "keymap" in sources and keymap_facts is not None:
             citations.append(ReviewCitation(
-                kind=candidate.kind, doc_type=candidate.doc_type, label=candidate.label,
-                page_pdf=candidate.page_pdf, section_id=candidate.section_id, verified=True,
+                kind="private", doc_type="key_map", label="Key Map", page_pdf=1, verified=True,
             ))
-        else:
+        if "estimate" in sources and estimate_facts is not None:
             citations.append(ReviewCitation(
-                kind="private", doc_type="unknown", label=f"Unverified citation ({tag})",
-                verified=False,
+                kind="private", doc_type="estimate", label="Estimate", page_pdf=1, verified=True,
             ))
-    if "keymap" in sources and keymap_facts is not None:
-        citations.append(ReviewCitation(
-            kind="private", doc_type="key_map", label="Key Map", page_pdf=1, verified=True,
-        ))
-    if "estimate" in sources and estimate_facts is not None:
-        citations.append(ReviewCitation(
-            kind="private", doc_type="estimate", label="Estimate", page_pdf=1, verified=True,
-        ))
+    except Exception:
+        logger.exception("evaluate_checks: citation construction failed for check %s", check.check_key)
+        citations = []
 
     return ReviewCheckResult(
         id=check.check_key, category=check.category, name=check.name,

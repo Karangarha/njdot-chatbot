@@ -83,6 +83,21 @@ def test_build_static_doc_search_fn_tags_results_with_doc_and_page():
     )
 
 
+def test_build_static_doc_search_fn_skips_candidate_when_doc_missing():
+    fake_searcher = MagicMock()
+    fake_searcher.search.return_value = [
+        {"content": "Untagged passage with no doc metadata.", "metadata": {"doc": None, "page_pdf": 12}},
+    ]
+    with patch("app.api.review.VectorSearcher", return_value=fake_searcher):
+        search_fn = _build_static_doc_search_fn("specs_2019")
+        text, candidates = search_fn("some query")
+
+    tag = "specs_2019-0"
+    assert f"[cite:{tag}]" in text
+    assert "Untagged passage with no doc metadata." in text
+    assert tag not in candidates
+
+
 def test_build_static_doc_search_fn_returns_none_when_searcher_init_fails():
     with patch("app.api.review.VectorSearcher", side_effect=RuntimeError("no key")):
         assert _build_static_doc_search_fn("specs_2019") is None

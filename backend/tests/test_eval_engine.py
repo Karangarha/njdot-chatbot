@@ -58,7 +58,7 @@ def test_build_narrative_text_tags_chunks_with_page_pdf():
     assert candidates["narrative-0"] == EvidenceCandidate(
         kind="private", doc_type="narrative", label="Site Overview", page_pdf=3,
     )
-    assert candidates["narrative-1"].label == "n2"
+    assert candidates["narrative-1"].label == "Narrative"
     assert candidates["narrative-1"].page_pdf == 4
 
 

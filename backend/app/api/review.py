@@ -628,11 +628,20 @@ def _build_static_doc_search_fn(collection: str, match_count: int = 5) -> Option
             tag = f"{collection}-{i}"
             meta = r.get("metadata") or {}
             parts.append(f"[cite:{tag}] {r['content']}")
-            candidates[tag] = EvidenceCandidate(
-                kind="public", doc_type=meta.get("doc", collection),
-                label=meta.get("section_title") or meta.get("doc") or collection,
-                page_pdf=meta.get("page_pdf"), section_id=meta.get("section_id"),
-            )
+            doc = meta.get("doc")
+            # Only construct a candidate when metadata.doc is a real, truthy
+            # value -- falling back to `collection` as a fake doc_type would
+            # produce a "verified" citation pill that can't resolve via the
+            # real PDF-serving route (404s). A skipped tag still appears in
+            # the text above, so the LLM still sees the evidence; if it later
+            # cites this tag, citation_lookup.get(tag) in eval_engine returns
+            # None and the citation naturally falls back to "unverified".
+            if doc:
+                candidates[tag] = EvidenceCandidate(
+                    kind="public", doc_type=doc,
+                    label=meta.get("section_title") or doc,
+                    page_pdf=meta.get("page_pdf"), section_id=meta.get("section_id"),
+                )
         return "\n\n---\n\n".join(parts), candidates
 
     return _search
