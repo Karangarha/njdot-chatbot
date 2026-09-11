@@ -82,11 +82,19 @@ def evaluate_no_mandatory_constraints(graph: Any, project_id: str) -> ScheduleLo
 def evaluate_no_lag(graph: Any, project_id: str) -> ScheduleLogicResult:
     # Unfiltered -- CSM's rule depends on relType, so every relationship
     # (not just the already-lagged ones) has to be inspected to classify it.
+    # No LIMIT here: this is a classification pass over the whole graph, not
+    # a display list -- a real schedule has several relationships per
+    # activity (P6 allows SS+FF+FS between one pair), so a 136-activity
+    # project can easily carry 240+ PRECEDES edges. An earlier LIMIT of
+    # _MAX_ROWS*4=160 silently truncated below that on the Route 49 fixture
+    # and dropped one real violation (D1220 -> D1250) from the result --
+    # confirmed by re-querying without a limit and getting all 243 edges.
+    # _result() below still caps how many violations are ever *displayed*.
     rows = graph.query(
-        "MATCH (p:Activity {projectId: $pid})-[r:PRECEDES]->(s:Activity) "
+        "MATCH (p:Activity {projectId: $pid})-[r:PRECEDES]->(s:Activity {projectId: $pid}) "
         "RETURN p.taskId AS pred, s.taskId AS succ, r.relType AS relType, "
-        "       coalesce(r.lagDays, 0) AS lagDays LIMIT $limit",
-        params={"pid": project_id, "limit": _MAX_ROWS * 4},
+        "       coalesce(r.lagDays, 0) AS lagDays",
+        params={"pid": project_id},
     ) or []
     # Lag is barred outright on Finish-to-Start; on any other type, only a
     # negative lag is barred (a positive SS/FF lag is ordinary schedule logic).

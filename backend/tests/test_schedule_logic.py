@@ -74,6 +74,21 @@ def test_no_lag_flags_fs_lag_and_negative_lag_only():
     assert violators == {("A1", "A2"), ("C1", "C2")}
 
 
+def test_no_lag_does_not_truncate_large_relationship_sets():
+    # Regression: the raw classification fetch used to LIMIT $limit at
+    # _MAX_ROWS*4=160. A real 136-activity schedule can carry 240+
+    # PRECEDES edges (P6 allows several relationship types between one
+    # pair), so that limit silently dropped violations past row 160 on
+    # the Route 49 fixture (12 real FS-lag violations, only 11 returned).
+    # No LIMIT should appear in the query at all now.
+    rows = [{"pred": f"P{i}", "succ": f"S{i}", "relType": "FS", "lagDays": 1} for i in range(300)]
+    graph = _FakeGraph(rows=rows)
+    result = evaluate_no_lag(graph, "proj-1")
+    assert len(result.violations) == 300
+    cypher, _params = graph.calls[0]
+    assert "LIMIT" not in cypher.upper()
+
+
 def test_no_open_ends_exempts_project_milestones():
     rows = [
         {"id": "M100", "name": "Advertise", "isOpenStart": True, "isOpenEnd": False},
@@ -91,5 +106,6 @@ if __name__ == "__main__":
     test_no_negative_float_fail_lists_activities()
     test_mandatory_constraints_filters_to_mandatory_types_only()
     test_no_lag_flags_fs_lag_and_negative_lag_only()
+    test_no_lag_does_not_truncate_large_relationship_sets()
     test_no_open_ends_exempts_project_milestones()
     print("All tests passed!")
