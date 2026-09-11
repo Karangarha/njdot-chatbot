@@ -219,6 +219,18 @@ function CitationPill({ citation, sessionId, authToken, onOpen }: {
   )
 }
 
+// ponytail: regex-matched against evidence text, not a real citation --
+// schedule (XER) data has no PDF to link to, so this is a best-effort
+// "here's what this refers to" hint, not a verified source. Naive pattern
+// (1-2 uppercase letters + 2-4 digits) matches this project's task-id
+// convention (D1120, M900, PS340, ...); a differently-coded schedule may
+// under/over-match. Upgrade path: read the real activity list from Neo4j
+// and only badge ids that actually exist there, if this needs to be exact.
+function extractActivityIds(text: string): string[] {
+  const matches = text.match(/\b[A-Z]{1,2}\d{2,4}\b/g) ?? []
+  return Array.from(new Set(matches)).slice(0, 6)
+}
+
 function CheckCard({ check, sessionId, authToken }: {
   check: CheckItem; sessionId: string | null; authToken?: string
 }) {
@@ -259,12 +271,26 @@ function CheckCard({ check, sessionId, authToken }: {
           </div>
         )}
         {check.evidence && <p className="mt-1.5 text-[11px] text-gray-400 leading-relaxed italic">{check.evidence}</p>}
-        {check.citations && check.citations.length > 0 && (
+        {check.citations && check.citations.length > 0 ? (
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             {check.citations.map((citation, i) => (
               <CitationPill key={i} citation={citation} sessionId={sessionId} authToken={authToken} onOpen={setPdfCitation} />
             ))}
           </div>
+        ) : (
+          (() => {
+            const activityIds = extractActivityIds(check.evidence)
+            return activityIds.length > 0 ? (
+              <div className="mt-1.5 flex flex-wrap gap-1.5">
+                <span
+                  className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 text-[10px] font-semibold text-gray-400"
+                  title="Referenced schedule activities — no PDF exists for schedule data, so this isn't a clickable source"
+                >
+                  Schedule · {activityIds.join(', ')}
+                </span>
+              </div>
+            ) : null
+          })()
         )}
       </div>
       {pdfCitation && sessionId && (
