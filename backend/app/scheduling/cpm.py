@@ -484,11 +484,28 @@ def run_cpm(
                 min_tf = r.total_float if min_tf is None else min(min_tf, r.total_float)
         result.activities[n] = r
 
-    # Open ends among schedulable activities
-    result.open_starts = [n for n in order if sub.in_degree(n) == 0
-                          and sub.nodes[n].get("status") != "Complete"]
-    result.open_ends = [n for n in order if sub.out_degree(n) == 0
-                        and sub.nodes[n].get("status") != "Complete"]
+    # Open ends among schedulable activities, per CSM Section 3.0: an open
+    # start needs a predecessor that actually constrains the start (FS or
+    # SS); an open finish needs a successor that actually constrains the
+    # finish (FS or FF). in_degree/out_degree == 0 undercounts -- an activity
+    # whose only predecessor is an SF or FF edge still has an open start,
+    # since neither type fixes when it begins.
+    def _incoming_types(n: str) -> set:
+        return {link["type"] for p in sub.predecessors(n) for link in sub[p][n]["links"]}
+
+    def _outgoing_types(n: str) -> set:
+        return {link["type"] for s in sub.successors(n) for link in sub[n][s]["links"]}
+
+    result.open_starts = [
+        n for n in order
+        if sub.nodes[n].get("status") != "Complete"
+        and not (_incoming_types(n) & {"FS", "SS"})
+    ]
+    result.open_ends = [
+        n for n in order
+        if sub.nodes[n].get("status") != "Complete"
+        and not (_outgoing_types(n) & {"FS", "FF"})
+    ]
 
     # ── Critical path chains via driving edges ────────────────────────────────
     critical_tf = 0 if (min_tf is None or min_tf <= 0) else min_tf
