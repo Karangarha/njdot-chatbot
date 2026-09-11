@@ -118,32 +118,34 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "ad_date_day", CAT_ADMIN_DATES,
         "Advertisement Date Falls on Tuesday or Thursday",
-        "PASS if the Advertisement milestone falls on a Tuesday or Thursday. "
-        "State the date and weekday. Look in: schedule milestone M100.",
+        "Deterministic: computed from the Advertisement milestone's (M100) "
+        "date — no AI judgement involved. FAIL states the actual weekday.",
+        check_type="date_rule",
     ),
     CheckDef(
         "bid_date_day", CAT_ADMIN_DATES,
         "Bid Date Falls on Tuesday or Thursday",
-        "PASS if the Bid milestone falls on a Tuesday or Thursday. State the "
-        "date and weekday. Look in: schedule milestone M200.",
+        "Deterministic: computed from the Bid milestone's (M200) date — no "
+        "AI judgement involved. FAIL states the actual weekday.",
+        check_type="date_rule",
     ),
     CheckDef(
         "ad_to_bid_gap", CAT_ADMIN_DATES,
         "15 Business Days: Advertisement to Bid",
-        "Count weekdays from Advertisement to Bid, excluding State holidays. "
-        "Minimum 15. If a spanning activity exists, compare its duration to "
-        "your count and report any disagreement - it usually means the "
-        "calendar is not excluding holidays. Look in: schedule milestones "
-        "M100 and M200; activity A100 if present.",
+        "Deterministic: computed from the Advertisement (M100) and Bid "
+        "(M200) milestone dates using the Advertisement milestone's own "
+        "calendar (holiday-aware) — no AI judgement involved. FAIL states "
+        "the actual business-day count against the 15-day minimum.",
+        check_type="date_rule",
     ),
     CheckDef(
         "bid_to_award_gap", CAT_ADMIN_DATES,
         "15 Business Days: Bid to Award",
-        "Count weekdays from Bid to Award, excluding State holidays. Minimum "
-        "15. If the window contains a State holiday and the spanning activity "
-        "still shows 15 days, the calendar is not excluding holidays - the "
-        "real gap is shorter. Say so. Look in: schedule milestones M200 and "
-        "M300; activity A200 if present.",
+        "Deterministic: computed from the Bid (M200) and Award (M300) "
+        "milestone dates using the Bid milestone's own calendar "
+        "(holiday-aware) — no AI judgement involved. FAIL states the "
+        "actual business-day count against the 15-day minimum.",
+        check_type="date_rule",
     ),
     CheckDef(
         "award_to_construction", CAT_ADMIN_DATES,
@@ -379,10 +381,11 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "no_completion_in_winter", CAT_COMPLETION,
         "Completion Dates Not Between Dec 15 and Mar 15",
-        "Neither Substantial nor Final Completion may fall between Dec 15 "
-        "and Mar 15 - it forces punch list, paving, striping and "
-        "landscaping into unworkable conditions. State both dates. Look in: "
-        "schedule milestones M900 and M950.",
+        "Deterministic: computed from the Substantial (M900) and Final "
+        "(M950) Completion milestone dates against the fixed Dec 15 - Mar "
+        "15 window — no AI judgement involved. FAIL states whichever "
+        "milestone(s) fall in the window.",
+        check_type="date_rule",
     ),
     CheckDef(
         "project_region_i195", CAT_NONE,
@@ -396,12 +399,13 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "substantial_regional_deadlines", CAT_COMPLETION,
         "Substantial Completion Before Oct 1 (North/Central NJ) or Oct 15 (South NJ)",
-        "Substantial Completion must fall before Oct 1 if NORTH of I-195, "
-        "before Oct 15 if SOUTH. Compare month and day only; the year does "
-        "not matter. Use the GEOGRAPHY line supplied in the key map facts - "
-        "do not re-derive it. This rule governs SUBSTANTIAL Completion only. "
-        "A later Final Completion is expected and is not a failure here. "
-        "Look in: KEY MAP FACTS geography line; schedule milestone M900.",
+        "Deterministic: computed from the Substantial Completion milestone "
+        "(M900) date against the region-dependent deadline (Oct 1 NORTH of "
+        "I-195, Oct 15 SOUTH), using the same region determination as "
+        "project_region_i195 — no AI judgement involved. Governs SUBSTANTIAL "
+        "Completion only; a later Final Completion is expected and not a "
+        "failure here.",
+        check_type="date_rule",
         source_files=["schedule", "keymap"],
     ),
 

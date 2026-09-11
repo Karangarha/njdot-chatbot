@@ -67,13 +67,22 @@ def seed_schedule(
         cal_id = str(cal.get("id", ""))
         if not cal_id:
             continue
+        exceptions = cal.get("exceptions") or []
+        work_exceptions = cal.get("work_exceptions") or []
         cal_rows.append({
             "calendarId": cal_id,
             "name": cal.get("name", "Calendar"),
             "workDays": list(cal.get("work_days") or []),
             "hoursPerDay": cal.get("day_hr_cnt", 8.0),
-            "exceptionCount": len(cal.get("exceptions") or []),
-            "workExceptionCount": len(cal.get("work_exceptions") or []),
+            "exceptionCount": len(exceptions),
+            "workExceptionCount": len(work_exceptions),
+            # Actual dates (not just counts) so deterministic checks can
+            # reconstruct a real WorkCalendar and count business days
+            # holiday-aware -- e.g. app.compliance.date_rule's
+            # ad_to_bid_gap/bid_to_award_gap, which need the same "exclude
+            # State holidays" exclusion the CPM engine already applies.
+            "exceptionDates": [e["date"] for e in exceptions if e.get("date")],
+            "workExceptionDates": [e["date"] for e in work_exceptions if e.get("date")],
         })
     if cal_rows:
         graph.query(

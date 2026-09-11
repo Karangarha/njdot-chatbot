@@ -57,6 +57,7 @@ from app.auth import user_id_from_token, user_id_from_token_optional
 from app.compliance.catalog import BUILTIN_CHECKS, MANUAL_REVIEW_KEYS, CheckDef
 from app.compliance.cost import CostGapResult, evaluate_cost_gap
 from app.compliance.edq import EdqCoverageResult, evaluate_edq_coverage, match_edq_items_to_activities
+from app.compliance.date_rule import DateRuleResult, evaluate_date_rules
 from app.compliance.eval_engine import CitedSearch, EvidenceCandidate, evaluate_checks
 from app.compliance.geo import RegionResult, resolve_region
 from app.compliance.schedule_logic import ScheduleLogicResult, evaluate_schedule_logic
@@ -966,6 +967,14 @@ def _run_review_pipeline(
     # geo/cost_gap/edq_coverage there's no optional-upload gate here.
     schedule_logic: Dict[str, ScheduleLogicResult] = evaluate_schedule_logic(graph, project_id)
 
+    # Date-rule checks (weekday tests, business-day gaps, winter-window
+    # tests) likewise always run -- substantial_regional_deadlines is the
+    # one that needs keymap_geo.region, which is None (not "missing data")
+    # when no key map was uploaded; the evaluator reports that as Missing.
+    date_rule: Dict[str, DateRuleResult] = evaluate_date_rules(
+        graph, project_id, keymap_geo.region if keymap_geo else None,
+    )
+
     # ── Evaluate the checklist ───────────────────────────────────────────────────
     # Static reference collections — independent of reseed/fast-path above,
     # since they're ingested once system-wide, not per review.
@@ -984,6 +993,7 @@ def _run_review_pipeline(
             keymap_facts=keymap_facts, keymap_geo=keymap_geo,
             estimate_facts=estimate_facts, cost_gap=cost_gap,
             edq_coverage=edq_coverage, schedule_logic=schedule_logic,
+            date_rule=date_rule,
             utility_plan_search_fn=utility_plan_search_fn,
             project_id=project_id, user_id=user_id,
             on_progress=lambda done, total: _set_review_progress(

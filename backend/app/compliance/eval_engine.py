@@ -32,9 +32,10 @@ short-circuit the LLM entirely and are computed in Python: ``"geo"``
 (north/south of I-195 from key map coordinates, ``app.compliance.geo``),
 ``"cost_gap"`` (Substantial-to-Final day gap from the Engineer's Estimate,
 ``app.compliance.cost``), ``"edq_coverage"`` (EDQ line item -> schedule
-activity graph coverage, ``app.compliance.edq``), and ``"schedule_logic"``
+activity graph coverage, ``app.compliance.edq``), ``"schedule_logic"``
 (CSM Section 3.0 negative float / lag / open ends / mandatory constraints,
-``app.compliance.schedule_logic``).
+``app.compliance.schedule_logic``), and ``"date_rule"`` (milestone weekday
+tests and holiday-aware business-day gaps, ``app.compliance.date_rule``).
 """
 
 from __future__ import annotations
@@ -52,6 +53,7 @@ from langchain_neo4j import Neo4jGraph
 
 from app.compliance.catalog import CheckDef
 from app.compliance.cost import CostGapResult
+from app.compliance.date_rule import DateRuleResult
 from app.compliance.edq import EdqCoverageResult
 from app.compliance.geo import RegionResult
 from app.compliance.schedule_logic import ScheduleLogicResult
@@ -377,6 +379,25 @@ def _evaluate_edq_coverage_check(check: CheckDef, ctx: "_DeterministicContext") 
     )
 
 
+def _evaluate_date_rule_check(check: CheckDef, ctx: "_DeterministicContext") -> ReviewCheckResult:
+    """Deterministic milestone-date/business-day-gap check — dispatches by
+    ``check.check_key`` into the precomputed ``date_rule`` dict (one entry
+    per check_key, see ``app.compliance.date_rule``), no LLM call.
+    ``satisfied is None`` means an input milestone date (or, for
+    substantial_regional_deadlines, the key-map region) couldn't be
+    resolved — reported as Missing with the reason rather than a guess."""
+    results = ctx.date_rule
+    if results is None or check.check_key not in results:
+        return _result(check, "Missing", "Date-rule facts were not computed for this review.", "schedule")
+    r: DateRuleResult = results[check.check_key]
+    if r.satisfied is None:
+        return _result(check, "Missing", r.detail, "schedule milestones")
+    return _result(
+        check, "Pass" if r.satisfied else "Fail", r.detail,
+        "schedule milestones (deterministic computation)",
+    )
+
+
 def _evaluate_schedule_logic_check(check: CheckDef, ctx: "_DeterministicContext") -> ReviewCheckResult:
     """Deterministic CSM Section 3.0 schedule-logic check — dispatches by
     ``check.check_key`` into the precomputed ``schedule_logic`` dict (one
@@ -401,6 +422,7 @@ class _DeterministicContext:
     cost_gap: Optional[CostGapResult] = None
     edq_coverage: Optional[EdqCoverageResult] = None
     schedule_logic: Optional[Dict[str, ScheduleLogicResult]] = None
+    date_rule: Optional[Dict[str, DateRuleResult]] = None
 
 
 # check_type -> evaluator. A check_type absent from this registry takes the
@@ -410,6 +432,7 @@ _DETERMINISTIC_EVALUATORS: Dict[str, Callable[[CheckDef, _DeterministicContext],
     "cost_gap": _evaluate_cost_gap_check,
     "edq_coverage": _evaluate_edq_coverage_check,
     "schedule_logic": _evaluate_schedule_logic_check,
+    "date_rule": _evaluate_date_rule_check,
 }
 
 
@@ -716,6 +739,7 @@ def evaluate_checks(
     cost_gap: Optional[CostGapResult] = None,
     edq_coverage: Optional[EdqCoverageResult] = None,
     schedule_logic: Optional[Dict[str, ScheduleLogicResult]] = None,
+    date_rule: Optional[Dict[str, DateRuleResult]] = None,
     utility_plan_search_fn: Optional[Callable[[str], str]] = None,
     project_id: str = "default",
     user_id: Optional[str] = None,
@@ -763,7 +787,7 @@ def evaluate_checks(
     structured_judge_llm = llm.with_structured_output(GroundingJudgment, include_raw=True)
     deterministic_ctx = _DeterministicContext(
         keymap_geo=keymap_geo, cost_gap=cost_gap, edq_coverage=edq_coverage,
-        schedule_logic=schedule_logic,
+        schedule_logic=schedule_logic, date_rule=date_rule,
     )
     total_input_tokens = 0
     total_output_tokens = 0
