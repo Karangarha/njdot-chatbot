@@ -805,8 +805,9 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Night work can be REQUIRED by contract even when the schedule "
         "shows none. First check the SP for mandated night work - telecom "
         "fiber splicing during overnight windows is the common case, "
-        "typically under 105.07.02 (search: \"day shift, night shift, or "
-        "on weekends\", \"safe-time\", \"advance notice for nighttime "
+        "typically under 105.07.02.5.a.16 (search: \"fiber optic cable "
+        "splicing\", \"safe-time\", \"12:00am to 6:00am\", \"day shift, "
+        "night shift, or on weekends\", \"advance notice for nighttime "
         "work\"). Then check the schedule for activities named night or "
         "overnight, and night-related submittals (a Night Lighting Plan "
         "means night operations were contemplated) - calendar assignment "
@@ -821,6 +822,7 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "language into it. Look in: Special Provisions 105.07.02 utility "
         "sections; schedule submittals; designer's narrative.",
         source_files=["narrative", "schedule", "sp"],
+        sp_top_k=12,
     ),
 
     # ── Manual Review (continued) ─────────────────────────────────────────────
