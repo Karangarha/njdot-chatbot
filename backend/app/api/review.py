@@ -117,6 +117,7 @@ _STATUS_MAP = {"Pass": "pass", "Fail": "fail", "Missing": "warning"}
 # Fallback check_type by check_key, for `checks` payloads sent by a frontend
 # that predates the field — see _parse_checks.
 _BUILTIN_CHECK_TYPES = {c.check_key: c.check_type for c in BUILTIN_CHECKS}
+_BUILTIN_SP_TOP_K = {c.check_key: c.sp_top_k for c in BUILTIN_CHECKS}
 
 
 # ── In-process review progress store ────────────────────────────────────────
@@ -351,7 +352,7 @@ def _build_sp_search_fn(
     if not sp_chunks:
         return None
 
-    def _search(query: str, top_k: int = 5) -> Tuple[str, Dict[str, EvidenceCandidate]]:
+    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate]]:
         q_vec = embeddings.embed_query(query)
         scored = sorted(zip(sp_chunks, sp_vectors), key=lambda cv: -_cosine(q_vec, cv[1]))
         top = [c for c, _ in scored[:top_k]]
@@ -389,8 +390,8 @@ def _build_sp_search_fn_from_supabase(
     if not existing.count:
         return None
 
-    def _search(query: str) -> Tuple[str, Dict[str, EvidenceCandidate]]:
-        rows = retrieve_sp_chunks(db, embeddings.embed_query, project_id, query)
+    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate]]:
+        rows = retrieve_sp_chunks(db, embeddings.embed_query, project_id, query, match_count=top_k)
         if not rows:
             return "No matching Special Provision text found.", {}
         parts: List[str] = []
@@ -702,6 +703,12 @@ def _parse_checks(raw: Optional[str]) -> Optional[List[CheckDef]]:
                 check_type=(item.get("check_type")
                             or _BUILTIN_CHECK_TYPES.get(item["check_key"], "llm")),
                 source_files=item.get("source_files") or ["schedule"],
+                # Same fallback pattern as check_type: payloads from frontends
+                # that predate sp_top_k in CheckSpec fall back to the catalog's
+                # per-check default rather than the dataclass default of 8,
+                # so table-heavy checks keep their raised top_k on this path too.
+                sp_top_k=(item.get("sp_top_k")
+                          or _BUILTIN_SP_TOP_K.get(item["check_key"], 8)),
             ))
         except KeyError as exc:
             raise HTTPException(

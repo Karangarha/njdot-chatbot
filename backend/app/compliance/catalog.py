@@ -72,6 +72,11 @@ class CheckDef:
     # by the user when they add a custom check ("select the file(s)"),
     # defaulted by category for built-ins.
     source_files: List[str] = field(default_factory=lambda: ["schedule"])
+    # Number of Special Provision chunks to retrieve for checks with "sp" in
+    # source_files (ignored otherwise). Default matches chunk_special_provision's
+    # 600-token/100-token-overlap window; table-heavy checks (a table spanning
+    # more chunks than the default retrieves) raise this explicitly.
+    sp_top_k: int = 8
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -418,6 +423,7 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "schedule submittal (PS-series) activities; narrative Lead Time "
         "section.",
         source_files=["narrative", "schedule", "sp", "spec"],
+        sp_top_k=12,
     ),
     CheckDef(
         "steel_pole_lead_time", CAT_WORKING_DRAWINGS,
@@ -749,6 +755,7 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Look in: Traffic Control Plans; narrative Critical Milestones "
         "section; schedule milestones and stage WBS.",
         source_files=["sp", "narrative", "schedule"],
+        sp_top_k=12,
     ),
     CheckDef(
         "summer_shutdown", CAT_NONE,

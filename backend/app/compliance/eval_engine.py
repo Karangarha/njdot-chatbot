@@ -558,7 +558,7 @@ def _evaluate_one_check(
         evidence_parts.append(narrative_text)
         citation_lookup.update(narrative_candidates)
     if "sp" in sources:
-        sp_text, sp_candidates = sp_search_fn(check.instruction)
+        sp_text, sp_candidates = sp_search_fn(check.instruction, top_k=check.sp_top_k)
         evidence_parts.append(sp_text)
         citation_lookup.update(sp_candidates)
     if "keymap" in sources:
