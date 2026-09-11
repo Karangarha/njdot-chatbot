@@ -20,17 +20,20 @@ if str(_ROOT) not in sys.path:
 from app.compliance.date_rule import (  # noqa: E402
     evaluate_ad_date_day,
     evaluate_ad_to_bid_gap,
+    evaluate_award_to_construction,
     evaluate_no_completion_in_winter,
     evaluate_substantial_regional_deadlines,
 )
 
 
 class _FakeGraph:
-    """Milestones keyed by taskId; calendars keyed by calendarId."""
+    """Milestones keyed by taskId; calendars keyed by calendarId; EDQ items
+    as a flat list (only used by the award_to_construction classifier)."""
 
-    def __init__(self, milestones=None, calendars=None):
+    def __init__(self, milestones=None, calendars=None, edq_items=None):
         self.milestones = milestones or {}
         self.calendars = calendars or {}
+        self.edq_items = edq_items or []
 
     def query(self, cypher, params=None):
         if "MATCH (a:Activity" in cypher:
@@ -39,6 +42,8 @@ class _FakeGraph:
         if "MATCH (c:Calendar" in cypher:
             c = self.calendars.get(params["cid"])
             return [c] if c else []
+        if "MATCH (e:EdqItem" in cypher:
+            return [{"itemDescription": d} for d in self.edq_items]
         return []
 
 
@@ -152,6 +157,58 @@ def test_substantial_regional_deadlines_missing_when_region_unresolved():
     assert result.satisfied is None
 
 
+def _award_graph(award_date, construction_start_date, edq_items=None):
+    return _FakeGraph(
+        milestones={
+            "M300": _milestone("M300", award_date),
+            "M500": _milestone("M500", construction_start_date),
+        },
+        calendars={"827": _MON_FRI_CAL},
+        edq_items=edq_items or [],
+    )
+
+
+def test_award_to_construction_federal_passes_at_55_business_days():
+    # Route 49 fixture shape: Award 2024-09-05 -> Construction Start
+    # 2024-11-21 is >= 55 weekdays even on a plain Mon-Fri calendar with no
+    # holiday exceptions (the real holiday-aware count is exactly 55; the
+    # plain count is a few days higher, which still clears the minimum).
+    graph = _award_graph("2024-09-05", "2024-11-21")
+    result = evaluate_award_to_construction(graph, "proj-1", federal_project_no="0123456")
+    assert result.satisfied is True
+    assert "Federal" in result.detail
+    assert result.metric_days >= 55
+
+
+def test_award_to_construction_fails_below_federal_minimum():
+    graph = _award_graph("2024-09-05", "2024-09-19")  # ~10 weekdays
+    result = evaluate_award_to_construction(graph, "proj-1", federal_project_no="0123456")
+    assert result.satisfied is False
+
+
+def test_award_to_construction_defaults_to_state_without_federal_number_or_edq_items():
+    graph = _award_graph("2024-09-05", "2024-11-21", edq_items=[])
+    result = evaluate_award_to_construction(graph, "proj-1", federal_project_no=None)
+    assert "State" in result.detail
+    assert result.satisfied is True  # 40-day minimum, well cleared
+
+
+def test_award_to_construction_classifies_pavement_preservation_from_edq_items():
+    items = ["Mill Existing Pavement", "HMA Resurfacing Course", "Pavement Striping"] * 3
+    graph = _award_graph("2024-09-05", "2024-10-10", edq_items=items)  # short gap, ok for 25-day min
+    result = evaluate_award_to_construction(graph, "proj-1", federal_project_no=None)
+    assert "Pavement Preservation" in result.detail
+    assert result.satisfied is True
+
+
+def test_award_to_construction_missing_on_conflicting_federal_numbers():
+    graph = _award_graph("2024-09-05", "2024-11-21")
+    result = evaluate_award_to_construction(
+        graph, "proj-1", federal_project_no="0123456", conflicting_federal_number=True,
+    )
+    assert result.satisfied is None
+
+
 if __name__ == "__main__":
     test_ad_date_day_pass_on_thursday()
     test_ad_date_day_fail_on_monday()
@@ -163,4 +220,9 @@ if __name__ == "__main__":
     test_no_completion_in_winter_passes_outside_window()
     test_substantial_regional_deadlines_south_before_oct15()
     test_substantial_regional_deadlines_missing_when_region_unresolved()
+    test_award_to_construction_federal_passes_at_55_business_days()
+    test_award_to_construction_fails_below_federal_minimum()
+    test_award_to_construction_defaults_to_state_without_federal_number_or_edq_items()
+    test_award_to_construction_classifies_pavement_preservation_from_edq_items()
+    test_award_to_construction_missing_on_conflicting_federal_numbers()
     print("All tests passed!")

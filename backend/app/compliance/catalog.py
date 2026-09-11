@@ -150,13 +150,17 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "award_to_construction", CAT_ADMIN_DATES,
         "Award to Construction Start Timeframe (40 days State / 55 days Federal / 25-55 days Pavement)",
-        "Requirement depends on project type: Federal 55 business days, "
-        "State 40, Pavement Preservation 25-55. Treat as a minimum. Determine "
-        "type from a Federal Project Number or Federal-aid language; absent "
-        "any, treat as State. State which type you concluded. Look in: "
-        "schedule milestones M300 and M500; Key Sheet federal project "
-        "number; DBE Goal Memo; Special Provisions 105.02.05.",
-        source_files=["schedule", "narrative", "sp", "keymap", "estimate"],
+        "Deterministic: computed from the Award (M300) and Construction "
+        "Start (M500) milestone dates using the Award milestone's own "
+        "calendar (holiday-aware) — no AI judgement involved. Project type "
+        "is a Federal Project Number lookup (key map or DBE Goal Memo) "
+        "falling back to an EDQ item-mix classification for Pavement "
+        "Preservation, defaulting to State otherwise; conflicting Federal "
+        "Project Numbers between the two sources report Missing rather than "
+        "guess. FAIL states the actual business-day count against the "
+        "type's minimum (55 Federal / 40 State / 25 Pavement Preservation).",
+        check_type="date_rule",
+        source_files=["schedule", "keymap", "estimate"],
     ),
 
     # ── Environmental, Landscape & Utilities ──────────────────────────────────

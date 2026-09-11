@@ -163,9 +163,85 @@ def evaluate_substantial_regional_deadlines(
     )
 
 
-# check_key -> evaluator. substantial_regional_deadlines needs `region` from
-# the keymap geo result, so it's dispatched separately in eval_engine.py
-# rather than through this uniform (graph, project_id) registry.
+_AWARD_MINIMUM_BY_TYPE = {"Federal": 55, "State": 40, "Pavement Preservation": 25}
+
+# ponytail: keyword-based pavement-preservation classification -- a real
+# NJDOT pay-item category taxonomy would be more precise than matching
+# itemDescription substrings. Upgrade if this misclassifies a real project;
+# until then it only fires when NO federal project number is present at all.
+_MILLING_RESURFACING_TERMS = ("mill", "resurfac", "overlay", "pavement")
+_STRUCTURE_TERMS = ("bridge", "abutment", "pier", "structural steel", "beam", "deck", "culvert")
+
+
+def _classify_project_type(
+    graph: Any, project_id: str, federal_project_no: Optional[str],
+) -> "tuple[Optional[str], str]":
+    """Returns (project_type, detail). project_type is one of "Federal",
+    "State", "Pavement Preservation", or None (couldn't classify -> Missing)."""
+    if federal_project_no:
+        return "Federal", f"Federal Project No. {federal_project_no} present."
+
+    rows = graph.query(
+        "MATCH (e:EdqItem {projectId: $pid}) RETURN e.itemDescription AS itemDescription",
+        params={"pid": project_id},
+    ) or []
+    descriptions = [(r.get("itemDescription") or "").lower() for r in rows]
+    if not descriptions:
+        return "State", "No Federal Project Number found; no EDQ items available to check for pavement-preservation indicators, defaulting to State."
+
+    milling_count = sum(1 for d in descriptions if any(t in d for t in _MILLING_RESURFACING_TERMS))
+    structure_count = sum(1 for d in descriptions if any(t in d for t in _STRUCTURE_TERMS))
+    if structure_count == 0 and milling_count / len(descriptions) >= 0.5:
+        return (
+            "Pavement Preservation",
+            f"No Federal Project Number; {milling_count}/{len(descriptions)} EDQ items are "
+            f"milling/resurfacing-type with 0 structure items.",
+        )
+    return (
+        "State",
+        f"No Federal Project Number and no dominant pavement-preservation signature "
+        f"({milling_count}/{len(descriptions)} milling/resurfacing items, "
+        f"{structure_count} structure items), defaulting to State.",
+    )
+
+
+def evaluate_award_to_construction(
+    graph: Any, project_id: str, federal_project_no: Optional[str], conflicting_federal_number: bool = False,
+) -> DateRuleResult:
+    if conflicting_federal_number:
+        return DateRuleResult(
+            None,
+            "The key map and DBE Goal Memo report different Federal Project Numbers -- "
+            "project type could not be determined.",
+        )
+    a = _get_milestone(graph, project_id, _M_AWARD)
+    b = _get_milestone(graph, project_id, _M_CONSTRUCTION_START)
+    a_date = _to_date(a.get("date")) if a else None
+    b_date = _to_date(b.get("date")) if b else None
+    if a_date is None or b_date is None:
+        missing = [lbl for lbl, d in (("Award", a_date), ("Construction Start", b_date)) if d is None]
+        return DateRuleResult(None, f"Missing date(s) for: {', '.join(missing)}.")
+
+    project_type, type_detail = _classify_project_type(graph, project_id, federal_project_no)
+    if project_type is None:
+        return DateRuleResult(None, type_detail)
+
+    cal = _get_calendar(graph, project_id, a.get("calendarId"))
+    gap = cal.work_days_between(a_date, b_date)
+    minimum = _AWARD_MINIMUM_BY_TYPE[project_type]
+    ok = gap >= minimum
+    detail = (
+        f"{type_detail} Award (M300) = {a_date.isoformat()}, Construction Start (M500) = "
+        f"{b_date.isoformat()}: {gap} business day(s) on the Award-side calendar "
+        f"(minimum {minimum} for {project_type})."
+    )
+    return DateRuleResult(ok, detail, metric_days=gap)
+
+
+# check_key -> evaluator. substantial_regional_deadlines and
+# award_to_construction need extra inputs (region, federal project number)
+# beyond (graph, project_id), so they're dispatched separately in
+# evaluate_date_rules rather than through this uniform registry.
 _EVALUATORS: Dict[str, Callable[[Any, str], DateRuleResult]] = {
     "ad_date_day": evaluate_ad_date_day,
     "bid_date_day": evaluate_bid_date_day,
@@ -175,9 +251,18 @@ _EVALUATORS: Dict[str, Callable[[Any, str], DateRuleResult]] = {
 }
 
 
-def evaluate_date_rules(graph: Any, project_id: str, region: Optional[str]) -> Dict[str, DateRuleResult]:
+def evaluate_date_rules(
+    graph: Any,
+    project_id: str,
+    region: Optional[str],
+    federal_project_no: Optional[str] = None,
+    conflicting_federal_number: bool = False,
+) -> Dict[str, DateRuleResult]:
     """Run every date_rule check once per review -- each is a cheap read of
     already-seeded milestone/calendar data."""
     results = {key: fn(graph, project_id) for key, fn in _EVALUATORS.items()}
     results["substantial_regional_deadlines"] = evaluate_substantial_regional_deadlines(graph, project_id, region)
+    results["award_to_construction"] = evaluate_award_to_construction(
+        graph, project_id, federal_project_no, conflicting_federal_number,
+    )
     return results

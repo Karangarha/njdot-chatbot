@@ -967,12 +967,26 @@ def _run_review_pipeline(
     # geo/cost_gap/edq_coverage there's no optional-upload gate here.
     schedule_logic: Dict[str, ScheduleLogicResult] = evaluate_schedule_logic(graph, project_id)
 
+    # award_to_construction's project-type classification checks two
+    # independent sources for the Federal Project Number (key map, DBE Goal
+    # Memo) -- present-but-different is a conflict (Missing), present in
+    # only one is not.
+    federal_project_no = (
+        getattr(keymap_extraction, "federal_project_no", None) if keymap_extraction else None
+    ) or (
+        getattr(estimate_extraction, "federal_project_number", None) if estimate_extraction else None
+    )
+    km_federal = getattr(keymap_extraction, "federal_project_no", None) if keymap_extraction else None
+    est_federal = getattr(estimate_extraction, "federal_project_number", None) if estimate_extraction else None
+    conflicting_federal_number = bool(km_federal and est_federal and km_federal != est_federal)
+
     # Date-rule checks (weekday tests, business-day gaps, winter-window
     # tests) likewise always run -- substantial_regional_deadlines is the
     # one that needs keymap_geo.region, which is None (not "missing data")
     # when no key map was uploaded; the evaluator reports that as Missing.
     date_rule: Dict[str, DateRuleResult] = evaluate_date_rules(
         graph, project_id, keymap_geo.region if keymap_geo else None,
+        federal_project_no=federal_project_no, conflicting_federal_number=conflicting_federal_number,
     )
 
     # ── Evaluate the checklist ───────────────────────────────────────────────────
