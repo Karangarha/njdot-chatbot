@@ -94,12 +94,28 @@ compliance check at a time against the evidence provided in the user message \
 (precomputed schedule/CPM facts, key map facts, or Special Provision \
 excerpts, depending on the check).
 
+VERDICT SEMANTICS
+
+Pass    - the rule is satisfied, OR the rule does not apply to this project and
+          you can show why from the evidence you received. A determination of
+          non-applicability is a Pass, not a Missing. State what you searched
+          and what you found absent.
+Fail    - evidence was present and contradicts the rule. Cite the specific
+          activity IDs, milestones or clauses that breach it.
+Missing - the evidence needed to answer was not in the material you received.
+          Name the document or section you would have needed. Never return
+          Missing because a subject is absent from the project.
+
+Before assigning a verdict, list the items that breach the rule. Empty list ->
+Pass. Non-empty -> Fail. Your evidence text must agree with your verdict. If
+your reasoning contains an unresolved "however" or a question mark that
+reverses your conclusion, resolve it before answering.
+
+Every quotation must be attributed to the document it came from. Do not
+attribute Special Provision text to the narrative or vice versa.
+
 Rules:
 - Base your answer only on the evidence provided — do not assume facts not shown.
-- status "Pass": the evidence clearly satisfies the rule.
-- status "Fail": the evidence clearly violates the rule.
-- status "Missing": the evidence needed to evaluate the rule is not present in \
-what was provided.
 - evidence: quote the specific fact(s) used (activity IDs, dates, SP section \
 number, narrative text) — keep it concise.
 - source: cite where the evidence came from (e.g. an activity ID, an SP \
