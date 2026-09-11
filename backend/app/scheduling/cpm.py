@@ -191,8 +191,23 @@ def run_cpm(
     result = CpmResult()
     project = project or {}
 
+    _unresolved_calendars: Dict[str, List[str]] = {}
+
     def cal_of(node_data: Dict[str, Any]) -> WorkCalendar:
-        return calendars.get(str(node_data.get("calendar_id", ""))) or DEFAULT_CALENDAR
+        cal_id = str(node_data.get("calendar_id", ""))
+        cal = calendars.get(cal_id)
+        if cal is not None:
+            return cal
+        # Falling back silently here makes every activity on an unresolved
+        # calendar_id compute against Mon-Fri/no-exceptions instead of its
+        # real calendar (e.g. a 7-day or in-water-work calendar) -- exactly
+        # the shape of a false CPM cross-check mismatch. Record it instead of
+        # swallowing it so it surfaces in the schedule evidence.
+        affected = _unresolved_calendars.setdefault(cal_id or "(blank)", [])
+        activity_id = str(node_data.get("activity_id", "?"))
+        if activity_id not in affected:
+            affected.append(activity_id)
+        return DEFAULT_CALENDAR
 
     def _constraints(nd: Dict[str, Any]):
         c = nd.get("constraints", {}) or {}
@@ -502,5 +517,16 @@ def run_cpm(
     for n in on_path:
         if n in result.activities:
             result.activities[n].on_driving_path = True
+
+    for cal_id, activity_ids in _unresolved_calendars.items():
+        msg = (
+            f"Calendar {cal_id!r} referenced by {len(activity_ids)} activity(ies) "
+            f"({', '.join(activity_ids[:8])}"
+            f"{', …' if len(activity_ids) > 8 else ''}) was not found among the "
+            f"parsed calendars -- those activities were computed against the "
+            f"default Mon-Fri calendar instead of their real one."
+        )
+        logger.warning("run_cpm: %s", msg)
+        result.warnings.append(msg)
 
     return result
