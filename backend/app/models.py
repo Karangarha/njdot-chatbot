@@ -101,18 +101,38 @@ class DebugResponse(BaseModel):
 
 class EvaluationSchema(BaseModel):
     """Structured output shape enforced via ``.with_structured_output()`` for
-    each individual compliance-check LLM call."""
+    each individual compliance-check LLM call.
 
-    status:   Literal["Pass", "Fail", "Missing"]
+    ``status`` is deliberately NOT a field here — it used to be, and the
+    model could say "Fail" while its own ``evidence`` described a Pass (or
+    cite an activity that was never actually a breach). Status is now
+    derived in Python from ``breaching_items`` (see
+    ``app.compliance.eval_engine._derive_status``): non-empty -> Fail,
+    empty -> Pass. That makes a self-contradictory verdict structurally
+    impossible instead of something a grounding judge has to catch after
+    the fact.
+    """
+
+    considered_items: List[str] = []
+    # Every activity ID, milestone ID, or SP/spec section number the rule
+    # governs, found in the evidence -- literal IDs only, not prose. The
+    # full candidate set, not just the ones that breach.
+    breaching_items: List[str] = []
+    # The subset of considered_items that actually breaches the rule.
+    # Every entry must also appear in considered_items -- validated in
+    # app.compliance.eval_engine, not just requested here.
     evidence: str   # verbatim extraction or exact metric found
     source:   str   # page number, document name, or Task ID
     cited_chunk_ids: List[str] = []   # tags copied verbatim from tagged evidence passages
 
 
 class GroundingJudgment(BaseModel):
-    """Structured output for the second-pass grounding judge — verifies that
-    an ``EvaluationSchema`` result's evidence actually supports its status,
-    catching self-contradictory verdicts a single LLM call can produce."""
+    """Structured output for the second-pass grounding judge. With status
+    mechanically derived from breaching_items (see EvaluationSchema) and
+    item hallucination caught by a separate mechanical check, this judge's
+    remaining job is narrower than "is this grounded": does the quoted
+    evidence text actually SUPPORT treating the listed items as breaches,
+    rather than just naming real IDs that don't actually breach the rule."""
 
     grounded: bool
     reason:   str   # brief explanation, especially when grounded=False

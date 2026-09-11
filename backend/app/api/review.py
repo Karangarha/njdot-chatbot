@@ -113,7 +113,7 @@ _STORAGE_BUCKET = "review-files"
 _SPEC_COLLECTION = "specs_2019"   # NJDOT Standard Specifications
 _CSM_COLLECTION = "scheduling"    # Construction Scheduling Manual
 
-# EvaluationSchema's Pass/Fail/Missing -> the frontend's existing lowercase enum.
+# ReviewCheckResult.status's Pass/Fail/Missing -> the frontend's existing lowercase enum.
 _STATUS_MAP = {"Pass": "pass", "Fail": "fail", "Missing": "warning"}
 
 # Fallback check_type by check_key, for `checks` payloads sent by a frontend

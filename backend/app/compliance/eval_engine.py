@@ -94,30 +94,37 @@ compliance check at a time against the evidence provided in the user message \
 (precomputed schedule/CPM facts, key map facts, or Special Provision \
 excerpts, depending on the check).
 
-VERDICT SEMANTICS
+You do NOT decide Pass/Fail/Missing directly -- there is no status field. \
+Instead you report two lists, and the verdict is computed from them \
+mechanically:
 
-Pass    - the rule is satisfied, OR the rule does not apply to this project and
-          you can show why from the evidence you received. A determination of
-          non-applicability is a Pass, not a Missing. State what you searched
-          and what you found absent.
-Fail    - evidence was present and contradicts the rule. Cite the specific
-          activity IDs, milestones or clauses that breach it.
-Missing - the evidence needed to answer was not in the material you received.
-          Name the document or section you would have needed. Never return
-          Missing because a subject is absent from the project.
+- considered_items: every activity ID, milestone ID, or SP/spec section \
+number the rule governs, that you actually found in the evidence. Literal \
+IDs only (e.g. "B1020", "M900", "105.07.02") -- never a prose description \
+in place of an ID. If the rule's subject is absent from this project \
+entirely (no railroad, no summer-shutdown clause, etc.), leave this empty \
+and say so in evidence -- that is a Pass, not a reason to invent an item.
+- breaching_items: the subset of considered_items that actually breaches \
+the rule. Every entry here MUST also appear in considered_items, and every \
+entry must be an ID you can point to verbatim in the evidence you were \
+given -- never an item you merely suspect might exist. Empty list -> the \
+check passes. Non-empty -> the check fails on exactly those items and no \
+others.
 
-Before assigning a verdict, list the items that breach the rule. Empty list ->
-Pass. Non-empty -> Fail. Your evidence text must agree with your verdict. If
-your reasoning contains an unresolved "however" or a question mark that
-reverses your conclusion, resolve it before answering.
+Getting this right means: list every candidate item first (considered_items), \
+THEN decide which of those breach (breaching_items) -- never work backwards \
+from a conclusion to a list that supports it. If your reasoning contains an \
+unresolved "however" or a question mark that reverses your conclusion, \
+resolve it before answering.
 
-Every quotation must be attributed to the document it came from. Do not
+Every quotation must be attributed to the document it came from. Do not \
 attribute Special Provision text to the narrative or vice versa.
 
 Rules:
 - Base your answer only on the evidence provided — do not assume facts not shown.
 - evidence: quote the specific fact(s) used (activity IDs, dates, SP section \
-number, narrative text) — keep it concise.
+number, narrative text) — keep it concise, and make sure it explains WHY \
+each breaching_items entry breaches (not just that it exists).
 - source: cite where the evidence came from (e.g. an activity ID, an SP \
 section number, "narrative", or "no data provided").
 - Some passages above are tagged like "[cite:sp-0]" immediately before their \
@@ -134,26 +141,33 @@ cited_chunk_ids empty rather than over-citing. Passages without a tag \
 """
 
 _JUDGE_SYSTEM_PROMPT = """\
-You are a strict fact-checker reviewing ONE compliance-check verdict for \
-internal consistency. You will be shown the same evidence the original \
-check saw, the rule being checked, and the verdict that was produced.
+You are a strict fact-checker reviewing ONE compliance-check verdict. You
+will be shown the same evidence the original check saw, the rule being
+checked, and the items it reported: which activities/clauses it considered,
+which of those it flagged as breaching, and its evidence text.
 
-Your only job: does the cited evidence actually support the stated status? \
-Look specifically for:
-- A status that contradicts what the evidence itself shows (e.g. dates in \
-the evidence indicate compliance, but status is "Fail").
-- Evidence that does not appear to describe what it claims to (a quote \
-attributed to a document that doesn't match the material shown).
+Item existence and internal list consistency (breaching_items all being a
+subset of considered_items, every item appearing verbatim somewhere in the
+evidence) have ALREADY been checked mechanically before this ever reaches
+you -- do not re-derive those. Your only job is the part a mechanical check
+can't do: does the evidence text actually SUPPORT treating each breaching
+item as a genuine breach, and not, say, an item that exists but doesn't
+actually violate the rule (e.g. an activity is real and is named, but its
+own date shows it complies, not breaches)?
 
-A "Pass" that rests on a well-scoped absence (e.g. "searched for water, \
-water main, hydrant, valve — none appear in the evidence") is grounded, \
-provided the search terms are named, the named terms genuinely do not \
-appear, and the evidence shown is the right material to have searched. \
-Absence of a quote is not the same as a fabricated quote.
+A "Pass" (empty breaching_items) that rests on a well-scoped absence (e.g.
+"searched for water, water main, hydrant, valve — none appear in the
+evidence") is grounded, provided the search terms are named, the named
+terms genuinely do not appear, and the evidence shown is the right material
+to have searched.
 
-grounded: true if the evidence genuinely supports the status. false if the \
-status contradicts its own evidence, or the evidence looks fabricated.
-reason: one sentence explaining your grounded/not-grounded call.
+grounded: true if the evidence genuinely supports treating the listed
+breaching items (if any) as real breaches. false if the evidence for a
+breaching item actually shows compliance, or attributes a quote to the
+wrong document.
+reason: one sentence explaining your grounded/not-grounded call -- if false,
+state what the evidence actually shows for the specific item in question,
+since that sentence may be used to correct the verdict directly.
 """
 
 
@@ -490,6 +504,50 @@ def _accumulate_usage(totals: Dict[str, int], call_usage: Dict[str, int]) -> Non
     totals["cached_tokens"] += call_usage["cached_tokens"]
 
 
+def _derive_status(result: EvaluationSchema) -> str:
+    """Status is never a model output (see EvaluationSchema's docstring) --
+    Fail iff breaching_items is non-empty, Pass otherwise. Makes "Fail with
+    evidence that describes a Pass" structurally impossible: there is no
+    field left for the two to disagree in."""
+    return "Fail" if result.breaching_items else "Pass"
+
+
+def _validate_items(result: EvaluationSchema, evidence_blob: str) -> Optional[str]:
+    """Mechanical (no LLM) consistency check on the item lists, run before
+    the grounding judge ever sees the answer. Returns None if valid, or a
+    corrective message identifying exactly what's wrong, fed into the same
+    retry path a grounding-judge rejection uses.
+
+    This catches pure ID fabrication -- an item that never appears anywhere
+    in the evidence at all (e.g. a mistyped or invented activity ID). It
+    does NOT catch a real ID being semantically misclassified (a genuine
+    activity cited for a rule it doesn't actually govern, e.g. "B1020
+    Place Advance Warning Signs" cited as a paving activity) -- that class
+    of error has no fabricated token to catch mechanically; it's still the
+    grounding judge's job below, which is exactly why that judge exists
+    alongside this check rather than instead of it.
+    """
+    orphaned = [b for b in result.breaching_items if b not in result.considered_items]
+    if orphaned:
+        return (
+            f"These breaching_items were never listed in considered_items: "
+            f"{', '.join(orphaned)}. Every breaching item must also appear in "
+            f"considered_items."
+        )
+    evidence_lower = evidence_blob.lower()
+    hallucinated = [
+        item for item in result.considered_items
+        if item and item.lower() not in evidence_lower
+    ]
+    if hallucinated:
+        return (
+            f"These items do not appear anywhere in the evidence you were "
+            f"given: {', '.join(hallucinated)}. Only list items you can point "
+            f"to verbatim in the evidence."
+        )
+    return None
+
+
 def _judge_grounding(
     check: CheckDef,
     evidence_blob: str,
@@ -497,14 +555,16 @@ def _judge_grounding(
     structured_judge_llm: Runnable,
     invoke_config: dict,
 ) -> Tuple[GroundingJudgment, Dict[str, int]]:
-    """Second-pass check: does `result`'s evidence actually support its
-    status? Only called for Pass/Fail verdicts — Missing already means "not
-    enough evidence," nothing to judge. Fails open (grounded=True) if the
-    judge call itself errors, so an unreachable judge never blocks an
-    otherwise-reasonable answer."""
+    """Second-pass check: does the evidence actually support treating
+    breaching_items as genuine breaches? Item existence/list-consistency is
+    already handled by _validate_items before this is ever called; this is
+    the narrower, genuinely subjective remainder (see _JUDGE_SYSTEM_PROMPT).
+    Fails open (grounded=True) if the judge call itself errors, so an
+    unreachable judge never blocks an otherwise-reasonable answer."""
     judge_msg = (
         f"{evidence_blob}\n\nCHECK: {check.name}\n{check.instruction}\n\n"
-        f"VERDICT TO REVIEW:\nstatus: {result.status}\n"
+        f"VERDICT TO REVIEW:\nconsidered_items: {result.considered_items}\n"
+        f"breaching_items: {result.breaching_items}\n"
         f"evidence: {result.evidence}\nsource: {result.source}"
     )
     try:
@@ -673,12 +733,38 @@ def _evaluate_one_check(
             raise ValueError(f"structured output parsing failed: {raw_result.get('parsing_error')}")
     except Exception:
         logger.exception("evaluate_checks: check %s failed", check.check_key)
-        result = EvaluationSchema(
+        return ReviewCheckResult(
+            id=check.check_key, category=check.category, name=check.name,
             status="Missing", evidence="Evaluation failed due to an internal error.",
-            source="error",
-        )
+            source="error", citations=[],
+        ), usage_totals
 
-    if config.REVIEW_GROUNDING_JUDGE and result.status in ("Pass", "Fail"):
+    grounding_note: Optional[str] = None
+
+    # Mechanical item-consistency check, before any LLM judge sees the
+    # answer -- catches pure ID fabrication for free (no LLM call) and only
+    # spends a retry when it actually finds something wrong.
+    item_validation_failed = False
+    item_error = _validate_items(result, evidence)
+    if item_error is not None:
+        logger.warning(
+            "evaluate_checks: check %s failed item validation (%s)", check.check_key, item_error,
+        )
+        retry_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:item_retry"}
+        retried, retry_usage = _retry_with_correction(structured_llm, user_msg, item_error, retry_config)
+        _accumulate_usage(usage_totals, retry_usage)
+        if retried is not None:
+            result = retried
+            if _validate_items(retried, evidence) is not None:
+                grounding_note = "item consistency could not be fully verified after retry"
+                item_validation_failed = True
+        # else: retry call itself errored -- keep the original result
+        # unflagged, same fail-open posture as an unreachable judge below.
+
+    # A retry that still fabricates an item is already known-bad -- skip
+    # the judge rather than spend another call (and possibly another
+    # retry) verifying support for items we already know aren't real.
+    if config.REVIEW_GROUNDING_JUDGE and not item_validation_failed:
         judge_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:judge"}
         judgment, judge_usage = _judge_grounding(check, evidence, result, structured_judge_llm, judge_config)
         _accumulate_usage(usage_totals, judge_usage)
@@ -702,27 +788,35 @@ def _evaluate_one_check(
                 _accumulate_usage(usage_totals, re_judge_usage)
 
             if retried is not None and re_judgment is not None and re_judgment.grounded:
-                # Note the asymmetry: if the FIRST judge call errors, _judge_grounding
-                # fails open and we keep the original answer unverified (safe — it's
-                # what we already had). If the RE-judge errors, it also fails open,
-                # and we accept the RETRIED answer unverified here — a different
-                # answer we've never actually verified. Both follow "an unreachable
-                # judge never blocks a check," and accepting the correction is the
-                # better of the two options, but it's worth being explicit that this
-                # branch can be reached without the retry ever being judged.
                 result = retried
-            else:
+            elif retried is not None:
+                # Double-failure. Deliberately NOT collapsed to Missing: that
+                # used to discard a verdict whose item list was often already
+                # correct (confirmed on Route 49's narrative_winter_work --
+                # the judge's own rejection reasoning WAS the right finding,
+                # word for word). Keep the retried answer's mechanically-
+                # derived status, since breaching_items still says exactly
+                # what it says, and flag it in the evidence for a human to
+                # weigh instead of hiding it behind an amber "Missing" pill
+                # indistinguishable from "the file wasn't uploaded."
+                result = retried
                 failure_reason = re_judgment.reason if re_judgment is not None else judgment.reason
                 logger.warning(
-                    "evaluate_checks: check %s downgraded to Missing after retry (%s)",
+                    "evaluate_checks: check %s grounding unresolved after retry (%s)",
                     check.check_key, failure_reason,
                 )
                 usage_totals["downgraded"] = 1
-                result = EvaluationSchema(
-                    status="Missing",
-                    evidence=f"Could not verify grounding after retry: {failure_reason}",
-                    source="grounding verification failed",
-                )
+                grounding_note = f"grounding could not be independently confirmed after retry — {failure_reason}"
+            else:
+                # Retry call itself errored -- keep the original, same
+                # fail-open posture as an unreachable judge.
+                usage_totals["downgraded"] = 1
+                grounding_note = f"grounding could not be independently confirmed — {judgment.reason}"
+
+    status = _derive_status(result)
+    evidence_text = result.evidence
+    if grounding_note:
+        evidence_text = f"{evidence_text} [Automated note: {grounding_note} — recommend human review.]"
 
     try:
         citations: List[ReviewCitation] = []
@@ -752,7 +846,7 @@ def _evaluate_one_check(
 
     return ReviewCheckResult(
         id=check.check_key, category=check.category, name=check.name,
-        status=result.status, evidence=result.evidence, source=result.source,
+        status=status, evidence=evidence_text, source=result.source,
         citations=citations,
     ), usage_totals
 
@@ -809,8 +903,9 @@ def evaluate_checks(
     UI progress reporting without any locking.
 
     Logs a token-usage summary (input/output/total, plus any cached input
-    tokens, plus how many checks were judged/ungrounded/downgraded) to the
-    server console when done — ``include_raw=True`` is needed to see each
+    tokens, plus how many checks were judged/ungrounded/left unresolved
+    after a retry) to the server console when done — ``include_raw=True``
+    is needed to see each
     call's ``usage_metadata``; the plain parsed Pydantic object doesn't
     carry it.
     """
@@ -907,7 +1002,7 @@ def evaluate_checks(
 
     logger.info(
         "evaluate_checks: %d checks evaluated (%d LLM calls, concurrency=%d) | tokens: %d in "
-        "(%d cached) / %d out / %d total | judge: %d checks judged, %d ungrounded, %d downgraded",
+        "(%d cached) / %d out / %d total | judge: %d checks judged, %d ungrounded, %d unresolved after retry",
         len(results), llm_call_count, config.REVIEW_CHECK_CONCURRENCY, total_input_tokens,
         total_cached_tokens, total_output_tokens, total_input_tokens + total_output_tokens,
         total_judged, total_ungrounded, total_downgraded,

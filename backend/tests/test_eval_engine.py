@@ -26,9 +26,11 @@ from app.compliance.eval_engine import (  # noqa: E402
     EvidenceCandidate,
     _DeterministicContext,
     _accumulate_usage,
+    _derive_status,
     _evaluate_one_check,
     _judge_grounding,
     _retry_with_correction,
+    _validate_items,
     build_narrative_text,
     evaluate_checks,
 )
@@ -156,10 +158,66 @@ def _make_check(**overrides):
     return CheckDef(**defaults)
 
 
+def test_derive_status_fail_when_breaching_items_non_empty():
+    result = EvaluationSchema(
+        considered_items=["B1010", "B1020"], breaching_items=["B1020"],
+        evidence="e", source="s",
+    )
+    assert _derive_status(result) == "Fail"
+
+
+def test_derive_status_pass_when_breaching_items_empty():
+    result = EvaluationSchema(considered_items=["B1010"], breaching_items=[], evidence="e", source="s")
+    assert _derive_status(result) == "Pass"
+
+
+def test_derive_status_pass_on_supported_absence():
+    # No railroad on this project -- considered_items is legitimately empty
+    # too (nothing to consider), and that must still be Pass, not Missing.
+    result = EvaluationSchema(considered_items=[], breaching_items=[], evidence="no railroad found", source="s")
+    assert _derive_status(result) == "Pass"
+
+
+def test_validate_items_passes_when_all_items_appear_in_evidence():
+    result = EvaluationSchema(
+        considered_items=["B1010", "B1020"], breaching_items=["B1020"],
+        evidence="e", source="s",
+    )
+    assert _validate_items(result, "roster: B1010 ...; B1020 ...") is None
+
+
+def test_validate_items_rejects_breaching_item_not_in_considered_items():
+    result = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1020"], evidence="e", source="s",
+    )
+    error = _validate_items(result, "roster: B1010 ...; B1020 ...")
+    assert error is not None
+    assert "B1020" in error
+
+
+def test_validate_items_rejects_item_not_present_in_evidence():
+    # The no_paving_winter-shaped failure: a real activity ID that simply
+    # never appears anywhere in the evidence the check actually received.
+    result = EvaluationSchema(
+        considered_items=["Z9999"], breaching_items=["Z9999"], evidence="e", source="s",
+    )
+    error = _validate_items(result, "roster: B1010 ...; B1020 ...")
+    assert error is not None
+    assert "Z9999" in error
+
+
+def test_validate_items_is_case_insensitive():
+    result = EvaluationSchema(
+        considered_items=["gas main"], breaching_items=["gas main"], evidence="e", source="s",
+    )
+    assert _validate_items(result, "Activity: Install GAS MAIN and Roadway Features") is None
+
+
 def test_judge_grounding_parses_response():
     check = _make_check()
     result = EvaluationSchema(
-        status="Fail",
+        considered_items=["B1010"],
+        breaching_items=["B1010"],
         evidence="B1010 starts 2024-09-01, ROW available 2024-08-01.",
         source="B1010",
     )
@@ -182,7 +240,7 @@ def test_judge_grounding_parses_response():
 
 def test_judge_grounding_fails_open_on_error():
     check = _make_check()
-    result = EvaluationSchema(status="Pass", evidence="no gas activity found", source="schedule")
+    result = EvaluationSchema(evidence="no gas activity found", source="schedule")
 
     judgment, usage = _judge_grounding(check, "evidence blob", result, _FakeErroringLLM(), {})
 
@@ -200,7 +258,7 @@ def test_accumulate_usage_adds_call_and_tokens():
 
 def test_retry_with_correction_includes_correction_and_returns_parsed():
     retried = EvaluationSchema(
-        status="Pass", evidence="B1010 starts after ROW available.", source="B1010",
+        evidence="B1010 starts after ROW available.", source="B1010",
     )
     fake_llm = _FakeStructuredLLM([
         (retried, {"input_tokens": 80, "output_tokens": 15, "input_token_details": {"cache_read": 20}}),
@@ -245,9 +303,68 @@ def _call_evaluate_one_check(check, structured_llm, structured_judge_llm, **over
     return _evaluate_one_check(check, structured_llm, structured_judge_llm, **kwargs)
 
 
+def test_evaluate_one_check_item_validation_retry_recovers():
+    """A hallucinated ID (never appears in the schedule evidence) is caught
+    mechanically before the judge ever runs, and a corrected retry that
+    only names real items is accepted."""
+    check = _make_check()
+    original = EvaluationSchema(
+        considered_items=["Z9999"], breaching_items=["Z9999"],
+        evidence="Z9999 breaches the rule", source="schedule",
+    )
+    retried = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=[],
+        evidence="B1010 is compliant", source="schedule",
+    )
+    llm = _FakeStructuredLLM([
+        (original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}),
+        (retried, {"input_tokens": 12, "output_tokens": 6, "input_token_details": {}}),
+    ])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    result, usage = _call_evaluate_one_check(check, llm, judge)
+
+    assert result.status == "Pass"
+    assert result.evidence == "B1010 is compliant"
+    assert usage["llm_call_count"] == 3  # original + item-validation retry + judge
+    assert len(judge.calls) == 1  # judge only ever sees the corrected answer
+
+
+def test_evaluate_one_check_item_validation_retry_still_invalid():
+    """If the retry STILL hallucinates, proceed with it (closer to right
+    than the original) but flag it -- never crash, never silently accept
+    the fabrication without a trace."""
+    check = _make_check()
+    original = EvaluationSchema(
+        considered_items=["Z9999"], breaching_items=["Z9999"],
+        evidence="Z9999 breaches the rule", source="schedule",
+    )
+    retried = EvaluationSchema(
+        considered_items=["Z8888"], breaching_items=["Z8888"],
+        evidence="Z8888 breaches the rule", source="schedule",
+    )
+    llm = _FakeStructuredLLM([
+        (original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}),
+        (retried, {"input_tokens": 12, "output_tokens": 6, "input_token_details": {}}),
+    ])
+    judge = _FakeStructuredLLM([])  # must not be reached -- item validation never cleared
+
+    result, usage = _call_evaluate_one_check(check, llm, judge)
+
+    assert result.status == "Fail"  # breaching_items still non-empty on the retry
+    assert "could not be fully verified" in result.evidence
+    assert usage["llm_call_count"] == 2  # original + item-validation retry, no judge
+    assert len(judge.calls) == 0
+
+
 def test_evaluate_one_check_grounded_pass_through():
     check = _make_check()
-    original = EvaluationSchema(status="Fail", evidence="cited evidence", source="schedule")
+    original = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1010"],
+        evidence="cited evidence", source="schedule",
+    )
     llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
     judge = _FakeStructuredLLM([
         (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
@@ -266,11 +383,11 @@ def test_evaluate_one_check_grounded_pass_through():
 
 def test_evaluate_one_check_grounded_pass_through_status_pass():
     """Same as test_evaluate_one_check_grounded_pass_through but for a
-    status="Pass" original verdict — the judge condition is
-    ``if result.status in ("Pass", "Fail")``, so Pass must be judged too,
-    not just Fail."""
+    Pass verdict (empty breaching_items) -- the judge runs unconditionally
+    whenever REVIEW_GROUNDING_JUDGE is on, so a Pass must be judged too,
+    not just a Fail."""
     check = _make_check()
-    original = EvaluationSchema(status="Pass", evidence="cited evidence", source="schedule")
+    original = EvaluationSchema(evidence="cited evidence", source="schedule")
     llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
     judge = _FakeStructuredLLM([
         (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
@@ -292,7 +409,10 @@ def test_evaluate_one_check_grounding_judge_can_be_disabled():
     skip the judge (and any retry) entirely, regardless of the original
     verdict, so the check falls back to its unjudged first answer."""
     check = _make_check()
-    original = EvaluationSchema(status="Fail", evidence="cited evidence", source="schedule")
+    original = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1010"],
+        evidence="cited evidence", source="schedule",
+    )
     llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
     judge = _FakeStructuredLLM([])  # must not be called
 
@@ -312,8 +432,14 @@ def test_evaluate_one_check_grounding_judge_can_be_disabled():
 
 def test_evaluate_one_check_ungrounded_retry_succeeds():
     check = _make_check()
-    original = EvaluationSchema(status="Fail", evidence="wrong reading of dates", source="schedule")
-    retried = EvaluationSchema(status="Pass", evidence="B1010 starts after ROW available", source="schedule")
+    original = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1010"],
+        evidence="wrong reading of dates", source="schedule",
+    )
+    retried = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=[],
+        evidence="B1010 starts after ROW available", source="schedule",
+    )
     llm = _FakeStructuredLLM([
         (original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}),
         (retried, {"input_tokens": 12, "output_tokens": 6, "input_token_details": {}}),
@@ -334,9 +460,20 @@ def test_evaluate_one_check_ungrounded_retry_succeeds():
 
 
 def test_evaluate_one_check_ungrounded_retry_still_fails():
+    """Double-failure (judge rejects both the original and the retry) no
+    longer collapses to Missing -- it keeps the retry's own mechanically-
+    derived status (still Fail here, since its breaching_items is
+    non-empty) and appends an automated note to the evidence instead of
+    discarding the finding into an amber "Missing" pill."""
     check = _make_check()
-    original = EvaluationSchema(status="Fail", evidence="wrong reading", source="schedule")
-    retried = EvaluationSchema(status="Fail", evidence="still wrong", source="schedule")
+    original = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1010"],
+        evidence="wrong reading", source="schedule",
+    )
+    retried = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1010"],
+        evidence="still wrong", source="schedule",
+    )
     llm = _FakeStructuredLLM([
         (original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}),
         (retried, {"input_tokens": 12, "output_tokens": 6, "input_token_details": {}}),
@@ -348,25 +485,31 @@ def test_evaluate_one_check_ungrounded_retry_still_fails():
 
     result, usage = _call_evaluate_one_check(check, llm, judge)
 
-    assert result.status == "Missing"
+    assert result.status == "Fail"
+    assert "still wrong" in result.evidence
     assert "still contradicts dates" in result.evidence
-    assert result.source == "grounding verification failed"
+    assert "recommend human review" in result.evidence.lower()
+    assert result.source == "schedule"
     assert usage["llm_call_count"] == 4  # original + judge + retry + re-judge
     assert usage["judged"] == 1
     assert usage["ungrounded"] == 1
     assert usage["downgraded"] == 1
 
 
-def test_evaluate_one_check_missing_status_skips_judge():
+def test_evaluate_one_check_primary_call_error_returns_missing_without_judge():
+    """Missing is no longer something the model can author directly (see
+    EvaluationSchema's docstring) -- the only LLM-path source of Missing
+    left is the primary call itself failing/erroring, which short-circuits
+    before the judge, item validation, or any retry ever run."""
     check = _make_check()
-    original = EvaluationSchema(status="Missing", evidence="no schedule data", source="no data provided")
-    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    llm = _FakeErroringLLM()
     judge = _FakeStructuredLLM([])  # must not be called
 
     result, usage = _call_evaluate_one_check(check, llm, judge)
 
     assert result.status == "Missing"
-    assert usage["llm_call_count"] == 1
+    assert "internal error" in result.evidence
+    assert usage["llm_call_count"] == 0
     assert usage["judged"] == 0
     assert usage["ungrounded"] == 0
     assert usage["downgraded"] == 0
@@ -375,7 +518,10 @@ def test_evaluate_one_check_missing_status_skips_judge():
 
 def test_evaluate_one_check_retry_call_fails_entirely():
     check = _make_check()
-    original = EvaluationSchema(status="Fail", evidence="wrong reading", source="schedule")
+    original = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1010"],
+        evidence="wrong reading", source="schedule",
+    )
 
     class _FirstCallThenError:
         def __init__(self, first_response):
@@ -401,8 +547,12 @@ def test_evaluate_one_check_retry_call_fails_entirely():
 
     result, usage = _call_evaluate_one_check(check, llm, judge)
 
-    assert result.status == "Missing"
-    assert result.source == "grounding verification failed"
+    # Retry call itself errored -- keeps the original (unretried) result,
+    # same fail-open posture as an unreachable judge, flagged rather than
+    # collapsed to Missing.
+    assert result.status == "Fail"
+    assert result.source == "schedule"
+    assert "wrong reading" in result.evidence
     assert "dates show compliance" in result.evidence
     assert usage["llm_call_count"] == 3  # original + judge + failed retry attempt
     assert usage["judged"] == 1
@@ -414,7 +564,8 @@ def test_evaluate_one_check_retry_call_fails_entirely():
 def test_evaluate_one_check_builds_verified_citation_from_matched_tag():
     check = _make_check(source_files=["sp"])
     original = EvaluationSchema(
-        status="Fail", evidence="SP section bars gas work in July.", source="SP 105.03",
+        considered_items=["Gas work"], breaching_items=["Gas work"],
+        evidence="SP section bars gas work in July.", source="SP 105.03",
         cited_chunk_ids=["sp-0"],
     )
     llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
@@ -439,7 +590,8 @@ def test_evaluate_one_check_builds_verified_citation_from_matched_tag():
 def test_evaluate_one_check_flags_unmatched_citation_tag():
     check = _make_check(source_files=["sp"])
     original = EvaluationSchema(
-        status="Fail", evidence="claims to quote SP text", source="SP 105.03",
+        considered_items=["Gas work"], breaching_items=["Gas work"],
+        evidence="claims to quote SP text", source="SP 105.03",
         cited_chunk_ids=["sp-99"],
     )
     llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
@@ -462,7 +614,7 @@ def test_evaluate_one_check_flags_unmatched_citation_tag():
 
 def test_evaluate_one_check_adds_automatic_keymap_and_estimate_citations():
     check = _make_check(source_files=["keymap", "estimate", "schedule"])
-    original = EvaluationSchema(status="Pass", evidence="utility crosses I-195", source="key map")
+    original = EvaluationSchema(evidence="utility crosses I-195", source="key map")
     llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
     judge = _FakeStructuredLLM([
         (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
@@ -478,12 +630,20 @@ def test_evaluate_one_check_adds_automatic_keymap_and_estimate_citations():
     assert all(c.page_pdf == 1 for c in result.citations)
 
 
-def test_evaluate_one_check_downgraded_missing_keeps_automatic_citations_only():
+def test_evaluate_one_check_grounding_unresolved_keeps_citations_from_final_answer():
+    """Double-failure keeps the retried answer (including its own
+    cited_chunk_ids) rather than discarding citations into a bare Missing
+    result -- the automatic keymap citation is still added on top, as for
+    any other result."""
     check = _make_check(source_files=["sp", "keymap"])
     original = EvaluationSchema(
-        status="Fail", evidence="wrong reading", source="schedule", cited_chunk_ids=["sp-0"],
+        considered_items=["Some SP text"], breaching_items=["Some SP text"],
+        evidence="wrong reading", source="schedule", cited_chunk_ids=["sp-0"],
     )
-    retried = EvaluationSchema(status="Fail", evidence="still wrong", source="schedule")
+    retried = EvaluationSchema(
+        considered_items=["Some SP text"], breaching_items=["Some SP text"],
+        evidence="still wrong", source="schedule", cited_chunk_ids=["sp-0"],
+    )
     llm = _FakeStructuredLLM([
         (original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}),
         (retried, {"input_tokens": 12, "output_tokens": 6, "input_token_details": {}}),
@@ -502,9 +662,10 @@ def test_evaluate_one_check_downgraded_missing_keeps_automatic_citations_only():
         check, llm, judge, sp_search_fn=sp_search_fn, keymap_facts="KEY MAP FACTS: ...",
     )
 
-    assert result.status == "Missing"
-    assert len(result.citations) == 1
-    assert result.citations[0].doc_type == "key_map"
+    assert result.status == "Fail"
+    assert "recommend human review" in result.evidence.lower()
+    doc_types = {c.doc_type for c in result.citations}
+    assert doc_types == {"special_provision", "key_map"}
 
 
 if __name__ == "__main__":
