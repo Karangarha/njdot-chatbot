@@ -192,6 +192,11 @@ def build_compliance_facts(graph: Neo4jGraph, project_id: str = "default") -> st
         "RETURN a.taskId AS id, a.name AS name LIMIT $limit",
         params={"pid": project_id, "limit": _MAX_FACT_ROWS},
     )
+    free_float_notes = graph.query(
+        "MATCH (a:Activity {projectId: $pid}) WHERE a.hasFreeFloatNote = true "
+        "RETURN a.taskId AS id, a.name AS name LIMIT $limit",
+        params={"pid": project_id, "limit": _MAX_FACT_ROWS},
+    )
     project_rows = graph.query(
         "MATCH (p:Project {projectId: $pid}) "
         "RETURN p.warnings AS warnings, p.projectFinish AS projectFinish, "
@@ -241,6 +246,16 @@ def build_compliance_facts(graph: Neo4jGraph, project_id: str = "default") -> st
         lines += [f"  - {r['id']} {r['name']}" for r in mismatches]
     else:
         lines.append("\nP6/CPM Cross-Check Mismatches: none — schedule is fully recalculated.")
+
+    if free_float_notes:
+        lines.append(
+            f"\nFree Float Notes ({len(free_float_notes)}) — informational only, "
+            f"does NOT indicate the schedule was not recalculated (total float "
+            f"and dates for these activities already agree with P6; only free "
+            f"float differs, often because a successor's own calendar has an "
+            f"extended non-working stretch such as an in-water-work season):"
+        )
+        lines += [f"  - {r['id']} {r['name']}" for r in free_float_notes]
 
     if warnings:
         lines.append("\nCPM Engine Warnings:")

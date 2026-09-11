@@ -576,14 +576,19 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "cpm_consistency", CAT_SCHEDULE_LOGIC,
         "P6 Stored Values Match Recomputed CPM (Schedule Recalculated)",
-        "Confirm the schedule was recalculated: stored dates and float "
-        "should match what the logic and calendars produce. Mismatches "
-        "usually mean the file was edited and not rescheduled, which makes "
-        "every other date-based finding unreliable. PASS on zero or "
-        "tolerance-only mismatches; FAIL beyond tolerance citing IDs; "
-        "WARNING if the section is absent - say stored values could not be "
-        "verified rather than implying failure. Look in: precomputed 'CPM "
-        "Validation' section.",
+        "Confirm the schedule was recalculated: stored dates and TOTAL "
+        "FLOAT should match what the logic and calendars produce. "
+        "Mismatches usually mean the file was edited and not rescheduled, "
+        "which makes every other date-based finding unreliable. Free float "
+        "deltas are reported separately under 'Free Float Notes' and are "
+        "informational only - free-float semantics are calendar-specific "
+        "enough that a delta there does NOT mean the schedule needs "
+        "recalculating; do not cite Free Float Notes activities as a FAIL "
+        "basis. PASS on zero or tolerance-only total-float/date mismatches; "
+        "FAIL beyond tolerance citing IDs; WARNING if the section is absent "
+        "- say stored values could not be verified rather than implying "
+        "failure. Look in: precomputed 'P6/CPM Cross-Check Mismatches' and "
+        "'Free Float Notes' sections.",
     ),
 
     # ── Completion Milestones (continued) ─────────────────────────────────────

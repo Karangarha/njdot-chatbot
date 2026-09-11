@@ -58,6 +58,10 @@ def seed_schedule(
     ensure_constraints(graph)
 
     mismatched_ids = {m.get("activity_id") for m in (crosscheck or {}).get("mismatches", [])}
+    # Free-float deltas are informational only (see crosscheck.py) -- kept
+    # separate from mismatched_ids so they never set hasMismatch/fail the
+    # cpm_consistency check, but still surfaced for the LLM to mention.
+    free_float_note_ids = {m.get("activity_id") for m in (crosscheck or {}).get("free_float_notes", [])}
     open_starts = set(getattr(cpm, "open_starts", []) or [])
     open_ends = set(getattr(cpm, "open_ends", []) or [])
 
@@ -141,6 +145,7 @@ def seed_schedule(
             "storedLateStart": act.get("late_start"),
             "storedLateFinish": act.get("late_finish"),
             "hasMismatch": aid in mismatched_ids,
+            "hasFreeFloatNote": aid in free_float_note_ids,
             "isOpenStart": aid in open_starts,
             "isOpenEnd": aid in open_ends,
             **computed,

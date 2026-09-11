@@ -472,7 +472,22 @@ def run_cpm(
 
         if status != "Complete":
             r.total_float = _bdist(cal, sb[n], lsb[n])
-            # Free float: slack before delaying any successor's early start
+            # Free float: slack before delaying any successor's early start.
+            # ponytail: this undercounts when a successor's OWN calendar has
+            # an extended non-working stretch between the predecessor's
+            # required-by date and the successor's actual start (e.g. an
+            # in-water-work seasonal moratorium) -- _bdist counts working
+            # days on the SUCCESSOR's calendar in that span, which can be
+            # ~0 even though the predecessor genuinely has months of slack
+            # (confirmed on Route 49: D1070 sits on a calendar with a ~2.5
+            # month in-water-work blackout, making every predecessor's free
+            # float compute to 0 regardless of true slack). total_float and
+            # dates are unaffected -- this is a free-float-only artifact.
+            # Not fixed here: P6's own free-float semantics on a multi-
+            # calendar project are implementation-specific enough that
+            # cross-checking it isn't a reliable signal either way (see
+            # cross_check(), which reports free-float deltas as
+            # informational rather than failing on them for this reason).
             slacks: List[int] = []
             for s in sub.successors(n):
                 c = edge_cand.get((n, s))
