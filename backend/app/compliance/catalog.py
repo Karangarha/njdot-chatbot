@@ -100,17 +100,22 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "work to with no activity in the schedule. Allow name variants (SJG / "
         "South Jersey Gas). FAIL only for SP-scoped utilities absent from the "
         "schedule. Look in: Key Sheet utility list; Special Provisions "
-        "105.07.01 and 105.07.02; schedule activity list.",
+        "105.07.01 and 105.07.02 (search: \"Advance Notice Requirements\", "
+        "\"Work to be Performed by Utility\"); schedule activity list. If the "
+        "retrieved Special Provision text does not contain 105.07.01 or "
+        "105.07.02, say so and state whether you believe the section is "
+        "absent from this contract or simply was not retrieved — these are "
+        "different findings.",
         source_files=["keymap", "sp", "schedule"],
     ),
     CheckDef(
         "schedule_duration", CAT_NONE,
         "Schedule Duration Under 3 Years (Exclude Weekends and Holidays)",
         "Measure Advertisement (M100) to Completion (M950) in CALENDAR days. "
-        "Under 1,095 days passes. Do not apply the 3-year test to a "
-        "business-day count. If over 3 years, a narrative justification "
-        "converts it to PASS. Look in: schedule milestones M100 and M950; "
-        "designer's narrative.",
+        "State the exact day count first. Under 1,095 days passes. Do not "
+        "apply the 3-year test to a business-day count. If over 3 years, a "
+        "narrative justification converts it to PASS. Look in: schedule "
+        "milestones M100 and M950; designer's narrative.",
         source_files=["schedule", "narrative"],
     ),
 
@@ -173,8 +178,12 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "dates - a narrative saying all ROW is acquired before Construction "
         "Start, while parcels become available later, is a contradiction "
         "worth reporting. If the Special Provisions were not supplied, say "
-        "'SP 108.12 not supplied.' Look in: Special Provisions 108.12; "
-        "narrative ROW Requirements section; schedule activity dates.",
+        "'SP 108.12 not supplied.' Look in: Special Provisions 108.12 "
+        "RIGHT-OF-WAY RESTRICTIONS (search: \"has not obtained the following "
+        "ROW parcels\", \"anticipated availability dates\"); narrative ROW "
+        "Requirements section; schedule activity dates. If the retrieved "
+        "text does not contain 108.12, say so and state whether you believe "
+        "it is absent from this contract or simply was not retrieved.",
         source_files=["narrative", "schedule", "sp"],
     ),
 
@@ -188,11 +197,18 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "30 and Oct 1 - Nov 30; tree clearing barred Apr 1 - Aug 30. These "
         "windows recur every year the project spans - test cofferdam, "
         "in-water and clearing activities against every occurrence, not "
-        "just the first. A dedicated calendar whose non-working ranges "
-        "match the permit is the strongest evidence of compliance. Look "
-        "in: narrative Permit "
-        "Requirements section; schedule activity dates and calendar "
-        "assignments; Special Provisions.",
+        "just the first. Calendar exception ranges are not currently "
+        "included in the schedule evidence you receive - do not claim to "
+        "have checked them; rely on activity dates only. This contract's "
+        "Special Provisions may contain no dedicated environmental permit "
+        "section - permit conditions normally appear in the designer's "
+        "narrative instead. The closest related section, if present, is "
+        "158 SOIL EROSION AND SEDIMENT CONTROL AND WATER QUALITY, not a "
+        "permit section by that name. If no SP permit text is retrieved, "
+        "say so explicitly and evaluate from the narrative and schedule "
+        "alone rather than treating the absence as a gap in retrieval. "
+        "Look in: narrative Permit Requirements section; schedule activity "
+        "dates; Special Provisions 158.",
         source_files=["sp", "narrative", "schedule"],
     ),
 
@@ -217,57 +233,74 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "gas_interruption", CAT_ENV_LANDSCAPE_UTILITIES,
         "No Gas Service Interruptions Oct 1 to Apr 1",
         "Restricted window: Oct 1 - Apr 1, recurring every year the project "
-        "spans - check every occurrence, not just the first. Search activity names for: gas, "
-        "gas main, gas line, gas valve, gas service, and named gas "
-        "utilities. Never conclude 'no gas activity' without listing the "
-        "terms you searched. Nothing found -> PASS. Installation, tie-in, "
+        "spans - check every occurrence, not just the first. Search activity "
+        "names for: gas, gas main, gas line, gas valve, gas service, and "
+        "named gas utilities. List every activity your search terms "
+        "matched, including notice/submittal activities, before concluding. "
+        "If the list of physical gas work is empty, PASS, showing the full "
+        "list you found (even if only notices). Installation, tie-in, "
         "connection, abandonment and valve work can interrupt service; "
         "notices and submittals cannot. WARNING if such work falls in the "
         "window; check the SP utility notes first - 'facilities remain in "
         "service at all times' is mitigation, quote it. Look in: schedule "
-        "activity list; Special Provisions 105.07.02 gas utility section.",
+        "activity list; Special Provisions 105.07.02 (search: \"gas main\", "
+        "\"advance notice prior to the start of gas work\", \"remain in "
+        "service at all times\"). If the retrieved SP text does not contain "
+        "105.07.02, say so and state whether you believe it is absent from "
+        "this contract or simply was not retrieved.",
         source_files=["narrative", "schedule", "sp"],
     ),
     CheckDef(
         "water_interruption", CAT_ENV_LANDSCAPE_UTILITIES,
         "No Water Service Interruptions Apr 1 to Sep 30",
         "Restricted window: Apr 1 - Sep 30, recurring every year the project "
-        "spans - check every occurrence, not just the first. Search for: water, water main, "
-        "water service, water valve, hydrant, named water owners. Nothing "
-        "found -> PASS, naming the terms searched. A live TIE-IN OR "
-        "CONNECTION TO AN EXISTING MAIN IS a service interruption - do not "
-        "dismiss it as 'just a construction activity.' Installing new pipe "
-        "not yet in service is not. WARNING if an interruption activity "
-        "falls in the window. Look in: schedule activity list; Special "
-        "Provisions 105.07.02 water/sewer section; Standard Specifications "
-        "651.",
+        "spans - check every occurrence, not just the first. Search activity "
+        "names for: water, water main, water service, water valve, hydrant, "
+        "named water owners. List every matching activity before "
+        "concluding. If the list of physical water work is empty, PASS, "
+        "showing the full list you found. A live TIE-IN OR CONNECTION TO AN "
+        "EXISTING MAIN IS a service interruption - do not dismiss it as "
+        "'just a construction activity.' Installing new pipe not yet in "
+        "service is not. WARNING if an interruption activity falls in the "
+        "window. Look in: schedule activity list; Special Provisions "
+        "105.07.02 and 651.03.01.A (search: \"Scheduling of Work and "
+        "Interruption to Water Service\", \"tie-in to existing main\"); "
+        "Standard Specifications 651. If the retrieved SP text does not "
+        "contain 105.07.02 or 651.03.01.A, say so.",
         source_files=["narrative", "schedule", "sp", "spec"],
     ),
     CheckDef(
         "electric_interruption", CAT_ENV_LANDSCAPE_UTILITIES,
         "No Electric Service Interruptions Jun 1 to Sep 30",
         "Restricted window: Jun 1 - Sep 30, recurring every year the project "
-        "spans - check every occurrence, not just the first. Search for: electric, power, "
-        "service, meter, lighting, signal, ITS, conduit, junction box, named "
-        "electric owners. Nothing found -> PASS, naming terms. Service "
-        "cut-over, meter changeover, de-energizing and resetting a live "
-        "signal can interrupt; installing unenergized conduit or boxes "
-        "cannot. Watch for installation activities with a live operation "
-        "buried in the name (e.g. '...and Reset Traffic Light'). Look in: "
-        "schedule activity list; Special Provisions 105.07.02 electric "
-        "section.",
+        "spans - check every occurrence, not just the first. Search activity "
+        "names for: electric, power, service, meter, lighting, signal, ITS, "
+        "conduit, junction box, named electric owners. List every matching "
+        "activity before concluding; if the list of live-service work is "
+        "empty, PASS, showing the full list you found. Service cut-over, "
+        "meter changeover, de-energizing and resetting a live signal can "
+        "interrupt; installing unenergized conduit or boxes cannot. Watch "
+        "for installation activities with a live operation buried in the "
+        "name (e.g. '...and Reset Traffic Light'). Look in: schedule "
+        "activity list; Special Provisions 105.07.02 (search: \"electric "
+        "service inquiry\", \"meter cabinet\"). If the retrieved SP text "
+        "does not contain 105.07.02, say so.",
         source_files=["narrative", "schedule", "sp"],
     ),
     CheckDef(
         "utility_work_hours", CAT_ENV_LANDSCAPE_UTILITIES,
         "Utility Relocation Work Accounts for No Night/Weekend Work",
-        "Utility owners work daytime weekday hours. Check utility activities "
-        "sit on ordinary weekday calendars with durations that do not assume "
-        "nights or weekends. Then check the SP for work that REQUIRES "
-        "off-hours - telecom fiber splicing during overnight windows is the "
-        "common one. If the SP mandates off-hours utility work the schedule "
-        "omits, that is a FAIL. Look in: schedule calendars and utility "
-        "activity durations; Special Provisions 105.07.02.",
+        "Utility owners work daytime weekday hours. Check utility activity "
+        "durations do not assume nights or weekends. Then check the SP for "
+        "work that REQUIRES off-hours - telecom fiber splicing during "
+        "overnight windows is the common one. If the SP mandates off-hours "
+        "utility work the schedule omits, that is a FAIL. Look in: schedule "
+        "activity durations (calendar assignment is not in the evidence you "
+        "receive - infer off-hours only from named night/weekend activities "
+        "or an explicit SP mandate); Special Provisions 105.07.02 (search: "
+        "\"day shift, night shift, or on weekends\", \"safe-time\", "
+        "\"advance notice for nighttime work\"). If the retrieved SP text "
+        "does not contain 105.07.02, say so.",
         source_files=["narrative", "schedule", "sp"],
     ),
     CheckDef(
@@ -279,7 +312,10 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "name what you checked. If a railroad is involved, verify flagging "
         "lead time, track windows and coordination appear in both schedule "
         "and SP. Look in: Key Sheet utility list; Special Provisions 105.07; "
-        "schedule activity names.",
+        "schedule activity names. If the retrieved SP text does not contain "
+        "a railroad-specific subsection under 105.07, say so and state "
+        "whether you believe none exists in this contract or it simply was "
+        "not retrieved.",
         source_files=["keymap", "narrative", "schedule", "sp"],
     ),
 
@@ -419,17 +455,21 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Working Drawing Review Durations (30/45 Days)",
         "Certified submittals get 30 days review; Approved get 45. Category "
         "is set by Table 105.05-1 - but the Special Provisions often "
-        "REPLACE that table ('TABLE 105.05-1 IS CHANGED TO'); the "
-        "replacement governs. Read the table carefully: two columns of "
-        "unequal length, and the tail rows of the longer one are easily "
-        "misread as the other. For each submittal give: label in schedule, "
-        "column in the governing table, scheduled duration, required "
-        "duration, match? FAIL on each mismatch. Do not explain a long "
-        "duration away as material lead time unless a document says so - "
-        "check the narrative's special materials section first. Look in: "
-        "Special Provisions Table 105.05-1; Standard Specifications 105.05; "
-        "schedule submittal (PS-series) activities; narrative Lead Time "
-        "section.",
+        "REPLACE that table (search for the literal heading \"TABLE "
+        "105.05-1 IS CHANGED TO\" and the column header \"Working Drawing "
+        "Submission Category\"); the replacement governs. Read the table "
+        "carefully: two columns of unequal length, and the tail rows of the "
+        "longer one are easily misread as the other. For each submittal "
+        "give: label in schedule, column in the governing table, scheduled "
+        "duration, required duration, match? FAIL on each mismatch. Do not "
+        "explain a long duration away as material lead time unless a "
+        "document says so - check the narrative's special materials "
+        "section first. If the retrieved SP text does not contain a Table "
+        "105.05-1 replacement, say so explicitly before falling back to the "
+        "base spec table - falling back silently is how a superseded table "
+        "gets applied by mistake. Look in: Special Provisions Table "
+        "105.05-1; Standard Specifications 105.05; schedule submittal "
+        "(PS-series) activities; narrative Lead Time section.",
         source_files=["narrative", "schedule", "sp", "spec"],
         sp_top_k=12,
     ),
@@ -443,8 +483,11 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "steel signal pole work' and name what you checked. If new poles "
         "exist, verify at least 4 months between fabrication and "
         "installation. Look in: schedule activity and submittal list; "
-        "Special Provisions; Construction Scheduling Manual Table A; "
-        "traffic signal plans if available.",
+        "Special Provisions SECTION 702 - TRAFFIC SIGNALS and SECTION 703 - "
+        "HIGHWAY LIGHTING; Construction Scheduling Manual Table A; traffic "
+        "signal plans if available. If no SP text relevant to pole lead "
+        "times was retrieved, say so rather than treating silence as "
+        "confirmation there is no requirement.",
         source_files=["schedule", "narrative", "sp", "csm"],
     ),
     CheckDef(
@@ -456,8 +499,12 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "what you checked. If present, verify at least 2 months between "
         "submittal or fabrication and installation. Report installation "
         "activities that have no procurement time before them. Look in: "
-        "schedule activity and submittal list; Special Provisions; "
-        "Construction Scheduling Manual Table A.",
+        "schedule activity and submittal list; Special Provisions SECTION "
+        "703 - HIGHWAY LIGHTING, particularly 703.03.07 Temporary Highway "
+        "Lighting System (search: \"Lighting mast arms and standards\"); "
+        "Construction Scheduling Manual Table A. If no SP text relevant to "
+        "pole lead times was retrieved, say so rather than treating silence "
+        "as confirmation there is no requirement.",
         source_files=["schedule", "narrative", "sp", "csm"],
     ),
     CheckDef(
@@ -470,7 +517,12 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "verify at least 4 months before installation, and that "
         "installation leaves time for testing before Substantial "
         "Completion. Look in: schedule activity and submittal list; Special "
-        "Provisions; Construction Scheduling Manual Table A.",
+        "Provisions 702.03.01 Controller (search: \"Submit catalog cuts for "
+        "the time synchronized GPS unit to the RE for approval before "
+        "installation\"); Construction Scheduling Manual Table A. If no SP "
+        "text relevant to controller lead times was retrieved, say so "
+        "rather than treating silence as confirmation there is no "
+        "requirement.",
         source_files=["schedule", "narrative", "sp", "csm"],
     ),
 
@@ -622,7 +674,8 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "available. Scrutinise any claim that all ROW is acquired before "
         "construction start - check it against the parcel dates in the "
         "Special Provisions. Look in: narrative, Right-of-Way Requirements "
-        "section; Special Provisions 108.12.",
+        "section; Special Provisions 108.12. If the retrieved SP text does "
+        "not contain 108.12, say so.",
         source_files=["narrative", "sp"],
     ),
     CheckDef(
@@ -706,8 +759,18 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "special events, municipal or county ordinances. A narrative that "
         "considers these and states none apply passes. But check whether "
         "the project's conditions imply one - a bridge over a navigable "
-        "waterway suggests marine considerations. Look in: narrative; "
-        "Traffic Control Plans; Special Provisions.",
+        "waterway suggests marine considerations. Also check the Special "
+        "Provisions for an enforceable closure schedule - 108.08 OCCUPANCY "
+        "CHARGES (search: \"The closure schedule shown in the plans "
+        "indicates the time periods for allowable closures\", \"Overrun of "
+        "'Alternating Traffic Pattern/Traffic Shift' Time Limits\") and "
+        "SECTION 159 - TRAFFIC CONTROL are work-hour restrictions in their "
+        "own right even when framed as a cost provision, and 108.06 can "
+        "carry a night-operations lighting requirement. A closure schedule "
+        "with a per-minute occupancy charge that the narrative never "
+        "mentions is a FAIL, not a pass by omission - the narrative's "
+        "silence is itself the finding. Look in: narrative; Traffic Control "
+        "Plans; Special Provisions 108.08, 108.06, Section 159.",
         source_files=["narrative", "schedule", "sp"],
     ),
     CheckDef(
@@ -728,15 +791,22 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Night Work Explained in the Narrative",
         "Night work can be REQUIRED by contract even when the schedule "
         "shows none. First check the SP for mandated night work - telecom "
-        "fiber splicing during overnight windows is the common case. Then "
-        "check the schedule for night-shift calendars, activities named "
-        "night or overnight, and night-related submittals (a Night "
-        "Lighting Plan means night operations were contemplated). FAIL if "
-        "the SP requires night work the narrative does not explain or the "
-        "schedule cannot perform. Do not pass on 'no night work scheduled' "
-        "without addressing whether any is required. Look in: Special "
-        "Provisions 105.07.02 utility sections; schedule calendars and "
-        "submittals; designer's narrative.",
+        "fiber splicing during overnight windows is the common case, "
+        "typically under 105.07.02 (search: \"day shift, night shift, or "
+        "on weekends\", \"safe-time\", \"advance notice for nighttime "
+        "work\"). Then check the schedule for activities named night or "
+        "overnight, and night-related submittals (a Night Lighting Plan "
+        "means night operations were contemplated) - calendar assignment "
+        "is not in the evidence you receive, so do not claim to have "
+        "checked it. FAIL if the SP requires night work the narrative does "
+        "not explain or the schedule cannot perform. Do not pass on 'no "
+        "night work scheduled' without addressing whether any is required. "
+        "An SP mandate, if found, is Special Provisions text - attribute it "
+        "to \"Special Provisions 105.07.02\", never to the narrative, even "
+        "if the narrative is silent on the topic; silence in the narrative "
+        "is itself a finding, not a reason to relocate the SP's own "
+        "language into it. Look in: Special Provisions 105.07.02 utility "
+        "sections; schedule submittals; designer's narrative.",
         source_files=["narrative", "schedule", "sp"],
     ),
 
@@ -751,7 +821,20 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "disagreement with both values - a single mismatched milestone "
         "date is a finding even when the sequence is right. No staging "
         "plan -> the narrative must outline the assumed order of work. "
-        "Look in: Traffic Control Plans; narrative Critical Milestones "
+        "Separately and always: search the Special Provisions for "
+        "\"TEMPORARY HIGHWAY LIGHTING SYSTEM (STAGE\" pay items and for "
+        "\"Pre-Stage\", \"Post-Stage\", \"during Stage 1\", \"during Stage "
+        "2\", and section 703 - list every stage a temporary lighting item "
+        "is required for, then check the schedule for a matching lighting "
+        "activity in each of those stages. A required stage with no "
+        "matching activity is a FAIL, cited separately from any "
+        "staging-sequence finding. Also search for reset/work-verification "
+        "notes (e.g. \"WV #\" item numbers) tied to a specific stage and "
+        "confirm a matching activity exists in that stage. If the "
+        "retrieved SP text does not contain 703 or a lighting pay-item "
+        "list, say so rather than concluding no lighting requirement "
+        "exists. Look in: Traffic Control Plans; Special Provisions 703 "
+        "and any Traffic Control Stage notes; narrative Critical Milestones "
         "section; schedule milestones and stage WBS.",
         source_files=["sp", "narrative", "schedule"],
         sp_top_k=12,
@@ -765,8 +848,9 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "provision, and the project is not on a shore route, PASS - naming "
         "what you searched and where the project is. That is a "
         "determination, not a gap. WARNING only if the SP was not supplied "
-        "at all. Look in: Special Provisions (search: summer, seasonal, "
-        "shutdown, moratorium); Key Sheet route and location.",
+        "at all. Look in: Special Provisions (search: \"summer\", "
+        "\"seasonal restriction\", \"shutdown\", \"moratorium\", \"shore\"); "
+        "Key Sheet route and location.",
         source_files=["sp", "keymap"],
     ),
     CheckDef(
@@ -779,8 +863,14 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Absence is only a finding where the scope includes the item. If "
         "you were not given the schedule activity list, say so - do not "
         "report the items missing when what is missing is the schedule. "
-        "Look in: schedule activity list; Special Provisions; estimate "
-        "items; plan sheet index.",
+        "The Special Provisions' pay-item list is usually under headings "
+        "like \"MEASUREMENT AND PAYMENT\" and an \"Item / Pay Unit\" table - "
+        "search those rather than assuming scope from item names alone. "
+        "Name which parts of the Special Provisions you actually searched - "
+        "a generic \"Special Provisions\" evidence block may not cover "
+        "every relevant section; say so if coverage looks partial. Look "
+        "in: schedule activity list; Special Provisions; estimate items; "
+        "plan sheet index.",
         source_files=["sp", "schedule", "estimate"],
     ),
     CheckDef(
@@ -793,8 +883,9 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "only completion dates. If you read 108.10 and it holds only "
         "Substantial Completion and Completion dates, PASS - quoting what "
         "it says. That is a determination. WARNING only if 108.10 was not "
-        "supplied. Look in: Special Provisions 108.10; schedule milestones "
-        "and activity dates.",
+        "supplied. Look in: Special Provisions 108.10 CONTRACT TIME "
+        "(search: \"Substantial Completion on or before\"); schedule "
+        "milestones and activity dates.",
         source_files=["sp", "schedule"],
     ),
     CheckDef(
@@ -807,8 +898,11 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "stating you read 105.06 and it names no adjacent work. That is a "
         "determination, not a gap. Where adjacent work IS named, check the "
         "schedule accounts for it. WARNING only if the SP was not supplied. "
-        "Look in: Special Provisions 105.06; Standard Specifications "
-        "105.06; schedule.",
+        "Look in: Special Provisions 105.06 (search: \"Cooperation with "
+        "Others\"); Standard Specifications 105.06; schedule. If retrieval "
+        "returns no 105.06 text at all (not even the base form), say so "
+        "distinctly from '105.06 exists and adds nothing' - those are "
+        "different findings.",
         source_files=["schedule", "sp", "spec"],
     ),
 
@@ -827,7 +921,9 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "testing or acceptance activity sits between the last installation "
         "and Substantial Completion. Report its absence as a finding of "
         "its own. Look in: schedule electrical and ITS activities; Special "
-        "Provisions 701 and 704; Standard Specifications Section 704.",
+        "Provisions 701.03.15 and 704 (search: \"interim acceptance\", "
+        "\"verification testing\", \"burn-in\"); Standard Specifications "
+        "Section 704.",
         source_files=["narrative", "schedule", "sp", "spec"],
     ),
 ]
