@@ -422,7 +422,7 @@ def test_evaluate_one_check_builds_verified_citation_from_matched_tag():
         (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
     ])
 
-    def sp_search_fn(query):
+    def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Gas work is prohibited in July.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7),
         }
@@ -447,7 +447,7 @@ def test_evaluate_one_check_flags_unmatched_citation_tag():
         (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
     ])
 
-    def sp_search_fn(query):
+    def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Gas work is prohibited in July.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7),
         }
@@ -493,7 +493,7 @@ def test_evaluate_one_check_downgraded_missing_keeps_automatic_citations_only():
         (GroundingJudgment(grounded=False, reason="still contradicts dates"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
     ])
 
-    def sp_search_fn(query):
+    def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Some SP text.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=1),
         }
