@@ -59,6 +59,7 @@ from app.compliance.cost import CostGapResult, evaluate_cost_gap
 from app.compliance.edq import EdqCoverageResult, evaluate_edq_coverage, match_edq_items_to_activities
 from app.compliance.eval_engine import CitedSearch, EvidenceCandidate, evaluate_checks
 from app.compliance.geo import RegionResult, resolve_region
+from app.compliance.schedule_logic import ScheduleLogicResult, evaluate_schedule_logic
 from app.config import config
 from app.database import get_db
 from app.graph_neo4j.seed import (
@@ -960,6 +961,11 @@ def _run_review_pipeline(
     # it reflects the current graph state.
     edq_coverage: Optional[EdqCoverageResult] = evaluate_edq_coverage(graph, project_id)
 
+    # Schedule-logic checks (negative float / lag / open ends / mandatory
+    # constraints) read the schedule graph, which is always seeded -- unlike
+    # geo/cost_gap/edq_coverage there's no optional-upload gate here.
+    schedule_logic: Dict[str, ScheduleLogicResult] = evaluate_schedule_logic(graph, project_id)
+
     # ── Evaluate the checklist ───────────────────────────────────────────────────
     # Static reference collections — independent of reseed/fast-path above,
     # since they're ingested once system-wide, not per review.
@@ -977,7 +983,7 @@ def _run_review_pipeline(
             sp_search_fn=sp_search_fn, spec_search_fn=spec_search_fn, csm_search_fn=csm_search_fn,
             keymap_facts=keymap_facts, keymap_geo=keymap_geo,
             estimate_facts=estimate_facts, cost_gap=cost_gap,
-            edq_coverage=edq_coverage,
+            edq_coverage=edq_coverage, schedule_logic=schedule_logic,
             utility_plan_search_fn=utility_plan_search_fn,
             project_id=project_id, user_id=user_id,
             on_progress=lambda done, total: _set_review_progress(

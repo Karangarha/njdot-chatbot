@@ -470,49 +470,40 @@ BUILTIN_CHECKS: List[CheckDef] = [
     CheckDef(
         "no_negative_float", CAT_SCHEDULE_LOGIC,
         "No Negative Float Present",
-        "Negative float means the schedule cannot meet its own completion "
-        "date on the logic as built. PASS if none; FAIL citing each "
-        "activity with its float value. Report the zero-float count as "
-        "context but do not fail on it - zero float is normal. Look in: "
-        "precomputed 'Activities with Negative Float' section.",
+        "Deterministic: computed from each activity's recomputed total "
+        "float in the schedule graph — no AI judgement involved. FAIL lists "
+        "every activity with negative float.",
+        check_type="schedule_logic",
     ),
     CheckDef(
         "no_lag", CAT_SCHEDULE_LOGIC,
         "No Lag Present",
-        "Lag is not permitted on Finish-to-Start relationships - the fix is "
-        "always to add a real activity representing the lag time. Negative "
-        "lag is barred on any relationship type. FAIL citing predecessor, "
-        "successor and lag value for each. Report relationship types where "
-        "available: a lag on Start-to-Start or Finish-to-Finish is treated "
-        "differently. If types are not given, say so and treat lags as "
-        "Finish-to-Start. Look in: precomputed relationship lag section; "
-        "Construction Scheduling Manual Section 3.0.",
-        source_files=["schedule", "csm"],
+        "Deterministic: computed from every relationship's type and lag in "
+        "the schedule graph — no AI judgement involved. FAIL lists any "
+        "Finish-to-Start relationship with lag, and any relationship of any "
+        "type with negative lag, per Construction Scheduling Manual "
+        "Section 3.0.",
+        check_type="schedule_logic",
     ),
     CheckDef(
         "no_open_ends", CAT_SCHEDULE_LOGIC,
         "No Open Ends Present",
-        "Every activity needs a predecessor and successor EXCEPT the "
-        "project's start and finish milestones - the manual exempts them by "
-        "name. Do NOT report M100 Advertise Date or M950 Completion; "
-        "citing them buries the real findings. Open start = no FS and no SS "
-        "predecessor. Open finish = no FS and no FF successor. An activity "
-        "whose only predecessor is Finish-to-Finish has an open start. FAIL "
-        "citing non-exempt open ends only. Look in: precomputed open-ends "
-        "section; Construction Scheduling Manual Section 3.0.",
-        source_files=["schedule", "csm"],
+        "Deterministic: computed from each activity's incoming/outgoing "
+        "relationship types in the schedule graph — no AI judgement "
+        "involved. Open start = no Finish-to-Start or Start-to-Start "
+        "predecessor; open finish = no Finish-to-Start or Finish-to-Finish "
+        "successor. The project's own start/finish milestones (M100, M950) "
+        "are exempt per Construction Scheduling Manual Section 3.0.",
+        check_type="schedule_logic",
     ),
     CheckDef(
         "no_mandatory_constraints", CAT_SCHEDULE_LOGIC,
         "No Mandatory Constraints Applied",
-        "Mandatory Start and Mandatory Finish override schedule logic and "
-        "are prohibited. PASS if none; FAIL citing each with its type and "
-        "date. Note as context only, without changing the status, whether "
-        "the completion milestone carries a Late Finish constraint - the "
-        "manual requires one, and a schedule with no constraints at all is "
-        "missing it. Look in: 'Activities with Mandatory Constraints' "
-        "section; Construction Scheduling Manual Section 3.0.",
-        source_files=["schedule", "csm"],
+        "Deterministic: computed from each activity's constraint type in "
+        "the schedule graph — no AI judgement involved. FAIL lists every "
+        "activity with a Mandatory Start or Mandatory Finish constraint, "
+        "per Construction Scheduling Manual Section 3.0.",
+        check_type="schedule_logic",
     ),
     CheckDef(
         "cpm_consistency", CAT_SCHEDULE_LOGIC,

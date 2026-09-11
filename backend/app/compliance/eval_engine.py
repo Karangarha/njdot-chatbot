@@ -31,8 +31,10 @@ Checks whose ``check_type`` appears in ``_DETERMINISTIC_EVALUATORS``
 short-circuit the LLM entirely and are computed in Python: ``"geo"``
 (north/south of I-195 from key map coordinates, ``app.compliance.geo``),
 ``"cost_gap"`` (Substantial-to-Final day gap from the Engineer's Estimate,
-``app.compliance.cost``), and ``"edq_coverage"`` (EDQ line item -> schedule
-activity graph coverage, ``app.compliance.edq``).
+``app.compliance.cost``), ``"edq_coverage"`` (EDQ line item -> schedule
+activity graph coverage, ``app.compliance.edq``), and ``"schedule_logic"``
+(CSM Section 3.0 negative float / lag / open ends / mandatory constraints,
+``app.compliance.schedule_logic``).
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from app.compliance.catalog import CheckDef
 from app.compliance.cost import CostGapResult
 from app.compliance.edq import EdqCoverageResult
 from app.compliance.geo import RegionResult
+from app.compliance.schedule_logic import ScheduleLogicResult
 from app.config import config
 from app.models import EvaluationSchema, GroundingJudgment, ReviewCheckResult, ReviewCitation
 from app.observability import get_langfuse_client, get_langfuse_handler, new_trace_id
@@ -374,6 +377,21 @@ def _evaluate_edq_coverage_check(check: CheckDef, ctx: "_DeterministicContext") 
     )
 
 
+def _evaluate_schedule_logic_check(check: CheckDef, ctx: "_DeterministicContext") -> ReviewCheckResult:
+    """Deterministic CSM Section 3.0 schedule-logic check — dispatches by
+    ``check.check_key`` into the precomputed ``schedule_logic`` dict (one
+    entry per check_key, see ``app.compliance.schedule_logic``), no LLM
+    call. ``schedule_logic is None`` only if the graph read never ran
+    (shouldn't happen — schedule is always available), reported as Missing
+    rather than silently defaulting to Pass."""
+    results = ctx.schedule_logic
+    if results is None or check.check_key not in results:
+        return _result(check, "Missing", "Schedule-logic facts were not computed for this review.", "schedule")
+    r: ScheduleLogicResult = results[check.check_key]
+    status = "Fail" if r.violations else "Pass"
+    return _result(check, status, r.detail, "schedule graph (deterministic CSM Section 3.0 computation)")
+
+
 @dataclass
 class _DeterministicContext:
     """Precomputed inputs for the non-LLM check types. Grouping them keeps
@@ -382,6 +400,7 @@ class _DeterministicContext:
     keymap_geo: Optional[RegionResult] = None
     cost_gap: Optional[CostGapResult] = None
     edq_coverage: Optional[EdqCoverageResult] = None
+    schedule_logic: Optional[Dict[str, ScheduleLogicResult]] = None
 
 
 # check_type -> evaluator. A check_type absent from this registry takes the
@@ -390,6 +409,7 @@ _DETERMINISTIC_EVALUATORS: Dict[str, Callable[[CheckDef, _DeterministicContext],
     "geo": _evaluate_geo_check,
     "cost_gap": _evaluate_cost_gap_check,
     "edq_coverage": _evaluate_edq_coverage_check,
+    "schedule_logic": _evaluate_schedule_logic_check,
 }
 
 
@@ -695,6 +715,7 @@ def evaluate_checks(
     estimate_facts: Optional[str] = None,
     cost_gap: Optional[CostGapResult] = None,
     edq_coverage: Optional[EdqCoverageResult] = None,
+    schedule_logic: Optional[Dict[str, ScheduleLogicResult]] = None,
     utility_plan_search_fn: Optional[Callable[[str], str]] = None,
     project_id: str = "default",
     user_id: Optional[str] = None,
@@ -742,6 +763,7 @@ def evaluate_checks(
     structured_judge_llm = llm.with_structured_output(GroundingJudgment, include_raw=True)
     deterministic_ctx = _DeterministicContext(
         keymap_geo=keymap_geo, cost_gap=cost_gap, edq_coverage=edq_coverage,
+        schedule_logic=schedule_logic,
     )
     total_input_tokens = 0
     total_output_tokens = 0

@@ -290,6 +290,7 @@ def test_run_review_pipeline_rerun_reports_single_fast_path_message():
          patch("app.api.review._read_estimate_extraction_from_supabase", return_value=None), \
          patch("app.api.review._seed_edq_items_if_needed"), \
          patch("app.api.review.evaluate_edq_coverage", return_value=None), \
+         patch("app.api.review.evaluate_schedule_logic", return_value={}), \
          patch("app.api.review._build_static_doc_search_fn", return_value=None), \
          patch("app.api.review.evaluate_checks", return_value=[]), \
          patch("app.api.review._set_review_progress") as mock_progress:
