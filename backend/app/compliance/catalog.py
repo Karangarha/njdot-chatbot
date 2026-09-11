@@ -98,15 +98,22 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "work here. A key-map utility missing from the Special Provisions is "
         "NOT a failure. The failure is the reverse: a utility the SP assigns "
         "work to with no activity in the schedule. Allow name variants (SJG / "
-        "South Jersey Gas). FAIL only for SP-scoped utilities absent from the "
-        "schedule. Look in: Key Sheet utility list; Special Provisions "
-        "105.07.01 and 105.07.02 (search: \"Advance Notice Requirements\", "
-        "\"Work to be Performed by Utility\"); schedule activity list. If the "
-        "retrieved Special Provision text does not contain 105.07.01 or "
-        "105.07.02, say so and state whether you believe the section is "
-        "absent from this contract or simply was not retrieved — these are "
-        "different findings.",
+        "South Jersey Gas; ACE / Atlantic City Electric). A short subsection "
+        "wedged between two longer utility sections is easy to miss - check "
+        "each key-map utility individually rather than concluding from the "
+        "surrounding text alone. FAIL only for SP-scoped utilities absent "
+        "from the schedule. Look in: Key Sheet utility list; Special "
+        "Provisions 105.07.01, 105.07.02 (search: \"Advance Notice "
+        "Requirements\", \"Work to be Performed by Utility\", \"Atlantic "
+        "City Electric\", \"ACE work will be completed under the "
+        "Department's construction permit\", \"electric service inquiry\"); "
+        "schedule activity list, including advance-notice (\"U###\") "
+        "activities. If the retrieved Special Provision text does not "
+        "contain 105.07.01 or 105.07.02, say so and state whether you "
+        "believe the section is absent from this contract or simply was "
+        "not retrieved — these are different findings.",
         source_files=["keymap", "sp", "schedule"],
+        sp_top_k=12,
     ),
     CheckDef(
         "schedule_duration", CAT_NONE,
@@ -158,11 +165,12 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "Deterministic: computed from the Award (M300) and Construction "
         "Start (M500) milestone dates using the Award milestone's own "
         "calendar (holiday-aware) — no AI judgement involved. Project type "
-        "is a Federal Project Number lookup (key map or DBE Goal Memo) "
-        "falling back to an EDQ item-mix classification for Pavement "
-        "Preservation, defaulting to State otherwise; conflicting Federal "
-        "Project Numbers between the two sources report Missing rather than "
-        "guess. FAIL states the actual business-day count against the "
+        "is classified on PRESENCE of a Federal Project Number (key map or "
+        "DBE Goal Memo, either source counts), falling back to an EDQ "
+        "item-mix classification for Pavement Preservation, defaulting to "
+        "State otherwise. The two sources disagreeing on the number's exact "
+        "value is a separate document-consistency finding, noted but not "
+        "blocking. FAIL states the actual business-day count against the "
         "type's minimum (55 Federal / 40 State / 25 Pavement Preservation).",
         check_type="date_rule",
         source_files=["schedule", "keymap", "estimate"],

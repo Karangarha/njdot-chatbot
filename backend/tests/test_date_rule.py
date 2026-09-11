@@ -27,12 +27,14 @@ from app.compliance.date_rule import (  # noqa: E402
 
 
 class _FakeGraph:
-    """Milestones keyed by taskId; calendars keyed by calendarId; EDQ items
-    as a flat list (only used by the award_to_construction classifier)."""
+    """Milestones keyed by taskId; a single ``business_days_calendar`` row
+    stands in for the project's named business-day Calendar node (matched
+    by name, not by id -- see _get_business_days_calendar); EDQ items as a
+    flat list (only used by the award_to_construction classifier)."""
 
-    def __init__(self, milestones=None, calendars=None, edq_items=None):
+    def __init__(self, milestones=None, business_days_calendar=None, edq_items=None):
         self.milestones = milestones or {}
-        self.calendars = calendars or {}
+        self.business_days_calendar = business_days_calendar
         self.edq_items = edq_items or []
 
     def query(self, cypher, params=None):
@@ -40,14 +42,16 @@ class _FakeGraph:
             m = self.milestones.get(params["tid"])
             return [m] if m else []
         if "MATCH (c:Calendar" in cypher:
-            c = self.calendars.get(params["cid"])
-            return [c] if c else []
+            return [self.business_days_calendar] if self.business_days_calendar else []
         if "MATCH (e:EdqItem" in cypher:
             return [{"itemDescription": d} for d in self.edq_items]
         return []
 
 
-def _milestone(task_id, iso_date, calendar_id="827"):
+def _milestone(task_id, iso_date, calendar_id="830"):
+    # Default to the "wrong" 7-day-calendar id on purpose, matching the real
+    # Route 49 data -- business-day-gap checks must not use this field at
+    # all now, only _get_business_days_calendar (matched by name).
     return {"id": task_id, "date": iso_date, "calendarId": calendar_id}
 
 
@@ -87,7 +91,7 @@ def test_ad_to_bid_gap_uses_calendar_exceptions():
             "M100": _milestone("M100", "2024-09-05"),
             "M200": _milestone("M200", "2024-09-26"),
         },
-        calendars={"827": _MON_FRI_CAL},
+        business_days_calendar=_MON_FRI_CAL,
     )
     result = evaluate_ad_to_bid_gap(graph, "proj-1")
     assert result.metric_days == 15
@@ -100,7 +104,7 @@ def test_ad_to_bid_gap_fails_below_minimum():
             "M100": _milestone("M100", "2024-09-05"),
             "M200": _milestone("M200", "2024-09-12"),  # only 5 weekdays later
         },
-        calendars={"827": _MON_FRI_CAL},
+        business_days_calendar=_MON_FRI_CAL,
     )
     result = evaluate_ad_to_bid_gap(graph, "proj-1")
     assert result.satisfied is False
@@ -119,7 +123,7 @@ def test_ad_to_bid_gap_excludes_holiday_exceptions():
             "M100": _milestone("M100", "2024-09-05"),
             "M200": _milestone("M200", "2024-09-26"),
         },
-        calendars={"827": cal_with_holiday},
+        business_days_calendar=cal_with_holiday,
     )
     result = evaluate_ad_to_bid_gap(graph, "proj-1")
     assert result.metric_days == 14
@@ -163,7 +167,7 @@ def _award_graph(award_date, construction_start_date, edq_items=None):
             "M300": _milestone("M300", award_date),
             "M500": _milestone("M500", construction_start_date),
         },
-        calendars={"827": _MON_FRI_CAL},
+        business_days_calendar=_MON_FRI_CAL,
         edq_items=edq_items or [],
     )
 
@@ -201,12 +205,18 @@ def test_award_to_construction_classifies_pavement_preservation_from_edq_items()
     assert result.satisfied is True
 
 
-def test_award_to_construction_missing_on_conflicting_federal_numbers():
+def test_award_to_construction_conflicting_federal_numbers_still_classifies_and_notes_it():
+    # A Federal Project Number mismatch between sources is a real
+    # document-consistency finding, but it must not block this check's
+    # own arithmetic -- presence of a federal indicator is what matters
+    # here, not which of two disagreeing numbers is correct.
     graph = _award_graph("2024-09-05", "2024-11-21")
     result = evaluate_award_to_construction(
         graph, "proj-1", federal_project_no="0123456", conflicting_federal_number=True,
     )
-    assert result.satisfied is None
+    assert result.satisfied is True
+    assert "Federal" in result.detail
+    assert "different Federal Project Numbers" in result.detail
 
 
 if __name__ == "__main__":
@@ -224,5 +234,5 @@ if __name__ == "__main__":
     test_award_to_construction_fails_below_federal_minimum()
     test_award_to_construction_defaults_to_state_without_federal_number_or_edq_items()
     test_award_to_construction_classifies_pavement_preservation_from_edq_items()
-    test_award_to_construction_missing_on_conflicting_federal_numbers()
+    test_award_to_construction_conflicting_federal_numbers_still_classifies_and_notes_it()
     print("All tests passed!")

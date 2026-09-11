@@ -3,10 +3,14 @@ arithmetic that was costing an LLM call and, per the Route 49 regression,
 capable of arithmetic error even when the instruction correctly named its
 unit (award_to_construction's business-day-vs-calendar-day miscount).
 
-Reads milestone dates and each milestone's own calendar straight from
-Neo4j and reuses ``app.scheduling.calendar.WorkCalendar`` for business-day
-counting -- the same holiday-aware calendar math the CPM engine uses, not a
-re-derived approximation.
+Reads milestone dates from Neo4j and reuses
+``app.scheduling.calendar.WorkCalendar`` for business-day counting -- the
+same holiday-aware calendar math the CPM engine uses, not a re-derived
+approximation. Business-day gaps use the project's designated business-day
+calendar (matched by name), never a milestone's own assigned calendar --
+P6 milestones are frequently linked to a 7-day calendar regardless of what
+"business days" the rule actually means (confirmed on Route 49: every
+administrative milestone is on "CNT0 - 4 - 7 Day Work Week").
 """
 
 from __future__ import annotations
@@ -46,24 +50,34 @@ def _get_milestone(graph: Any, project_id: str, task_id: str) -> Optional[Dict[s
     return rows[0] if rows else None
 
 
-def _get_calendar(graph: Any, project_id: str, calendar_id: Optional[str]) -> WorkCalendar:
-    if not calendar_id:
-        return DEFAULT_CALENDAR
-    rows = graph.query(
-        "MATCH (c:Calendar {projectId: $pid, calendarId: $cid}) "
-        "RETURN c.workDays AS workDays, c.exceptionDates AS exceptionDates, "
-        "       c.workExceptionDates AS workExceptionDates, c.hoursPerDay AS hoursPerDay LIMIT 1",
-        params={"pid": project_id, "cid": calendar_id},
-    ) or []
-    if not rows:
-        return DEFAULT_CALENDAR
-    r = rows[0]
+def _calendar_from_row(r: Dict[str, Any]) -> WorkCalendar:
     return WorkCalendar(
         work_days=r.get("workDays") or ("Mon", "Tue", "Wed", "Thu", "Fri"),
         exceptions=r.get("exceptionDates") or (),
         work_exceptions=r.get("workExceptionDates") or (),
         hours_per_day=r.get("hoursPerDay") or 8.0,
     )
+
+
+def _get_business_days_calendar(graph: Any, project_id: str) -> WorkCalendar:
+    """The project's designated business-day calendar (NJDOT convention:
+    named e.g. "CNT0 - 1 - State Bus. Days"), used for the administrative
+    business-day-gap rules -- deliberately NOT the milestone's own assigned
+    calendar. Confirmed on Route 49: every milestone (M100 through M950) is
+    assigned to calendar "CNT0 - 4 - 7 Day Work Week", so trusting the
+    milestone's own calendar silently computed calendar days while labeled
+    business days (21/21/77 instead of the correct 15/15/55) -- the exact
+    unit-confusion bug this check type exists to eliminate. Falls back to
+    a plain Mon-Fri calendar (no holiday exclusion) if no such calendar is
+    found, which is conservative but not holiday-aware.
+    """
+    rows = graph.query(
+        "MATCH (c:Calendar {projectId: $pid}) WHERE toLower(c.name) CONTAINS 'bus' "
+        "RETURN c.workDays AS workDays, c.exceptionDates AS exceptionDates, "
+        "       c.workExceptionDates AS workExceptionDates, c.hoursPerDay AS hoursPerDay LIMIT 1",
+        params={"pid": project_id},
+    ) or []
+    return _calendar_from_row(rows[0]) if rows else DEFAULT_CALENDAR
 
 
 def _weekday_check(graph: Any, project_id: str, task_id: str, label: str) -> DateRuleResult:
@@ -96,14 +110,14 @@ def _business_day_gap(
     if a_date is None or b_date is None:
         missing = [lbl for lbl, d in ((from_label, a_date), (to_label, b_date)) if d is None]
         return DateRuleResult(None, f"Missing date(s) for: {', '.join(missing)}.")
-    cal = _get_calendar(graph, project_id, a.get("calendarId"))
+    cal = _get_business_days_calendar(graph, project_id)
     gap = cal.work_days_between(a_date, b_date)
     ok = gap >= minimum
     return DateRuleResult(
         ok,
         f"{from_label} ({from_id}) = {a_date.isoformat()}, {to_label} ({to_id}) = "
-        f"{b_date.isoformat()}: {gap} business day(s) on the {from_label}-side calendar "
-        f"(minimum {minimum}).",
+        f"{b_date.isoformat()}: {gap} business day(s) on the project's business-day "
+        f"calendar (minimum {minimum}).",
         metric_days=gap,
     )
 
@@ -208,32 +222,40 @@ def _classify_project_type(
 def evaluate_award_to_construction(
     graph: Any, project_id: str, federal_project_no: Optional[str], conflicting_federal_number: bool = False,
 ) -> DateRuleResult:
-    if conflicting_federal_number:
-        return DateRuleResult(
-            None,
-            "The key map and DBE Goal Memo report different Federal Project Numbers -- "
-            "project type could not be determined.",
-        )
+    # A Federal Project Number mismatch between the key map and DBE memo is a
+    # real document-consistency finding, but it doesn't bear on THIS rule --
+    # the rule needs to know whether the project is Federal-aid at all, not
+    # which of the two numbers is correct. Confirmed on Route 49: key map
+    # said 0049314, DBE memo said 0049303, and the narrative's FHWA-format
+    # "NHP-0049(303)" corroborates the memo -- but either way, a federal
+    # indicator being present from any source is enough to classify Federal.
+    # Surface the mismatch as a note rather than blocking the verdict on it.
+    conflict_note = (
+        " (Note: the key map and DBE Goal Memo report different Federal "
+        "Project Numbers -- worth a document-consistency check, separate "
+        "from this rule.)"
+        if conflicting_federal_number else ""
+    )
     a = _get_milestone(graph, project_id, _M_AWARD)
     b = _get_milestone(graph, project_id, _M_CONSTRUCTION_START)
     a_date = _to_date(a.get("date")) if a else None
     b_date = _to_date(b.get("date")) if b else None
     if a_date is None or b_date is None:
         missing = [lbl for lbl, d in (("Award", a_date), ("Construction Start", b_date)) if d is None]
-        return DateRuleResult(None, f"Missing date(s) for: {', '.join(missing)}.")
+        return DateRuleResult(None, f"Missing date(s) for: {', '.join(missing)}.{conflict_note}")
 
     project_type, type_detail = _classify_project_type(graph, project_id, federal_project_no)
     if project_type is None:
-        return DateRuleResult(None, type_detail)
+        return DateRuleResult(None, f"{type_detail}{conflict_note}")
 
-    cal = _get_calendar(graph, project_id, a.get("calendarId"))
+    cal = _get_business_days_calendar(graph, project_id)
     gap = cal.work_days_between(a_date, b_date)
     minimum = _AWARD_MINIMUM_BY_TYPE[project_type]
     ok = gap >= minimum
     detail = (
         f"{type_detail} Award (M300) = {a_date.isoformat()}, Construction Start (M500) = "
-        f"{b_date.isoformat()}: {gap} business day(s) on the Award-side calendar "
-        f"(minimum {minimum} for {project_type})."
+        f"{b_date.isoformat()}: {gap} business day(s) on the project's business-day "
+        f"calendar (minimum {minimum} for {project_type}).{conflict_note}"
     )
     return DateRuleResult(ok, detail, metric_days=gap)
 
