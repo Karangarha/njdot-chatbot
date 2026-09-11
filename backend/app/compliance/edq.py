@@ -42,6 +42,29 @@ MIN_COVERAGE_CONFIDENCE = 0.6
 _TOP_K_CANDIDATES = 15
 _MAX_DETAIL_EXAMPLES = 10
 
+# EDQ line items with no construction activity by nature -- administrative,
+# financial or allowance items that no schedule activity will ever "cover."
+# Matched case-insensitively as a substring of itemDescription. Without this
+# exclusion these items are indistinguishable from a genuinely missing
+# activity and drag every review toward a false Fail (confirmed on the
+# Route 49 fixture: 31 of 108 items unmatched, 29% -- high enough that
+# non-physical items were the suspect, not real coverage gaps).
+_NON_PHYSICAL_ITEM_PATTERNS = (
+    "mobilization",
+    "performance and payment bond", "performance bond", "payment bond",
+    "fuel price adjustment", "asphalt price adjustment", "steel price adjustment",
+    "field office", "field office maintenance",
+    "progress schedule", "progress schedule update",
+    "traffic control coordinator",
+    "training",
+    "allowance",
+)
+
+
+def _is_non_physical(item_description: Optional[str]) -> bool:
+    desc = (item_description or "").lower()
+    return any(pattern in desc for pattern in _NON_PHYSICAL_ITEM_PATTERNS)
+
 
 def _cosine(a: List[float], b: List[float]) -> float:
     va, vb = np.array(a), np.array(b)
@@ -223,12 +246,16 @@ def evaluate_edq_coverage(graph: Any, project_id: str) -> EdqCoverageResult:
             detail="No EDQ items could be read from the uploaded estimate document.",
         )
 
+    excluded_items: List[Dict[str, Any]] = []
     uncovered_items: List[Dict[str, Any]] = []
     low_confidence_items: List[Dict[str, Any]] = []
     fully_covered = 0
     for r in rows:
-        conf = r.get("bestConfidence")
         entry = {k: r[k] for k in ("id", "jobId", "category", "itemDescription")}
+        if _is_non_physical(r.get("itemDescription")):
+            excluded_items.append(entry)
+            continue
+        conf = r.get("bestConfidence")
         if conf is None:
             uncovered_items.append(entry)
         elif conf < MIN_COVERAGE_CONFIDENCE:
@@ -236,7 +263,7 @@ def evaluate_edq_coverage(graph: Any, project_id: str) -> EdqCoverageResult:
         else:
             fully_covered += 1
 
-    total = len(rows)
+    total = len(rows) - len(excluded_items)
     uncovered = len(uncovered_items)
     low_confidence = len(low_confidence_items)
 
@@ -247,22 +274,32 @@ def evaluate_edq_coverage(graph: Any, project_id: str) -> EdqCoverageResult:
             text += f"; and {len(items) - _MAX_DETAIL_EXAMPLES} more"
         return text
 
+    excluded_note = (
+        f" Excluded {len(excluded_items)} non-physical item(s) with no construction "
+        f"activity by nature (mobilization, bonds, price adjustments, field office, "
+        f"progress schedule updates, training, allowances, etc.): {_examples(excluded_items)}."
+        if excluded_items else ""
+    )
+
     if uncovered:
         status = "Fail"
         detail = (
             f"{uncovered} of {total} EDQ item(s) have no matching schedule activity: "
-            f"{_examples(uncovered_items)}."
+            f"{_examples(uncovered_items)}.{excluded_note}"
         )
     elif low_confidence:
         status = "Missing"
         detail = (
             f"All {total} EDQ item(s) have some matching activity, but {low_confidence} "
             f"matched only at low confidence (below {MIN_COVERAGE_CONFIDENCE}) and need "
-            f"manual review: {_examples(low_confidence_items)}."
+            f"manual review: {_examples(low_confidence_items)}.{excluded_note}"
         )
     else:
         status = "Pass"
-        detail = f"All {total} EDQ item(s) have a matching schedule activity at or above {MIN_COVERAGE_CONFIDENCE} confidence."
+        detail = (
+            f"All {total} EDQ item(s) have a matching schedule activity at or above "
+            f"{MIN_COVERAGE_CONFIDENCE} confidence.{excluded_note}"
+        )
 
     return EdqCoverageResult(
         total_items=total, fully_covered=fully_covered, low_confidence=low_confidence,
