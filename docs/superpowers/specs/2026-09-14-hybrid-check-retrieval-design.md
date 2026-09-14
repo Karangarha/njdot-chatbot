@@ -156,6 +156,31 @@ unchanged.
 The same composition applies to the static specifications and scheduling manual
 searches the compliance path uses, so those stop being dense-only too.
 
+### Known limitation: phrase anchors are not implemented
+
+Several checks in the catalog name a phrase rather than a section or table --
+`narrative_night_work` and `utility_work_hours` both tell the evaluator to
+search for `"safe-time"`; `utility_alignment` tells it to search for `"Work
+to be Performed by Utility"`. Nothing in this design extracts those phrases
+into a retrieval anchor. `extract_anchors` (`backend/app/compliance/anchors.py`)
+recognises exactly two shapes -- section identifiers and table captions --
+and nothing else; a quoted phrase in an instruction is never captured and
+never reaches `keyword_search_session_chunks` as a query term. Where a check
+like this still gets its passage, it is because the phrase happens to sit in
+a section that is itself named nearby (`105.07.02`), so Layer 2's pinning
+delivers it -- not because the keyword leg matched the phrase.
+
+Extending `as_query()` to append phrases is not a small addition on top of
+what exists. `websearch_to_tsquery` AND-chains every surviving token in a
+single query string, so a query that already carries a section number (e.g.
+`105.07.02`) and then gains a phrase (`safe-time`) would require both to
+appear in the same chunk to match at all. That over-constrains the search
+rather than widening it, and works against the reason the query is anchors-only
+in the first place (see the module docstring above). A real fix needs either
+a second, separate keyword query per phrase or an OR-combined tsquery, both
+of which are out of scope here. This is a known gap, not a to-do: it is not
+implemented and is not assumed by anything else in this design.
+
 ## Components
 
 | File | Change | Responsibility |
