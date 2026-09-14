@@ -60,10 +60,25 @@ def test_none_id_rows_never_survive_fusion_and_are_not_coalesced():
     assert [r["id"] for r in out] == ["x"]
 
 
+def test_key_parameter_selects_a_different_id_field():
+    # The whole point of `key` is reuse on a table whose id column isn't
+    # "id" (e.g. a future session_chunks caller keyed on "session_id").
+    def _session_row(sid):
+        return {"session_id": sid, "content": f"body {sid}"}
+
+    out = fuse(
+        [_session_row("s1"), _session_row("s2")],
+        [_session_row("s2")],
+        v_weight=0.5, k_weight=0.5, match_count=5, key="session_id",
+    )
+    assert [r["session_id"] for r in out] == ["s2", "s1"]
+
+
 if __name__ == "__main__":
     test_a_document_in_both_lists_outranks_one_in_only_the_first()
     test_keyword_weight_can_lift_a_keyword_only_hit_above_a_vector_hit()
     test_similarity_carries_the_rrf_score_and_match_count_truncates()
     test_empty_inputs_are_not_an_error()
     test_none_id_rows_never_survive_fusion_and_are_not_coalesced()
+    test_key_parameter_selects_a_different_id_field()
     print("All tests passed!")
