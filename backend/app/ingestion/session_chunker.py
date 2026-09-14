@@ -369,11 +369,19 @@ def _segment_by_section(
     A run starts at each line ``section_detector.detect`` recognises as a
     heading and ends at the next one. Text before the first heading becomes a
     run with no section, which is normal for cover pages and preambles.
+
+    ``line_pages`` tracks the source PDF page of every entry in ``lines``,
+    1:1, so a chunk built from this run can later report the page its own
+    text actually came from instead of just the run's heading page (see
+    ``_page_at`` in ``chunk_special_provision``).
     """
     from app.ingestion.section_detector import detect
 
     runs: List[Dict[str, Any]] = []
-    cur: Dict[str, Any] = {"section_id": None, "section_title": None, "lines": [], "page": 1}
+    cur: Dict[str, Any] = {
+        "section_id": None, "section_title": None,
+        "lines": [], "line_pages": [], "page": 1,
+    }
     for page in pages:
         for line in page["text"].splitlines():
             if line.strip() in boilerplate:
@@ -386,12 +394,14 @@ def _segment_by_section(
                     "section_id": match["section_id"],
                     "section_title": match["title"],
                     "lines": [line],
+                    "line_pages": [page["page_num"]],
                     "page": page["page_num"],
                 }
             else:
                 if not cur["lines"]:
                     cur["page"] = page["page_num"]
                 cur["lines"].append(line)
+                cur["line_pages"].append(page["page_num"])
     if cur["lines"]:
         runs.append(cur)
     return runs
@@ -440,20 +450,45 @@ def chunk_special_provision(
     chunks: List[Dict[str, Any]] = []
     idx = 0
     for run in runs:
-        text = "\n".join(run["lines"]).strip()
-        if not text:
+        lines = run["lines"]
+        if not "\n".join(lines).strip():
             continue
-        tokens = enc.encode(text)
+
+        # Encode the run's lines grouped into same-page blocks (mirroring how
+        # the deleted top-level _page_at built page_token_starts across the
+        # whole document), so a window's start offset maps back to the real
+        # page it came from -- not just the page the run's own heading is on.
+        page_token_starts: List[tuple] = []   # (token_offset, page_num)
+        run_tokens: List[int] = []
+        i, n = 0, len(lines)
+        while i < n:
+            page_num = run["line_pages"][i]
+            j = i
+            while j < n and run["line_pages"][j] == page_num:
+                j += 1
+            page_token_starts.append((len(run_tokens), page_num))
+            run_tokens.extend(enc.encode("\n".join(lines[i:j]) + "\n"))
+            i = j
+
+        def _page_at(token_idx: int, _starts=page_token_starts) -> int:
+            page_num = _starts[0][1] if _starts else run["page"]
+            for start, pnum in _starts:
+                if start <= token_idx:
+                    page_num = pnum
+                else:
+                    break
+            return page_num
+
         start = 0
-        while start < len(tokens):
-            end  = min(start + _SP_MAX_TOKENS, len(tokens))
-            body = enc.decode(tokens[start:end]).strip()
+        while start < len(run_tokens):
+            end  = min(start + _SP_MAX_TOKENS, len(run_tokens))
+            body = enc.decode(run_tokens[start:end]).strip()
             if body:
                 chunks.append({
                     "content": body,
                     "metadata": {
                         "doc_type":      "special_provision",
-                        "page_pdf":      run["page"],
+                        "page_pdf":      _page_at(start),
                         "chunk_index":   idx,
                         "section_id":    run["section_id"],
                         "section_title": run["section_title"],
@@ -464,7 +499,7 @@ def chunk_special_provision(
                     },
                 })
                 idx += 1
-            if end >= len(tokens):
+            if end >= len(run_tokens):
                 break
             start = end - _SP_OVERLAP
 

@@ -79,6 +79,22 @@ def test_a_long_section_still_splits_into_overlapping_windows():
     assert all(c["metadata"]["section_id"] == "105.05" for c in chunks)
 
 
+def test_a_chunk_from_later_pages_of_a_long_section_reports_a_later_page():
+    # Section heading is on page 1; the bulk of the clause body lives on
+    # page 2. A window deep into the body must report page 2, not the
+    # heading's page 1 -- the old flat-stream _page_at gave every chunk in a
+    # long clause the section-heading's page, sending the reader to the
+    # wrong page for everything after the first window.
+    body = " ".join(f"word{i}" for i in range(4000))
+    pages = _pages("105.05 WORKING DRAWINGS\nShort lead-in on page one.\n", body)
+    chunks = chunk_special_provision(pages)
+    sp_chunks = [c for c in chunks if c["metadata"]["section_id"] == "105.05"]
+    assert len(sp_chunks) > 1
+    heading_page = sp_chunks[0]["metadata"]["page_pdf"]
+    assert heading_page == 1
+    assert sp_chunks[-1]["metadata"]["page_pdf"] > heading_page
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
