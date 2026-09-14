@@ -54,6 +54,94 @@ def test_build_sp_search_fn_returns_none_for_no_chunks():
     assert _build_sp_search_fn([], [], MagicMock()) is None
 
 
+# _build_sp_search_fn's anchor_missing split (review.py, ~lines 390-421) has
+# five distinguishable cases. Each test below queries with the same anchored
+# instruction (mirroring test_check_retrieval.py's _INSTRUCTION) except the
+# "no anchor named" case, so the only thing that varies is what the chunks'
+# metadata carries.
+
+_ANCHORED_INSTRUCTION = (
+    "Special Provisions 105.05 WORKING DRAWINGS: \"TABLE 105.05-1 IS CHANGED TO\".\n\n"
+    "Classify each submittal by the governing table."
+)
+
+
+def _sp_embeddings():
+    embeddings = MagicMock()
+    embeddings.embed_query.return_value = [0.0, 1.0]
+    return embeddings
+
+
+def test_build_sp_search_fn_anchor_matched_is_not_missing():
+    """Case 1: the named anchor pins a real chunk -- anchor_missing False."""
+    sp_chunks = [
+        {"content": "Governing table text.",
+         "metadata": {"section_id": "105.05", "tables": ["TABLE 105.05-1"], "chunk_index": 0}},
+    ]
+    search_fn = _build_sp_search_fn(sp_chunks, [[0.0, 1.0]], _sp_embeddings())
+
+    _text, _candidates, anchor_missing = search_fn(_ANCHORED_INSTRUCTION, top_k=8)
+
+    assert anchor_missing is False
+
+
+def test_build_sp_search_fn_anchor_absent_with_section_metadata_present_is_missing():
+    """Case 2: the project's chunks DO carry section_id metadata (just not
+    for the anchor this check names) -- a genuine, provable gap."""
+    sp_chunks = [
+        {"content": "Some other clause entirely.",
+         "metadata": {"section_id": "200.01", "tables": [], "chunk_index": 0}},
+    ]
+    search_fn = _build_sp_search_fn(sp_chunks, [[0.0, 1.0]], _sp_embeddings())
+
+    _text, _candidates, anchor_missing = search_fn(_ANCHORED_INSTRUCTION, top_k=8)
+
+    assert anchor_missing is True
+
+
+def test_build_sp_search_fn_no_section_id_key_degrades_silently():
+    """Case 3: pre-section-aware chunks with no "section_id" key at all --
+    pinning could never have worked, so this must NOT be reported as a gap."""
+    sp_chunks = [
+        {"content": "Pre-section-aware chunk.", "metadata": {"tables": [], "chunk_index": 0}},
+    ]
+    search_fn = _build_sp_search_fn(sp_chunks, [[0.0, 1.0]], _sp_embeddings())
+
+    _text, _candidates, anchor_missing = search_fn(_ANCHORED_INSTRUCTION, top_k=8)
+
+    assert anchor_missing is False
+
+
+def test_build_sp_search_fn_section_id_present_but_none_degrades_silently():
+    """Case 4: "section_id" key exists but is None -- same silent-degrade
+    behavior as the key being absent entirely."""
+    sp_chunks = [
+        {"content": "Chunk with an explicit null section_id.",
+         "metadata": {"section_id": None, "tables": [], "chunk_index": 0}},
+    ]
+    search_fn = _build_sp_search_fn(sp_chunks, [[0.0, 1.0]], _sp_embeddings())
+
+    _text, _candidates, anchor_missing = search_fn(_ANCHORED_INSTRUCTION, top_k=8)
+
+    assert anchor_missing is False
+
+
+def test_build_sp_search_fn_no_anchor_named_is_not_missing():
+    """Case 5: the instruction names no section/table anchor at all -- never
+    a missing-evidence signal, regardless of what the chunks carry."""
+    sp_chunks = [
+        {"content": "Some clause with section metadata.",
+         "metadata": {"section_id": "200.01", "tables": [], "chunk_index": 0}},
+    ]
+    search_fn = _build_sp_search_fn(sp_chunks, [[0.0, 1.0]], _sp_embeddings())
+
+    _text, _candidates, anchor_missing = search_fn(
+        "Confirm the narrative addresses community commitments.", top_k=8,
+    )
+
+    assert anchor_missing is False
+
+
 def test_build_sp_search_fn_from_supabase_tags_rows_with_page_pdf():
     # "funding" has no section/table anchor, so retrieve_for_check's pinning
     # and anchor_missing probe both short-circuit before ever calling
