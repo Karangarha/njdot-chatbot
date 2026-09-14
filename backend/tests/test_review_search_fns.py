@@ -6,6 +6,10 @@ and _build_static_doc_search_fn now return (tagged_text, {tag: candidate})
 instead of a plain string, so _evaluate_one_check can verify which passage
 (if any) the LLM's cited_chunk_ids actually refers to. See
 docs/superpowers/specs/2026-09-10-review-citations-design.md.
+
+The two SP closures return a third element, anchor_missing (see
+app.compliance.check_retrieval.RetrievalResult) -- _build_static_doc_search_fn
+has no anchor concept and keeps the two-tuple.
 """
 
 from __future__ import annotations
@@ -36,13 +40,14 @@ def test_build_sp_search_fn_tags_top_result_with_page_pdf():
     embeddings.embed_query.return_value = [1.0, 0.0]  # matches first chunk exactly
 
     search_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
-    text, candidates = search_fn("gas work restriction", top_k=1)
+    text, candidates, anchor_missing = search_fn("gas work restriction", top_k=1)
 
     assert "[cite:sp-0]" in text
     assert "Gas work prohibited in July." in text
     assert candidates["sp-0"] == EvidenceCandidate(
         kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7,
     )
+    assert anchor_missing is False
 
 
 def test_build_sp_search_fn_returns_none_for_no_chunks():
@@ -50,18 +55,25 @@ def test_build_sp_search_fn_returns_none_for_no_chunks():
 
 
 def test_build_sp_search_fn_from_supabase_tags_rows_with_page_pdf():
+    # "funding" has no section/table anchor, so retrieve_for_check's pinning
+    # and anchor_missing probe both short-circuit before ever calling
+    # db.table() -- only the "does this project have SP chunks" existence
+    # check (below) and the dense leg's db.rpc("match_session_chunks", ...)
+    # need fixtures.
     db = MagicMock()
     db.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.count = 1
+    db.rpc.return_value.execute.return_value.data = [
+        {"id": "c1", "doc_type": "special_provision",
+         "content": "Multi-year funding clause text.", "metadata": {"page_pdf": 12}},
+    ]
 
-    with patch("app.api.review.retrieve_sp_chunks", return_value=[
-        {"content": "Multi-year funding clause text.", "metadata": {"page_pdf": 12}},
-    ]):
-        search_fn = _build_sp_search_fn_from_supabase(db, MagicMock(), "proj1")
-        text, candidates = search_fn("funding")
+    search_fn = _build_sp_search_fn_from_supabase(db, MagicMock(), "proj1")
+    text, candidates, anchor_missing = search_fn("funding")
 
     assert "[cite:sp-0]" in text
     assert candidates["sp-0"].page_pdf == 12
     assert candidates["sp-0"].kind == "private"
+    assert anchor_missing is False
 
 
 def test_build_static_doc_search_fn_tags_results_with_doc_and_page():

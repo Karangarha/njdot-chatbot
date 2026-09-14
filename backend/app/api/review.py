@@ -54,7 +54,9 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from yarl import URL as _YarlURL
 
 from app.auth import user_id_from_token, user_id_from_token_optional
+from app.compliance.anchors import extract_anchors
 from app.compliance.catalog import BUILTIN_CHECKS, MANUAL_REVIEW_KEYS, CheckDef
+from app.compliance.check_retrieval import PIN_BUDGET_FRACTION, retrieve_for_check
 from app.compliance.cost import CostGapResult, evaluate_cost_gap
 from app.compliance.edq import EdqCoverageResult, evaluate_edq_coverage, match_edq_items_to_activities
 from app.compliance.date_rule import DateRuleResult, evaluate_date_rules
@@ -88,7 +90,6 @@ from app.ingestion.utility_plan_extractor import extract_utility_plan, render_ut
 from app.models import ReviewCheckResult, ReviewResponse
 from app.neo4j_client import get_neo4j
 from app.retrieval.vector_search import VectorSearcher
-from app.retrieval_langchain.sp_retriever import retrieve_sp_chunks
 from app.retrieval_langchain.utility_plan_retriever import retrieve_utility_plan_chunks
 from app.scheduling import build_calendars, build_network, cross_check, run_cpm
 # Re-exported for backward compatibility (session.py and debug scripts import
@@ -342,9 +343,27 @@ def _cosine(a: List[float], b: List[float]) -> float:
     return float(np.dot(va, vb) / denom) if denom else 0.0
 
 
+# The SP closures also report whether the instruction named a section/table
+# anchor this project's chunks genuinely lack (see
+# check_retrieval.RetrievalResult.anchor_missing) -- a three-tuple, and its
+# own alias distinct from CitedSearch. CitedSearch itself (spec,
+# scheduling-manual, key-map, estimate) stays a two-tuple unchanged: those
+# searches have no anchors.
+SpCitedSearch = Callable[..., Tuple[str, Dict[str, EvidenceCandidate], bool]]
+
+
+def _sp_chunk_matches_anchors(chunk: Dict[str, Any], anchors: Any) -> bool:
+    """Same pin test as ``check_retrieval.pin_by_anchors``, against an
+    in-memory chunk's metadata instead of a ``session_chunks`` row."""
+    metadata = chunk.get("metadata") or {}
+    if metadata.get("section_id") in anchors.sections:
+        return True
+    return bool(set(metadata.get("tables") or ()) & set(anchors.tables))
+
+
 def _build_sp_search_fn(
     sp_chunks: List[Dict[str, Any]], sp_vectors: List[List[float]], embeddings: OpenAIEmbeddings,
-) -> Optional[CitedSearch]:
+) -> Optional[SpCitedSearch]:
     """In-process cosine-ranked Special Provision search over already-chunked
     and already-embedded SP text, tagging each returned passage for citation
     verification (e.g. ``[cite:sp-0]``).
@@ -355,16 +374,49 @@ def _build_sp_search_fn(
     ``insert_session_chunks`` call that persists them to Supabase
     ``session_chunks`` — previously each computed its own chunks/embeddings
     independently, doubling SP embedding calls on every fresh review.
+
+    This closure has no database to pin against, so it can't call
+    ``check_retrieval.retrieve_for_check`` directly (that issues real
+    PostgREST/RPC queries). It instead pins over ``sp_chunks`` itself using
+    the identical anchor extraction and pin budget (``extract_anchors``,
+    ``PIN_BUDGET_FRACTION``) ``retrieve_for_check`` uses, so the two agree on
+    *which* chunks are anchor matches rather than merely resembling each
+    other. There is no keyword/BM25 index over in-memory chunks -- there
+    never was one here -- so the unpinned half of the budget is filled by
+    the existing cosine ranking only.
     """
     if not sp_chunks:
         return None
 
-    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate]]:
-        q_vec = embeddings.embed_query(query)
-        scored = sorted(zip(sp_chunks, sp_vectors), key=lambda cv: -_cosine(q_vec, cv[1]))
-        top = [c for c, _ in scored[:top_k]]
+    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate], bool]:
+        anchors = extract_anchors(query)
+        pin_limit = max(1, int(top_k * PIN_BUDGET_FRACTION)) if top_k > 0 else 0
+        pinned: List[Dict[str, Any]] = []
+        if pin_limit > 0 and not anchors.is_empty:
+            pinned = sorted(
+                (c for c in sp_chunks if _sp_chunk_matches_anchors(c, anchors)),
+                key=lambda c: (c.get("metadata") or {}).get("chunk_index") or 0,
+            )[:pin_limit]
+        pinned_ids = {id(c) for c in pinned}
+
+        remaining = max(top_k - len(pinned), 0)
+        ranked: List[Dict[str, Any]] = []
+        if remaining > 0:
+            q_vec = embeddings.embed_query(query)
+            pool = [(c, v) for c, v in zip(sp_chunks, sp_vectors) if id(c) not in pinned_ids]
+            ranked = [c for c, _ in sorted(pool, key=lambda cv: -_cosine(q_vec, cv[1]))[:remaining]]
+
+        top = pinned + ranked
+        # Mirrors retrieve_for_check's three-way split: a missing anchor is
+        # only evidence of a genuine gap when this project's chunks carry
+        # section metadata at all (see check_retrieval.project_has_section_metadata).
+        anchor_missing = (
+            not anchors.is_empty and not pinned
+            and any((c.get("metadata") or {}).get("section_id") for c in sp_chunks)
+        )
         if not top:
-            return "No matching Special Provision text found.", {}
+            return "No matching Special Provision text found.", {}, anchor_missing
+
         parts: List[str] = []
         candidates: Dict[str, EvidenceCandidate] = {}
         for i, chunk in enumerate(top):
@@ -374,19 +426,25 @@ def _build_sp_search_fn(
                 kind="private", doc_type="special_provision", label="Special Provision",
                 page_pdf=(chunk.get("metadata") or {}).get("page_pdf"),
             )
-        return "\n\n---\n\n".join(parts), candidates
+        return "\n\n---\n\n".join(parts), candidates, anchor_missing
 
     return _search
 
 
 def _build_sp_search_fn_from_supabase(
     db: Any, embeddings: OpenAIEmbeddings, project_id: str,
-) -> Optional[CitedSearch]:
+) -> Optional[SpCitedSearch]:
     """Special Provision search backed by ``session_chunks`` -- the
     ``reseed=False`` fast path's equivalent of ``_build_sp_search_fn``,
-    without re-parsing, re-chunking, or re-embedding the PDF. Reuses the same
-    ``retrieve_sp_chunks`` chat already calls, so review and chat can never
-    disagree about how SP retrieval works. Returns ``None`` if this project
+    without re-parsing, re-chunking, or re-embedding the PDF. Reuses
+    ``check_retrieval.retrieve_for_check`` -- the same pin+dense+keyword
+    composition ``_build_sp_search_fn`` now mirrors (in-memory pin, no
+    keyword leg) -- so the two review closures can never disagree about how
+    SP retrieval works, the way they used to before diverging on the
+    similarity floor. Chat's own SP tool (``sp_retriever.build_sp_tool``)
+    still calls the plain dense-only ``retrieve_sp_chunks`` beneath
+    ``retrieve_for_check`` with its own 0.2 floor; unifying that with the
+    compliance-check path is not this task. Returns ``None`` if this project
     has no SP chunks (matches "no SP uploaded" behavior).
     """
     existing = (
@@ -397,20 +455,22 @@ def _build_sp_search_fn_from_supabase(
     if not existing.count:
         return None
 
-    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate]]:
-        rows = retrieve_sp_chunks(db, embeddings.embed_query, project_id, query, match_count=top_k)
-        if not rows:
-            return "No matching Special Provision text found.", {}
+    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate], bool]:
+        result = retrieve_for_check(
+            db, embeddings.embed_query, project_id, query, top_k=top_k, doc_type="special_provision",
+        )
+        if not result.rows:
+            return "No matching Special Provision text found.", {}, result.anchor_missing
         parts: List[str] = []
         candidates: Dict[str, EvidenceCandidate] = {}
-        for i, r in enumerate(rows):
+        for i, r in enumerate(result.rows):
             tag = f"sp-{i}"
             parts.append(f"[cite:{tag}] {r['content']}")
             candidates[tag] = EvidenceCandidate(
                 kind="private", doc_type="special_provision", label="Special Provision",
                 page_pdf=(r.get("metadata") or {}).get("page_pdf"),
             )
-        return "\n\n---\n\n".join(parts), candidates
+        return "\n\n---\n\n".join(parts), candidates, result.anchor_missing
 
     return _search
 

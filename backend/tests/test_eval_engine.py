@@ -12,6 +12,7 @@ Runnable two ways:
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -800,6 +801,54 @@ def test_evaluate_one_check_grounding_unresolved_keeps_citations_from_final_answ
     assert "recommend human review" in result.evidence.lower()
     doc_types = {c.doc_type for c in result.citations}
     assert doc_types == {"special_provision", "key_map"}
+
+
+def test_both_sp_closures_return_identical_passages_for_one_query():
+    """The fresh-review closure applied no similarity floor and the rerun
+    closure applied 0.2, so the same check retrieved differently depending on
+    which code path ran. One implementation, one result.
+
+    Builds both app.api.review SP closures over the same backing data (the
+    _FakeDB/_chunk fakes from test_check_retrieval.py) and runs one
+    identical, anchored query through each.
+    """
+    from app.api.review import _build_sp_search_fn, _build_sp_search_fn_from_supabase
+    from test_check_retrieval import _FakeDB, _chunk, _INSTRUCTION
+
+    # One anchor-matching chunk (pinned by both closures) plus two plain
+    # chunks that only the dense leg can surface.
+    pinned_chunk = _chunk(
+        "t", section="105.05", tables=["TABLE 105.05-1"], body="Pinned SP text.", chunk_index=0,
+    )
+    vector_chunk1 = _chunk("v1", body="Vector match one.")
+    vector_chunk2 = _chunk("v2", body="Vector match two.")
+
+    # A zero query embedding makes _cosine() return 0.0 for every candidate
+    # (norm(query)=0 => denom=0), so the in-process closure's ranking is a
+    # stable sort that preserves list order -- the same order _FakeDB hands
+    # back verbatim (it does not do real vector math either). No keyword
+    # rows on either side, so the RRF fuse the Supabase closure performs
+    # never has a keyword-driven reordering to diverge on.
+    embed_fn = lambda q: [0.0, 0.0, 0.0]  # noqa: E731
+    embeddings = SimpleNamespace(embed_query=embed_fn)
+
+    db = _FakeDB(pinned=[pinned_chunk], vector=[vector_chunk1, vector_chunk2], keyword=())
+    supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
+
+    sp_chunks = [pinned_chunk, vector_chunk1, vector_chunk2]
+    sp_vectors = [[0.0, 0.0, 0.0]] * 3
+    memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+
+    text_a, _candidates_a, _anchor_missing_a = supabase_fn(_INSTRUCTION, top_k=8)
+    text_b, _candidates_b, _anchor_missing_b = memory_fn(_INSTRUCTION, top_k=8)
+
+    tags_a = re.findall(r"\[cite:(sp-\d+)\]", text_a)
+    tags_b = re.findall(r"\[cite:(sp-\d+)\]", text_b)
+
+    assert tags_a == ["sp-0", "sp-1", "sp-2"]  # sanity: not vacuously equal
+    assert text_a == text_b
+    assert tags_a == tags_b
+    assert len(tags_a) == len(tags_b)
 
 
 if __name__ == "__main__":
