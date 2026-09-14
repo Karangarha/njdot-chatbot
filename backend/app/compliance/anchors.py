@@ -19,14 +19,16 @@ import re
 from dataclasses import dataclass
 from typing import Tuple
 
+from app.ingestion.section_detector import TABLE_RE as _TABLE_RE
+
 # Mirrors app.ingestion.section_detector's dialect rather than inventing a
 # second one: 105.07, 105.07.02, and "SECTION 703".
 _SECTION_RE = re.compile(r"\b\d{3,4}\.\d{2}(?:\.\d{2})?\b|\bSECTION\s+\d{3}\b", re.IGNORECASE)
-# The identifier after "TABLE" must be digit-bearing ("105.05-1") or a lone
-# letter not itself the start of a longer word ("A" in "Table A", but not the
-# "c" in "table carefully"); otherwise ordinary prose like "table gets" reads
-# as a caption.
-_TABLE_RE = re.compile(r"\bTABLE\s+(?:\d[\dA-Z]*(?:\.[\dA-Z]+)*(?:-\d+)?|[A-Z]\b)", re.IGNORECASE)
+# Table-caption pattern: defined in app.ingestion.section_detector.TABLE_RE
+# (that module is the project's authority on heading dialect and imports
+# nothing but `re`); imported here under the old private name so the rest of
+# this module is unchanged. See that module for why the identifier after
+# "TABLE" must be digit-led or a lone letter.
 
 
 @dataclass(frozen=True)

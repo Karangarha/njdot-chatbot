@@ -39,11 +39,15 @@ from typing import Any, Dict, List, Optional
 
 import tiktoken
 
-# Reuse anchors.py's tightened TABLE-caption dialect (digit-led or single-letter
-# identifier only) rather than inventing a second, looser one here: a caption
-# recorded in chunk metadata must be matchable by an anchor extracted from a
-# check instruction later. See backend/app/compliance/anchors.py.
-from app.compliance.anchors import _TABLE_RE
+# Reuse section_detector's tightened TABLE-caption dialect (digit-led or
+# single-letter identifier only) rather than inventing a second, looser one
+# here: a caption recorded in chunk metadata must be matchable by an anchor
+# extracted from a check instruction later (app.compliance.anchors imports
+# this same pattern). section_detector is this project's authority on
+# heading dialect and imports nothing but `re` -- unlike app.compliance,
+# which pulls in LangChain and the app config -- so depending on it keeps
+# this zero-LLM-call ingestion module's dependency direction correct.
+from app.ingestion.section_detector import TABLE_RE
 
 _ENCODING_NAME  = "cl100k_base"
 _SP_MAX_TOKENS  = 600
@@ -494,7 +498,7 @@ def chunk_special_provision(
                         "section_title": run["section_title"],
                         "tables": sorted({
                             m.group(0).upper()
-                            for m in _TABLE_RE.finditer(body)
+                            for m in TABLE_RE.finditer(body)
                         }),
                     },
                 })
