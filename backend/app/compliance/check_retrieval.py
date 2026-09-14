@@ -148,8 +148,21 @@ def retrieve_for_check(
     v_weight, k_weight, _label = classify_query(anchors.as_query())
 
     if remaining > 0:
+        # Ask each leg for `top_k` rows, not `remaining`. The two legs can
+        # return the exact same rows as each other (an anchor hit tends to
+        # rank high in both dense and keyword search), and either leg can
+        # also return rows that are already pinned -- both are lost after
+        # this point: once to inter-leg dedupe inside fuse(), once to the
+        # pinned-id dedupe below. Worst case (full overlap between the legs,
+        # and every pinned row also present in the fetch), a leg fetched at
+        # size N survives fusion and the pinned dedupe with only
+        # N - len(pinned_rows) distinct rows left. Solving
+        # N - len(pinned_rows) >= remaining for N gives
+        # N >= remaining + len(pinned_rows) == top_k, so `top_k` per leg is
+        # the minimum fetch size that always leaves `remaining` survivors.
+        fetch_count = top_k
         vector_rows = retrieve_sp_chunks(
-            db, embed_fn, project_id, instruction, match_count=remaining, doc_type=doc_type,
+            db, embed_fn, project_id, instruction, match_count=fetch_count, doc_type=doc_type,
         )
         # The keyword leg is skipped entirely when there's no anchor: a
         # websearch_to_tsquery over an empty string matches nothing anyway,
@@ -162,14 +175,16 @@ def retrieve_for_check(
                         "search_query": anchors.as_query(),
                         "p_session_id": project_id,
                         "p_doc_type": doc_type,
-                        "match_count": remaining,
+                        "match_count": fetch_count,
                     },
                 ).execute().data
             ) or []
 
-    # Fuse with an unbounded match_count -- dedupe against the pinned ids
-    # below may drop the top-ranked row (it's already pinned), so we need
-    # more than `remaining` candidates on hand to still fill the budget.
+    # fuse()'s own match_count is already unbounded (len(vector_rows) +
+    # len(keyword_rows)), so it never discards a candidate either leg
+    # fetched -- that was never what caused the shortfall. The shortfall
+    # was upstream: each leg wasn't fetched deep enough to survive the
+    # pinned-id dedupe below (see the over-fetch comment above).
     fused = fuse(
         vector_rows, keyword_rows, v_weight, k_weight,
         match_count=len(vector_rows) + len(keyword_rows),
