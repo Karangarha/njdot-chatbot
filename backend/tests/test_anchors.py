@@ -75,7 +75,19 @@ def test_deduplicates_and_preserves_first_appearance_order():
 def test_table_followed_by_ordinary_prose_is_not_an_anchor():
     # "table" followed by a common noun/adverb is not a caption; a false
     # positive here (e.g. "CAREFULLY") would AND-poison the BM25 query.
-    a = extract_anchors("Read the table's two columns carefully.")
+    #
+    # FINDING 7: the previous fixture, "table's two columns", already fails
+    # to match on the apostrophe alone (no whitespace immediately after
+    # "table", which \s+ requires) -- true under BOTH the pre-fix pattern
+    # (re.compile(r"\bTABLE\s+[\dA-Z]+(?:\.[\dA-Z]+)*(?:-\d+)?\b",
+    # re.IGNORECASE), commit 5d94940's "before") and the current one, so it
+    # never actually exercised the digit/single-letter requirement this test
+    # claims to pin. A plain sentence with a real space after "table" does:
+    # confirmed the pre-fix pattern above DOES match "table carefully" (as
+    # "TABLE CAREFULLY"), which is precisely the real bug commit 5d94940
+    # fixed (working_drawing_review_time's actual instruction text produced
+    # junk anchors TABLE CAREFULLY / TABLE GETS).
+    a = extract_anchors("Read the table carefully.")
     assert a.tables == ()
 
 
