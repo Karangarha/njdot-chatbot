@@ -36,6 +36,18 @@ activity graph coverage, ``app.compliance.edq``), ``"schedule_logic"``
 (CSM Section 3.0 negative float / lag / open ends / mandatory constraints,
 ``app.compliance.schedule_logic``), and ``"date_rule"`` (milestone weekday
 tests and holiday-aware business-day gaps, ``app.compliance.date_rule``).
+
+Special Provision search closures (``sp_search_fn``) return a three-tuple
+``(text, candidates, anchor_missing)`` rather than ``CitedSearch``'s plain
+two-tuple -- carried as the third element of that call's own return value
+(the chosen transport; see ``app.compliance.check_retrieval.RetrievalResult
+.anchor_missing`` and ``app.api.review``'s SP closures for where it's
+computed) rather than on a separate retrieval-log record. ``anchor_missing``
+True means the project has section metadata, the check named a section/table
+anchor, and it matched nothing -- a genuine gap. ``_evaluate_one_check``
+short-circuits on that signal: no LLM call, an immediate "Missing" verdict
+naming the absent anchor. False is the default/no-anchor/no-metadata case
+and behaves exactly as before (evidence goes to the LLM as usual).
 """
 
 from __future__ import annotations
@@ -52,6 +64,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import Runnable
 from langchain_neo4j import Neo4jGraph
 
+from app.compliance.anchors import extract_anchors
 from app.compliance.catalog import CheckDef
 from app.compliance.cost import CostGapResult
 from app.compliance.date_rule import DateRuleResult
@@ -86,6 +99,14 @@ class EvidenceCandidate:
 # instead of a plain string, so the tag(s) the LLM copies into
 # EvaluationSchema.cited_chunk_ids can be resolved back to real metadata.
 CitedSearch = Callable[[str], Tuple[str, Dict[str, EvidenceCandidate]]]
+
+# The Special Provision search closures additionally report whether the
+# instruction named a section/table anchor this project's chunks genuinely
+# lack (see check_retrieval.RetrievalResult.anchor_missing) -- a three-tuple,
+# and its own alias distinct from CitedSearch. Every other source (spec,
+# scheduling-manual, key-map, estimate) has no anchors and keeps the
+# two-tuple CitedSearch shape unchanged.
+SpCitedSearch = Callable[..., Tuple[str, Dict[str, EvidenceCandidate], bool]]
 
 _MAX_FACT_ROWS = 40
 
@@ -663,7 +684,7 @@ def _evaluate_one_check(
     structured_judge_llm: Runnable,
     schedule_facts: str,
     narrative_result: Tuple[str, Dict[str, EvidenceCandidate]],
-    sp_search_fn: Optional[CitedSearch],
+    sp_search_fn: Optional[SpCitedSearch],
     spec_search_fn: Optional[CitedSearch],
     csm_search_fn: Optional[CitedSearch],
     keymap_facts: Optional[str],
@@ -738,7 +759,27 @@ def _evaluate_one_check(
         evidence_parts.append(narrative_text)
         citation_lookup.update(narrative_candidates)
     if "sp" in sources:
-        sp_text, sp_candidates = sp_search_fn(check.instruction, top_k=check.sp_top_k)
+        sp_text, sp_candidates, anchor_missing = sp_search_fn(check.instruction, top_k=check.sp_top_k)
+        if anchor_missing:
+            # The project HAS section metadata and the check's own named
+            # anchor still matched nothing -- a genuine, provable gap, not a
+            # pre-section-aware project where pinning simply can't work (see
+            # this module's docstring). No point spending an LLM call asking
+            # the model about text it was never given; report needs-review
+            # directly via the existing insufficient_evidence -> Missing
+            # mechanism (_derive_status), naming the anchor for the reviewer.
+            anchors = extract_anchors(check.instruction)
+            named = ", ".join((*anchors.sections, *anchors.tables))
+            return ReviewCheckResult(
+                id=check.check_key, category=check.category, name=check.name,
+                status="Missing",
+                evidence=(
+                    f"{named} was not found anywhere in this project's Special "
+                    "Provisions, which do have section-level metadata -- this "
+                    "check's named clause appears to be genuinely absent."
+                ),
+                source="special provision",
+            ), usage_totals
         evidence_parts.append(sp_text)
         citation_lookup.update(sp_candidates)
     if "keymap" in sources:
@@ -933,7 +974,7 @@ def evaluate_checks(
     checks: List[CheckDef],
     graph: Neo4jGraph,
     llm: BaseChatModel,
-    sp_search_fn: Optional[CitedSearch] = None,
+    sp_search_fn: Optional[SpCitedSearch] = None,
     spec_search_fn: Optional[CitedSearch] = None,
     csm_search_fn: Optional[CitedSearch] = None,
     keymap_facts: Optional[str] = None,

@@ -711,7 +711,7 @@ def test_evaluate_one_check_builds_verified_citation_from_matched_tag():
     def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Gas work is prohibited in July.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7),
-        }
+        }, False  # anchor_missing -- unrelated to this check, no anchor named
 
     result, _ = _call_evaluate_one_check(check, llm, judge, sp_search_fn=sp_search_fn)
 
@@ -737,7 +737,7 @@ def test_evaluate_one_check_flags_unmatched_citation_tag():
     def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Gas work is prohibited in July.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7),
-        }
+        }, False  # anchor_missing -- unrelated to this check, no anchor named
 
     result, _ = _call_evaluate_one_check(check, llm, judge, sp_search_fn=sp_search_fn)
 
@@ -791,7 +791,7 @@ def test_evaluate_one_check_grounding_unresolved_keeps_citations_from_final_answ
     def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Some SP text.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=1),
-        }
+        }, False  # anchor_missing -- unrelated to this check, no anchor named
 
     result, _ = _call_evaluate_one_check(
         check, llm, judge, sp_search_fn=sp_search_fn, keymap_facts="KEY MAP FACTS: ...",
@@ -849,6 +849,84 @@ def test_both_sp_closures_return_identical_passages_for_one_query():
     assert text_a == text_b
     assert tags_a == tags_b
     assert len(tags_a) == len(tags_b)
+
+
+def test_sp_anchor_missing_reports_missing_with_no_llm_call():
+    """anchor_missing=True means the project HAS section metadata and the
+    check's own named anchor (TABLE 105.05-1) matched nothing -- a genuine,
+    provable gap, unlike a project ingested before section-aware chunking
+    (which must degrade silently, see the next test). Must short-circuit to
+    Missing without ever calling the LLM, and must name the anchor so a
+    reviewer knows what to look for."""
+    check = _make_check(
+        check_key="working_drawing_review_time", source_files=["sp", "schedule"],
+        instruction=(
+            "Category is set by Table 105.05-1 - but the Special Provisions "
+            "often REPLACE that table."
+        ),
+    )
+
+    def sp_search_fn(query, top_k=8):
+        return "[cite:sp-0] unrelated clause text", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision"),
+        }, True  # anchor_missing
+
+    result, usage = _call_evaluate_one_check(
+        check, _FakeStructuredLLM([]), _FakeStructuredLLM([]), sp_search_fn=sp_search_fn,
+    )
+
+    assert result.status == "Missing"
+    assert "105.05" in result.evidence or "TABLE 105.05-1" in result.evidence
+    assert usage["llm_call_count"] == 0
+
+
+def test_sp_anchor_missing_false_behaves_exactly_as_before():
+    """anchor_missing=False -- whether because no anchor was named or the
+    project predates section-aware chunking and pinning couldn't work at all
+    -- must not skip anything: evidence still goes to the LLM exactly as it
+    did before this task."""
+    check = _make_check(source_files=["sp", "schedule"])
+    original = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=[],
+        evidence="Nothing relevant found", source="schedule",
+    )
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def sp_search_fn(query, top_k=8):
+        return "[cite:sp-0] some SP text", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision"),
+        }, False  # anchor_missing
+
+    result, usage = _call_evaluate_one_check(check, llm, judge, sp_search_fn=sp_search_fn)
+
+    assert result.status == "Pass"
+    assert usage["llm_call_count"] == 2  # original + judge
+    assert len(llm.calls) == 1
+
+
+def test_spec_search_fn_two_tuple_path_is_unaffected():
+    """spec/csm (and every other non-SP source) still return the plain
+    CitedSearch two-tuple -- this task's three-tuple change must stay
+    confined to the SP path, per this task's own scope note."""
+    check = _make_check(source_files=["spec"])
+    original = EvaluationSchema(evidence="Spec text found", source="spec 105.03")
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def spec_search_fn(query):
+        return "[cite:specs-0] Standard Spec text.", {
+            "specs-0": EvidenceCandidate(kind="public", doc_type="spec", label="Standard Specifications"),
+        }
+
+    result, usage = _call_evaluate_one_check(check, llm, judge, spec_search_fn=spec_search_fn)
+
+    assert result.status == "Pass"
+    assert usage["llm_call_count"] == 2  # original + judge
 
 
 if __name__ == "__main__":
