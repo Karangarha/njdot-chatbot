@@ -25,10 +25,11 @@ _INSTRUCTION = (
 )
 
 
-def _chunk(cid, section=None, tables=(), body="body"):
+def _chunk(cid, section=None, tables=(), body="body", chunk_index=0):
     return {
         "id": cid, "content": body, "doc_type": "special_provision",
-        "metadata": {"section_id": section, "tables": list(tables)}, "similarity": 0.5,
+        "metadata": {"section_id": section, "tables": list(tables), "chunk_index": chunk_index},
+        "similarity": 0.5,
     }
 
 
@@ -190,6 +191,22 @@ def test_case2_section_metadata_present_but_anchor_matches_nothing_is_a_genuine_
     out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=8)
     assert out.pinned == 0
     assert out.anchor_missing is True
+
+
+def test_pinned_rows_come_back_in_reading_order_not_supply_order():
+    # _chunk() used to never set chunk_index, so every pinned row sorted
+    # equal and a broken sort key in pin_by_anchors wouldn't be caught.
+    # Supply the rows out of order here and require the fix (chunk_index
+    # ascending) to put them back.
+    db = _FakeDB(
+        pinned=[
+            _chunk("c2", section="105.05", chunk_index=2),
+            _chunk("c0", section="105.05", chunk_index=0),
+            _chunk("c1", section="105.05", chunk_index=1),
+        ],
+    )
+    out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=8)
+    assert [r["id"] for r in out.rows] == ["c0", "c1", "c2"]
 
 
 def test_case3_no_anchor_in_the_instruction_is_neither():
