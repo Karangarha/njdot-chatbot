@@ -345,11 +345,20 @@ def _cosine(a: List[float], b: List[float]) -> float:
 
 def _sp_chunk_matches_anchors(chunk: Dict[str, Any], anchors: Any) -> bool:
     """Same pin test as ``check_retrieval.pin_by_anchors``, against an
-    in-memory chunk's metadata instead of a ``session_chunks`` row."""
+    in-memory chunk's metadata instead of a ``session_chunks`` row.
+
+    Uses ``anchors.pinnable_tables``, not ``anchors.tables``, for the same
+    reason ``pin_by_anchors`` does (see ``Anchors.pinnable_tables``): a bare
+    single-letter caption like "TABLE A" is ambiguous across documents, and
+    pinning bypasses ranking entirely, so a wrong pin is worse than no pin.
+    Keeping this in sync with ``pin_by_anchors`` matters beyond style -- the
+    two SP search closures are tested for parity
+    (test_both_sp_closures_return_identical_passages_for_one_query).
+    """
     metadata = chunk.get("metadata") or {}
     if metadata.get("section_id") in anchors.sections:
         return True
-    return bool(set(metadata.get("tables") or ()) & set(anchors.tables))
+    return bool(set(metadata.get("tables") or ()) & set(anchors.pinnable_tables))
 
 
 def _build_sp_search_fn(

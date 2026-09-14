@@ -87,9 +87,16 @@ def pin_by_anchors(
         # a table caption is either the whole identifier or nothing.
         for section in anchors.sections:
             conditions.append(f"metadata->>section_id.like.{section}.*")
-    for table in anchors.tables:
+    for table in anchors.pinnable_tables:
         # jsonb array containment: does metadata.tables include this caption?
+        # Bare single-letter captions ("TABLE A") are deliberately excluded
+        # by pinnable_tables -- see Anchors.pinnable_tables. They're still
+        # in anchors.as_query() for the keyword leg, where ranking (not an
+        # unconditional position-0 pin) moderates an ambiguous match.
         conditions.append(f"metadata->tables.cs.{json.dumps([table])}")
+
+    if not conditions:
+        return []
 
     rows = (
         db.table("session_chunks").select("*")

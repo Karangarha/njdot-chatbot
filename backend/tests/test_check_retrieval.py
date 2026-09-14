@@ -141,6 +141,37 @@ def test_pin_filter_adds_a_dot_bounded_prefix_clause_for_section_anchors():
     assert 'metadata->>section_id.like.105.05.*' in db.pin_filter
 
 
+def test_pin_filter_excludes_bare_single_letter_table_anchors():
+    """FINDING 3: a bare "TABLE A" must never enter the PIN filter -- it's
+    ambiguous across documents (three checks name the Construction
+    Scheduling Manual's "Table A"; an unrelated Special Provision can carry
+    its own unrelated "TABLE A"), and pinned rows bypass ranking entirely,
+    so a wrong pin is worse than no pin. A numbered caption stays
+    pinnable."""
+    from app.compliance.anchors import Anchors
+    from app.compliance.check_retrieval import pin_by_anchors
+
+    db = _FakeDB(pinned=[_chunk("t", tables=["TABLE 105.05-1"])])
+    pin_by_anchors(db, "p1", Anchors(tables=("TABLE 105.05-1", "TABLE A")), limit=8)
+
+    assert 'metadata->tables.cs.["TABLE 105.05-1"]' in db.pin_filter
+    assert "TABLE A" not in db.pin_filter
+
+
+def test_pin_by_anchors_returns_empty_when_only_an_ambiguous_table_is_named():
+    """No section anchor, and the only table anchor is the ambiguous "TABLE
+    A" -- nothing is left to pin. Must return [] rather than send a
+    malformed empty .or_() filter to PostgREST."""
+    from app.compliance.anchors import Anchors
+    from app.compliance.check_retrieval import pin_by_anchors
+
+    db = _FakeDB(pinned=[_chunk("wrong-doc-table-a", tables=["TABLE A"])])
+    rows = pin_by_anchors(db, "p1", Anchors(tables=("TABLE A",)), limit=8)
+
+    assert rows == []
+    assert db.pin_filter is None  # .or_() was never reached
+
+
 def test_pinned_results_are_capped_so_they_cannot_fill_the_budget():
     many = [_chunk(f"t{i}", section="105.05") for i in range(20)]
     db = _FakeDB(pinned=many, vector=[_chunk(f"v{i}") for i in range(20)], keyword=[])

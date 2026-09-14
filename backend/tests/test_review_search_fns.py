@@ -142,6 +142,33 @@ def test_build_sp_search_fn_no_anchor_named_is_not_missing():
     assert anchor_missing is False
 
 
+def test_build_sp_search_fn_does_not_pin_an_unrelated_bare_table_a():
+    """FINDING 3, in-process closure: ``_sp_chunk_matches_anchors`` claims to
+    be "the same pin test" as ``check_retrieval.pin_by_anchors``, which
+    excludes bare single-letter table anchors (see
+    Anchors.pinnable_tables) -- a chunk carrying an unrelated "TABLE A"
+    (e.g. the Special Provision's own unrelated table, coincidentally
+    sharing a caption with the Construction Scheduling Manual's "Table A"
+    a check actually means) must not be pinned into position 0."""
+    sp_chunks = [
+        {"content": "Unrelated SP table, coincidentally also called Table A.",
+         "metadata": {"section_id": None, "tables": ["TABLE A"], "chunk_index": 0}},
+        {"content": "The real best dense match for this query.",
+         "metadata": {"section_id": None, "tables": [], "chunk_index": 1}},
+    ]
+    sp_vectors = [[0.0, 1.0], [1.0, 0.0]]
+    embeddings = MagicMock()
+    embeddings.embed_query.return_value = [1.0, 0.0]  # matches the second chunk
+
+    search_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+    text, _candidates, _anchor_missing = search_fn(
+        "Construction Scheduling Manual Table A governs submittal review.", top_k=1,
+    )
+
+    assert "The real best dense match" in text
+    assert "coincidentally also called Table A" not in text
+
+
 def test_build_sp_search_fn_from_supabase_tags_rows_with_page_pdf():
     # "funding" has no section/table anchor, so retrieve_for_check's pinning
     # and anchor_missing probe both short-circuit before ever calling

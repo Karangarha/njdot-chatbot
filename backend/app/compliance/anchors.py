@@ -30,6 +30,14 @@ _SECTION_RE = re.compile(r"\b\d{3,4}\.\d{2}(?:\.\d{2})?\b|\bSECTION\s+\d{3}\b", 
 # this module is unchanged. See that module for why the identifier after
 # "TABLE" must be digit-led or a lone letter.
 
+# A bare single-letter caption ("TABLE A") carries no document-specific
+# information -- extract_anchors has no notion of which document a table
+# belongs to, so "TABLE A" in a check meant for the Construction Scheduling
+# Manual matches an unrelated "TABLE A" just as well in a project's Special
+# Provision. A numbered caption ("TABLE 105.05-1") is document-specific by
+# construction and stays safe to pin.
+_AMBIGUOUS_TABLE_RE = re.compile(r"^TABLE\s+[A-Z]$", re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class Anchors:
@@ -39,6 +47,16 @@ class Anchors:
     @property
     def is_empty(self) -> bool:
         return not self.sections and not self.tables
+
+    @property
+    def pinnable_tables(self) -> Tuple[str, ...]:
+        """Table anchors safe to PIN by exact metadata match -- excludes
+        bare single-letter captions like "TABLE A", which are ambiguous
+        across documents and would pin an irrelevant passage at position 0
+        (pinned rows bypass ranking entirely, so a bad pin is worse than no
+        pin). Still included in ``tables``/``as_query()`` so the keyword leg
+        can retrieve it and ranking can moderate it normally."""
+        return tuple(t for t in self.tables if not _AMBIGUOUS_TABLE_RE.match(t))
 
     def as_query(self) -> str:
         """The BM25 query: anchors only, never the rule body."""

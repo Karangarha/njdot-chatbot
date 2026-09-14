@@ -84,6 +84,24 @@ def test_extracts_a_single_letter_table_from_construction_scheduling_manual():
     assert a.tables == ("TABLE A",)
 
 
+def test_pinnable_tables_excludes_bare_single_letter_captions():
+    """FINDING 3: a bare "TABLE A" is ambiguous across documents -- three
+    checks name the Construction Scheduling Manual's "Table A", and an
+    unrelated Special Provision in the measured project happens to carry its
+    own unrelated "TABLE A". Pinned rows bypass ranking entirely, so it must
+    be excluded from pinnable_tables (used by the PIN filter) while staying
+    in tables/as_query() so the keyword leg can still retrieve it and
+    ranking can moderate the match. A numbered caption is document-specific
+    by construction and stays pinnable."""
+    a = extract_anchors(
+        "Special Provisions 105.05 WORKING DRAWINGS: \"TABLE 105.05-1 IS CHANGED TO\" "
+        "and Construction Scheduling Manual Table A."
+    )
+    assert a.tables == ("TABLE 105.05-1", "TABLE A")
+    assert a.pinnable_tables == ("TABLE 105.05-1",)
+    assert "TABLE A" in a.as_query()
+
+
 def test_working_drawing_review_time_yields_no_prose_table_anchor():
     # Regression pin for the real bug: this check's actual catalog instruction
     # contains "Read the table carefully" and "table gets applied by mistake",
