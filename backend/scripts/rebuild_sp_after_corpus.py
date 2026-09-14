@@ -131,11 +131,24 @@ def stitch(rows: List[Dict[str, Any]]) -> Tuple[str, Dict[str, Any]]:
     return _ENC.decode(stitched), stats
 
 
+def _assert_local_host(url: str) -> None:
+    """Refuse to insert/delete real rows against anything but the local
+    Supabase container. Same check as
+    backend/tests/integration/conftest.py's ``local_db`` fixture (keep the
+    two in sync) -- this script writes 500+ rows through ``get_db()``, and
+    if ``local.env.local`` is missing, ``load_dotenv`` silently does
+    nothing and the insert lands on whatever database ``.env`` names
+    instead, which may be the hosted database."""
+    if "localhost" not in url and "127.0.0.1" not in url and "kong" not in url:
+        raise SystemExit(f"refusing to run against a non-local host: {url!r}")
+
+
 def rebuild(from_session: str, new_session: str) -> str:
     from app.config import config
     from app.database import get_db
     from langchain_openai import OpenAIEmbeddings
 
+    _assert_local_host(config.SUPABASE_URL)
     db = get_db()
     rows = _fetch_ordered_chunks(db, from_session)
     if not rows:
