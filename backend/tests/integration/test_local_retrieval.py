@@ -84,7 +84,22 @@ def test_websearch_tsquery_actually_matches_a_hyphenated_section_number(local_db
     assert any("TABLE 105.05-1" in r["content"] for r in rows)
 
 
-def test_a_phrase_anchor_is_found_by_the_keyword_leg(local_db, seeded_project):
+def test_naming_a_section_retrieves_the_passage_it_names(local_db, seeded_project):
+    """An instruction naming section 105.07.02 gets, first, the passage
+    containing the safe-time clause -- checked case-insensitively, since the
+    fixture text capitalizes "Safe-time" at the start of a sentence.
+
+    This does NOT exercise a "keyword leg finds a quoted phrase" path --
+    no such path exists. app.compliance.anchors.extract_anchors only ever
+    extracts section/table identifiers; a quoted phrase like "safe-time" is
+    never captured and never reaches keyword_search_session_chunks as a
+    query term. The passage surfaces here because 105.07.02 is itself a
+    section anchor, pinned ahead of ranking by pin_by_anchors -- the same
+    mechanism test_the_named_table_is_pinned_first_on_ten_consecutive_runs
+    already covers. This test asserts only the end-to-end retrieval outcome,
+    not which layer produced it. See "Phrase anchors are not implemented" in
+    docs/superpowers/specs/2026-09-14-hybrid-check-retrieval-design.md.
+    """
     from app.compliance.check_retrieval import retrieve_for_check
 
     project_id, emb = seeded_project
@@ -93,4 +108,5 @@ def test_a_phrase_anchor_is_found_by_the_keyword_leg(local_db, seeded_project):
         "Special Provisions 105.07.02: \"safe-time\", \"fiber optic cable splicing\".\n\nCheck night work.",
         top_k=8,
     )
-    assert any("safe-time" in r["content"] for r in out.rows)
+    assert out.rows, "no rows retrieved"
+    assert "safe-time" in out.rows[0]["content"].lower()
