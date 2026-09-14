@@ -910,6 +910,44 @@ def test_both_sp_closures_agree_when_instruction_names_parent_section():
     assert anchor_missing_a == anchor_missing_b
 
 
+def test_both_sp_closures_agree_zero_budget_is_starvation_not_a_missing_anchor():
+    """FINDING 1: check_retrieval.retrieve_for_check only calls a missing
+    anchor a genuine gap when pin_limit > 0 -- at top_k<=0 pin_by_anchors
+    never even runs (its own limit<=0 guard), so an empty pin there is
+    budget starvation, not proof the anchor is absent (see
+    test_check_retrieval.test_top_k_zero_is_budget_starvation_not_a_missing_anchor).
+    The in-process closure's own anchor_missing never got that guard. Proves
+    the two can't silently diverge again: if either path drops the
+    ``pin_limit > 0`` guard, this project (which genuinely has section
+    metadata elsewhere) makes that one path report True while the other
+    still reports False.
+    """
+    from app.api.review import _build_sp_search_fn, _build_sp_search_fn_from_supabase
+    from test_check_retrieval import _FakeDB, _chunk, _INSTRUCTION
+
+    # Non-empty so the Supabase closure's "does this project have SP chunks"
+    # existence probe passes -- pin_by_anchors itself is never reached at
+    # top_k=0 (pin_limit forces it to short-circuit before touching the DB),
+    # so this fixture cannot accidentally get pinned.
+    other_chunk = _chunk("other", section="900.01", body="Unrelated clause.")
+
+    embed_fn = lambda q: [0.0, 0.0, 0.0]  # noqa: E731
+    embeddings = SimpleNamespace(embed_query=embed_fn)
+
+    db = _FakeDB(pinned=[other_chunk], vector=[], keyword=[], metadata_rows=[other_chunk])
+    supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
+
+    sp_chunks = [other_chunk]
+    sp_vectors = [[0.0, 0.0, 0.0]]
+    memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+
+    _text_a, _candidates_a, anchor_missing_a = supabase_fn(_INSTRUCTION, top_k=0)
+    _text_b, _candidates_b, anchor_missing_b = memory_fn(_INSTRUCTION, top_k=0)
+
+    assert anchor_missing_a == anchor_missing_b
+    assert anchor_missing_a is False
+
+
 def test_sp_anchor_missing_sole_source_reports_missing_with_no_llm_call():
     """anchor_missing=True means the project HAS section metadata and the
     check's own named anchor (TABLE 105.05-1) matched nothing in the Special

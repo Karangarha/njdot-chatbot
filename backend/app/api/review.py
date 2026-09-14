@@ -416,8 +416,15 @@ def _build_sp_search_fn(
         # Mirrors retrieve_for_check's three-way split: a missing anchor is
         # only evidence of a genuine gap when this project's chunks carry
         # section metadata at all (see check_retrieval.project_has_section_metadata).
+        # Also requires pin_limit > 0, same as retrieve_for_check's own guard:
+        # at pin_limit == 0 pinning never even ran, so an empty `pinned` here
+        # is budget starvation, not proof the anchor is absent -- without
+        # this, this closure and retrieve_for_check disagreed at any
+        # non-positive top_k.
         anchor_missing = (
-            not anchors.is_empty and not pinned
+            pin_limit > 0
+            and not anchors.is_empty
+            and not pinned
             and any((c.get("metadata") or {}).get("section_id") for c in sp_chunks)
         )
         if not top:
