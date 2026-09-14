@@ -48,6 +48,7 @@ class _FakeDB:
         # the split keep the old behaviour (one fixture answers both).
         self._metadata_rows = list(pinned) if metadata_rows is None else list(metadata_rows)
         self.keyword_query = None
+        self.pin_filter = None
 
     def rpc(self, name, params):
         outer = self
@@ -64,14 +65,15 @@ class _FakeDB:
         return _R()
 
     def table(self, _name):
-        return _FakeTable(pinned=self._pinned, metadata_rows=self._metadata_rows)
+        return _FakeTable(pinned=self._pinned, metadata_rows=self._metadata_rows, outer=self)
 
 
 class _FakeTable:
-    def __init__(self, pinned, metadata_rows):
+    def __init__(self, pinned, metadata_rows, outer=None):
         self._pinned = pinned
         self._metadata_rows = metadata_rows
         self._select_cols = None
+        self._outer = outer
 
     def select(self, cols="*", *a, **k):
         # The metadata probe asks for select("metadata"); the pin query
@@ -92,7 +94,12 @@ class _FakeTable:
         return self
 
     def is_(self, *a, **k): return self
-    def or_(self, *a, **k): return self
+
+    def or_(self, filter_str, *a, **k):
+        if self._outer is not None:
+            self._outer.pin_filter = filter_str
+        return self
+
     def limit(self, *a, **k): return self
     def order(self, *a, **k): return self
 
@@ -119,6 +126,19 @@ def test_the_bm25_query_is_anchors_only_never_the_rule_body():
     assert "105.05" in db.keyword_query
     assert "Classify each submittal" not in db.keyword_query
     assert len(db.keyword_query.split()) <= 12
+
+
+def test_pin_filter_adds_a_dot_bounded_prefix_clause_for_section_anchors():
+    """FINDING 2: pinning must not require an exact section_id match -- a
+    check naming the parent "105.07" has to also pin a document whose actual
+    heading is the child "105.07.02". The PostgREST filter this builds uses
+    "like" with a literal ".*" suffix (PostgREST's documented stand-in for
+    SQL LIKE's "%"), so the boundary is a dot, not a bare string prefix --
+    proven end-to-end against the real filter in
+    backend/tests/integration/test_local_retrieval.py."""
+    db = _FakeDB(pinned=[_chunk("t", section="105.05", tables=["TABLE 105.05-1"])])
+    retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=8)
+    assert 'metadata->>section_id.like.105.05.*' in db.pin_filter
 
 
 def test_pinned_results_are_capped_so_they_cannot_fill_the_budget():

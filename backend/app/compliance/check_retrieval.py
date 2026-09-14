@@ -77,6 +77,16 @@ def pin_by_anchors(
     if anchors.sections:
         quoted = ",".join(f'"{s}"' for s in anchors.sections)
         conditions.append(f"metadata->>section_id.in.({quoted})")
+        # A check naming the parent section (e.g. "105.07") must also pin
+        # chunks headed by its children ("105.07.01", "105.07.02") -- exact
+        # match alone misses every document whose headings only go one level
+        # deeper than the anchor. The boundary is a literal dot, so "105.0"
+        # does NOT match "105.07" (that's a different section, not a parent):
+        # PostgREST's "*" is its documented stand-in for the SQL LIKE "%"
+        # wildcard. Section anchors only -- table anchors are excluded below,
+        # a table caption is either the whole identifier or nothing.
+        for section in anchors.sections:
+            conditions.append(f"metadata->>section_id.like.{section}.*")
     for table in anchors.tables:
         # jsonb array containment: does metadata.tables include this caption?
         conditions.append(f"metadata->tables.cs.{json.dumps([table])}")

@@ -84,6 +84,35 @@ def test_websearch_tsquery_actually_matches_a_hyphenated_section_number(local_db
     assert any("TABLE 105.05-1" in r["content"] for r in rows)
 
 
+def test_a_parent_section_anchor_pins_its_child_heading(local_db, seeded_project):
+    """FINDING 2 regression: a check naming the parent section "105.07" must
+    still pin a document whose actual heading is the child "105.07.02" --
+    exact match alone misses this (see test_check_retrieval.py's unit-level
+    coverage of the same boundary with a fake DB). Proven here against the
+    real PostgREST `like` filter, not a fake that can't disagree with the
+    code under test."""
+    from app.compliance.anchors import Anchors
+    from app.compliance.check_retrieval import pin_by_anchors
+
+    project_id, _ = seeded_project
+    rows = pin_by_anchors(local_db, project_id, Anchors(sections=("105.07",)), limit=8)
+    assert rows, "parent-section anchor '105.07' must pin the child heading '105.07.02'"
+    assert all(r["metadata"].get("section_id") == "105.07.02" for r in rows)
+
+
+def test_a_bare_string_prefix_does_not_pin_an_unrelated_section(local_db, seeded_project):
+    """The boundary must be a literal dot, not a bare string prefix: "105.0"
+    is a plausible-looking but WRONG parent of "105.07" (it isn't one -- 0
+    and 7 are siblings' leading digits, not a section/subsection
+    relationship), and must not pin it."""
+    from app.compliance.anchors import Anchors
+    from app.compliance.check_retrieval import pin_by_anchors
+
+    project_id, _ = seeded_project
+    rows = pin_by_anchors(local_db, project_id, Anchors(sections=("105.0",)), limit=8)
+    assert rows == [], "\"105.0\" must not match \"105.07.02\" -- the shared prefix isn't a dot boundary"
+
+
 def test_naming_a_section_retrieves_the_passage_it_names(local_db, seeded_project):
     """An instruction naming section 105.07.02 gets, first, the passage
     containing the safe-time clause -- checked case-insensitively, since the
