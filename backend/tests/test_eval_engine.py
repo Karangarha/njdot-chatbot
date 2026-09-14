@@ -835,12 +835,19 @@ def test_both_sp_closures_return_identical_passages_for_one_query():
     db = _FakeDB(pinned=[pinned_chunk], vector=[vector_chunk1, vector_chunk2], keyword=())
     supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
 
-    sp_chunks = [pinned_chunk, vector_chunk1, vector_chunk2]
+    # pinned_chunk is deliberately NOT first here (unlike the Supabase
+    # closure's separate `pinned=` fixture above, which is pin-only by
+    # construction and so can't prove anything about ordering). If the
+    # in-process closure's pinning were disabled, a stable sort over this
+    # list would leave pinned_chunk last -- so this fixture only produces
+    # sp-0/sp-1/sp-2 order matching the Supabase closure when pinning
+    # actually moves it to the front.
+    sp_chunks = [vector_chunk1, vector_chunk2, pinned_chunk]
     sp_vectors = [[0.0, 0.0, 0.0]] * 3
     memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
 
-    text_a, _candidates_a, _anchor_missing_a = supabase_fn(_INSTRUCTION, top_k=8)
-    text_b, _candidates_b, _anchor_missing_b = memory_fn(_INSTRUCTION, top_k=8)
+    text_a, _candidates_a, anchor_missing_a = supabase_fn(_INSTRUCTION, top_k=8)
+    text_b, _candidates_b, anchor_missing_b = memory_fn(_INSTRUCTION, top_k=8)
 
     tags_a = re.findall(r"\[cite:(sp-\d+)\]", text_a)
     tags_b = re.findall(r"\[cite:(sp-\d+)\]", text_b)
@@ -849,6 +856,7 @@ def test_both_sp_closures_return_identical_passages_for_one_query():
     assert text_a == text_b
     assert tags_a == tags_b
     assert len(tags_a) == len(tags_b)
+    assert anchor_missing_a == anchor_missing_b
 
 
 def test_sp_anchor_missing_reports_missing_with_no_llm_call():
