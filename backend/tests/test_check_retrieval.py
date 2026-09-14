@@ -83,7 +83,14 @@ class _FakeTable:
 
     def eq(self, *a, **k): return self
     def in_(self, *a, **k): return self
-    def not_(self, *a, **k): return self
+
+    @property
+    def not_(self):
+        # Real postgrest-py's .not_ is a property (see
+        # postgrest.base_request_builder.BaseFilterRequestBuilder.not_), not
+        # a method -- callers chain `.not_.is_(...)`, no parens.
+        return self
+
     def is_(self, *a, **k): return self
     def or_(self, *a, **k): return self
     def limit(self, *a, **k): return self
@@ -222,6 +229,57 @@ def test_case3_no_anchor_in_the_instruction_is_neither():
         db, lambda q: [0.0] * 3, "p1", "Confirm the narrative addresses community commitments.", top_k=8,
     )
     assert out.anchor_missing is False
+
+
+def test_project_has_section_metadata_finds_a_later_row_not_just_the_first():
+    """Old bug: reading one arbitrary row and inspecting only ITS section_id
+    could land on a row that happens to lack it even when a sibling row in
+    the same project has one, silently losing the genuine-gap signal. The
+    shared _FakeDB/_FakeTable above don't apply real filters (they just hand
+    back a fixture), so this needs a small fake that actually honors the
+    not.is.null filter server-side, to prove the fix asks "does ANY row have
+    section_id", not "does the first row returned"."""
+    from app.compliance.check_retrieval import project_has_section_metadata
+
+    class _FilteringTable:
+        def __init__(self, rows):
+            self._rows, self._negate = rows, False
+
+        def select(self, *a, **k): return self
+        def eq(self, *a, **k): return self
+
+        @property
+        def not_(self):
+            self._negate = True
+            return self
+
+        def is_(self, column, value):
+            assert value in (None, "null")
+            field = column.rsplit("->>", 1)[-1]
+            has_field = lambda r: (r.get("metadata") or {}).get(field) is not None
+            self._rows = [r for r in self._rows if has_field(r) == self._negate]
+            self._negate = False
+            return self
+
+        def limit(self, n):
+            self._rows = self._rows[:n]
+            return self
+
+        def execute(self):
+            return type("X", (), {"data": self._rows})()
+
+    class _FilteringDB:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def table(self, _name):
+            return _FilteringTable(self._rows)
+
+    # The row an unordered `.limit(1)` might return first has no section_id;
+    # a later row does.
+    rows = [{"metadata": {"section_id": None}}, {"metadata": {"section_id": "105.05"}}]
+    assert project_has_section_metadata(_FilteringDB(rows), "p1") is True
+    assert project_has_section_metadata(_FilteringDB([{"metadata": {}}]), "p1") is False
 
 
 if __name__ == "__main__":

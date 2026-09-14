@@ -40,21 +40,26 @@ _PIN_OVERFETCH = 5
 
 
 def project_has_section_metadata(db: Any, project_id: str, doc_type: str = "special_provision") -> bool:
-    """Whether this project's chunks carry section_id metadata at all.
+    """Whether ANY of this project's chunks carry section_id metadata --
+    the same question the in-process closure asks with
+    ``any(... .get("section_id") ...)`` over its in-memory chunk list.
 
-    Ingestion is uniform per project: a project either went through the
-    section-aware chunker (Task 6) and every chunk of this doc_type has a
-    section_id, or it was ingested before that and none do (confirmed
-    against the local database -- a pre-Task-6 project's SP chunks carry no
-    section_id whatsoever). So one row answers for the whole project; no
-    need to scan every chunk.
+    Ingestion is normally uniform per project (a project either went through
+    the section-aware chunker (Task 6) and every chunk of this doc_type has
+    a section_id, or it was ingested before that and none do), but an
+    unordered `.limit(1)` with no filter can still land on the one chunk
+    that happens to lack section_id even when a sibling chunk has it,
+    misreporting a real gap as "no metadata anywhere". Filtering server-side
+    for a non-null section_id before capping to one row keeps this a cheap
+    existence check rather than a scan of every chunk's content.
     """
     rows = (
         db.table("session_chunks").select("metadata")
         .eq("session_id", project_id).eq("doc_type", doc_type)
+        .not_.is_("metadata->>section_id", "null")
         .limit(1).execute().data
     ) or []
-    return bool(rows) and bool((rows[0].get("metadata") or {}).get("section_id"))
+    return bool(rows)
 
 
 def pin_by_anchors(
