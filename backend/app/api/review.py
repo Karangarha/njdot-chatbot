@@ -60,7 +60,7 @@ from app.compliance.check_retrieval import PIN_BUDGET_FRACTION, retrieve_for_che
 from app.compliance.cost import CostGapResult, evaluate_cost_gap
 from app.compliance.edq import EdqCoverageResult, evaluate_edq_coverage, match_edq_items_to_activities
 from app.compliance.date_rule import DateRuleResult, evaluate_date_rules
-from app.compliance.eval_engine import CitedSearch, EvidenceCandidate, evaluate_checks
+from app.compliance.eval_engine import CitedSearch, EvidenceCandidate, SpCitedSearch, evaluate_checks
 from app.compliance.geo import RegionResult, resolve_region
 from app.compliance.schedule_logic import ScheduleLogicResult, evaluate_schedule_logic
 from app.config import config
@@ -341,15 +341,6 @@ def _cosine(a: List[float], b: List[float]) -> float:
     va, vb = np.array(a), np.array(b)
     denom = np.linalg.norm(va) * np.linalg.norm(vb)
     return float(np.dot(va, vb) / denom) if denom else 0.0
-
-
-# The SP closures also report whether the instruction named a section/table
-# anchor this project's chunks genuinely lack (see
-# check_retrieval.RetrievalResult.anchor_missing) -- a three-tuple, and its
-# own alias distinct from CitedSearch. CitedSearch itself (spec,
-# scheduling-manual, key-map, estimate) stays a two-tuple unchanged: those
-# searches have no anchors.
-SpCitedSearch = Callable[..., Tuple[str, Dict[str, EvidenceCandidate], bool]]
 
 
 def _sp_chunk_matches_anchors(chunk: Dict[str, Any], anchors: Any) -> bool:
