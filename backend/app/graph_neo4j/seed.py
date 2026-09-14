@@ -25,6 +25,13 @@ from app.graph_neo4j.schema import ensure_constraints
 
 logger = logging.getLogger(__name__)
 
+# Bump whenever seed_schedule writes a property the deterministic checks
+# read that older seeds lack or computed differently (2: Calendar
+# exceptionDates/workExceptionDates, Activity hasFreeFloatNote, and the
+# relType-aware isOpenStart/isOpenEnd). Stored on the Project node; the
+# review rerun fast path re-seeds the schedule graph when it doesn't match.
+SEED_VERSION = 2
+
 
 def clear_project(graph: Neo4jGraph, project_id: str) -> None:
     """Delete all nodes tagged with this projectId (and their relationships)."""
@@ -271,12 +278,16 @@ def seed_schedule(
                 "driving": (pid, aid) in driving_pairs,
             })
     if prec_rows:
+        # relType is part of the MERGE key: P6 allows several relationships
+        # of different types between one pair (SS+FF, FS+SS), and a
+        # pair-only MERGE would keep just the last row written -- hiding an
+        # FS lag behind a lag-free SS from evaluate_no_lag.
         graph.query(
             "UNWIND $rows AS row "
             "MATCH (p:Activity {taskId: row.predId, projectId: $projectId}), "
             "      (s:Activity {taskId: row.succId, projectId: $projectId}) "
-            "MERGE (p)-[r:PRECEDES]->(s) "
-            "SET r.relType = row.relType, r.lagDays = row.lagDays, r.driving = row.driving",
+            "MERGE (p)-[r:PRECEDES {relType: row.relType}]->(s) "
+            "SET r.lagDays = row.lagDays, r.driving = row.driving",
             params={"rows": prec_rows, "projectId": project_id},
         )
 
@@ -301,6 +312,7 @@ def seed_schedule(
         # Precomputed so a re-run can read the duration straight back without
         # re-parsing the XER / re-running CPM — see review.py's reseed=False path.
         "durationDays": duration_days,
+        "seedVersion": SEED_VERSION,
     }
     graph.query(
         "MERGE (p:Project {projectId: $projectId}) SET p += $props",

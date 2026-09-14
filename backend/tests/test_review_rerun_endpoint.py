@@ -28,6 +28,7 @@ from app.api.review import (  # noqa: E402
     _run_review_rerun_background,
     review_rerun_endpoint,
 )
+from app.graph_neo4j.seed import SEED_VERSION  # noqa: E402
 
 
 class _FakeBackgroundTasks:
@@ -270,42 +271,81 @@ def test_run_review_rerun_background_failure_sets_error():
     assert len(db._table.updates) == 0  # never reached the DB update
 
 
+def _fast_path_patches(graph):
+    """Every external dependency the reseed=False path touches, as a list of
+    patch() context managers -- shared by the two fast-path tests below."""
+    return [
+        patch("app.api.review.get_neo4j", return_value=graph),
+        patch("app.api.review.get_db", return_value=MagicMock()),
+        patch("app.api.review.OpenAIEmbeddings", return_value=MagicMock()),
+        patch("app.api.review.ChatOpenAI", return_value=MagicMock()),
+        patch("app.api.review.ChatAnthropic", return_value=MagicMock()),
+        patch("app.api.review._read_project_summary", return_value=("Proj", 10)),
+        patch("app.api.review._build_sp_search_fn_from_supabase", return_value=None),
+        patch("app.api.review._build_utility_plan_search_fn_from_supabase", return_value=None),
+        patch("app.api.review._read_keymap_extraction_from_supabase", return_value=None),
+        patch("app.api.review._read_estimate_extraction_from_supabase", return_value=None),
+        patch("app.api.review._seed_edq_items_if_needed"),
+        patch("app.api.review.evaluate_edq_coverage", return_value=None),
+        patch("app.api.review.evaluate_schedule_logic", return_value={}),
+        patch("app.api.review.evaluate_date_rules", return_value={}),
+        patch("app.api.review._build_static_doc_search_fn", return_value=None),
+        patch("app.api.review.evaluate_checks", return_value=[]),
+    ]
+
+
 def test_run_review_pipeline_rerun_reports_single_fast_path_message():
-    """reseed=False, project already seeded (graph.query returns a nonzero
-    count so it doesn't fall back to a full reseed) -- the fast path is a
-    single stage, not six conditional ones. No manual _review_progress
-    clear needed -- this file's setup_function (above) already clears it
-    before every test."""
+    """reseed=False, project already seeded at the current SEED_VERSION (so
+    it neither falls back to a full reseed nor refreshes the schedule graph)
+    -- the fast path is a single stage, not six conditional ones. No manual
+    _review_progress clear needed -- this file's setup_function (above)
+    already clears it before every test."""
     graph = MagicMock()
-    graph.query.return_value = [{"c": 1}]
-    with patch("app.api.review.get_neo4j", return_value=graph), \
-         patch("app.api.review.get_db", return_value=MagicMock()), \
-         patch("app.api.review.OpenAIEmbeddings", return_value=MagicMock()), \
-         patch("app.api.review.ChatOpenAI", return_value=MagicMock()), \
-         patch("app.api.review.ChatAnthropic", return_value=MagicMock()), \
-         patch("app.api.review._read_project_summary", return_value=("Proj", 10)), \
-         patch("app.api.review._build_sp_search_fn_from_supabase", return_value=None), \
-         patch("app.api.review._build_utility_plan_search_fn_from_supabase", return_value=None), \
-         patch("app.api.review._read_keymap_extraction_from_supabase", return_value=None), \
-         patch("app.api.review._read_estimate_extraction_from_supabase", return_value=None), \
-         patch("app.api.review._seed_edq_items_if_needed"), \
-         patch("app.api.review.evaluate_edq_coverage", return_value=None), \
-         patch("app.api.review.evaluate_schedule_logic", return_value={}), \
-         patch("app.api.review._build_static_doc_search_fn", return_value=None), \
-         patch("app.api.review.evaluate_checks", return_value=[]), \
-         patch("app.api.review._set_review_progress") as mock_progress:
+    graph.query.return_value = [{"seedVersion": SEED_VERSION}]
+    with contextlib.ExitStack() as stack:
+        for p in _fast_path_patches(graph):
+            stack.enter_context(p)
+        reseed_schedule = stack.enter_context(patch("app.api.review._seed_schedule_graph"))
+        mock_progress = stack.enter_context(patch("app.api.review._set_review_progress"))
         _run_review_pipeline(
             schedule_bytes=b"", narrative_bytes=b"", sp_bytes=None,
             keymap_bytes=None, estimate_bytes=None, selected_checks=None,
             project_id="p1", reseed=False, user_id="user-1",
         )
 
+    reseed_schedule.assert_not_called()
     messages = [c.kwargs.get("message") for c in mock_progress.call_args_list]
     assert messages == [
         "Loading saved project data…",
         "Preparing compliance checklist…",
         "Running compliance checks (0/57)…",
     ]
+
+
+def test_run_review_pipeline_rerun_refreshes_stale_schedule_graph():
+    """A project seeded by an older build (Project.seedVersion behind
+    SEED_VERSION, or absent) has Calendar/Activity properties the
+    deterministic checks read missing or stale -- the fast path must re-seed
+    the schedule graph from the stored XER bytes before evaluating, without
+    falling back to a full reseed of narrative/SP/key-map data."""
+    graph = MagicMock()
+    graph.query.return_value = [{"seedVersion": None}]
+    with contextlib.ExitStack() as stack:
+        for p in _fast_path_patches(graph):
+            stack.enter_context(p)
+        reseed_schedule = stack.enter_context(patch("app.api.review._seed_schedule_graph"))
+        seed_narrative = stack.enter_context(patch("app.api.review.seed_narrative"))
+        mock_progress = stack.enter_context(patch("app.api.review._set_review_progress"))
+        _run_review_pipeline(
+            schedule_bytes=b"XER", narrative_bytes=b"", sp_bytes=None,
+            keymap_bytes=None, estimate_bytes=None, selected_checks=None,
+            project_id="p1", reseed=False, user_id="user-1",
+        )
+
+    reseed_schedule.assert_called_once_with(graph, b"XER", "p1")
+    seed_narrative.assert_not_called()  # schedule side only -- not a full reseed
+    messages = [c.kwargs.get("message") for c in mock_progress.call_args_list]
+    assert messages[:2] == ["Refreshing schedule graph…", "Loading saved project data…"]
 
 
 if __name__ == "__main__":

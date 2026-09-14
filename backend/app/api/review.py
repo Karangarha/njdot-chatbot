@@ -64,6 +64,7 @@ from app.compliance.schedule_logic import ScheduleLogicResult, evaluate_schedule
 from app.config import config
 from app.database import get_db
 from app.graph_neo4j.seed import (
+    SEED_VERSION,
     seed_edq_items,
     seed_narrative,
     seed_schedule,
@@ -116,10 +117,14 @@ _CSM_COLLECTION = "scheduling"    # Construction Scheduling Manual
 # ReviewCheckResult.status's Pass/Fail/Missing -> the frontend's existing lowercase enum.
 _STATUS_MAP = {"Pass": "pass", "Fail": "fail", "Missing": "warning"}
 
-# Fallback check_type by check_key, for `checks` payloads sent by a frontend
-# that predates the field — see _parse_checks.
-_BUILTIN_CHECK_TYPES = {c.check_key: c.check_type for c in BUILTIN_CHECKS}
-_BUILTIN_SP_TOP_K = {c.check_key: c.sp_top_k for c in BUILTIN_CHECKS}
+# Built-in check_key -> CheckDef. check_type/sp_top_k are engine dispatch,
+# not user data: a forked compliance_checks row (frontend checklist.ts
+# ensureForked) carries whatever check_type was current when the user first
+# edited their checklist and is never re-synced, so for built-ins the
+# payload's value is ignored and the catalog's is used unconditionally
+# (otherwise a stale "llm" keeps a since-deterministic check on the LLM
+# path). Custom checks keep what the payload says. See _parse_checks.
+_BUILTIN_BY_KEY = {c.check_key: c for c in BUILTIN_CHECKS}
 
 
 # ── In-process review progress store ────────────────────────────────────────
@@ -694,23 +699,19 @@ def _parse_checks(raw: Optional[str]) -> Optional[List[CheckDef]]:
         if not isinstance(item, dict):
             raise HTTPException(status_code=400, detail=f"checks[{i}] must be an object")
         try:
+            builtin = _BUILTIN_BY_KEY.get(item["check_key"])
             checks.append(CheckDef(
                 check_key=item["check_key"],
                 category=item["category"],
                 name=item["name"],
                 instruction=item.get("instruction", ""),
-                # Catalog-lookup fallback covers payloads from frontends that
-                # predate check_type in CheckSpec — without it a deterministic
-                # check would silently run as an ordinary LLM call.
-                check_type=(item.get("check_type")
-                            or _BUILTIN_CHECK_TYPES.get(item["check_key"], "llm")),
+                # Built-ins: always the catalog's dispatch fields (see
+                # _BUILTIN_BY_KEY) -- a stale forked row must not route a
+                # deterministic check through the LLM. Custom checks: the
+                # payload's value, defaulting to the dataclass defaults.
+                check_type=builtin.check_type if builtin else (item.get("check_type") or "llm"),
                 source_files=item.get("source_files") or ["schedule"],
-                # Same fallback pattern as check_type: payloads from frontends
-                # that predate sp_top_k in CheckSpec fall back to the catalog's
-                # per-check default rather than the dataclass default of 8,
-                # so table-heavy checks keep their raised top_k on this path too.
-                sp_top_k=(item.get("sp_top_k")
-                          or _BUILTIN_SP_TOP_K.get(item["check_key"], 8)),
+                sp_top_k=builtin.sp_top_k if builtin else (item.get("sp_top_k") or 8),
             ))
         except KeyError as exc:
             raise HTTPException(
@@ -762,6 +763,32 @@ def _to_frontend_shape(response: ReviewResponse) -> dict:
     }
 
 
+def _seed_schedule_graph(
+    graph: Any, schedule_bytes: bytes, project_id: str,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Any]:
+    """Parse the XER -> CPM -> cross-check -> ``seed_schedule``. Returns
+    ``(activities, project, cpm)``. CPM failure is non-fatal (the graph is
+    seeded without computed values; ``Project.computedCount`` stays unset
+    so the deterministic checks report Missing rather than a false Pass).
+    Shared by the fresh-review path and the rerun path's stale-seed refresh.
+    """
+    xer_text = schedule_bytes.decode("utf-8", errors="ignore")
+    parsed = parse_xer_all(xer_text)
+    activities = parsed["activities"]
+    calendars = parsed["calendars"]
+    project = parsed["project"]
+
+    cpm = xcheck = None
+    try:
+        cpm = run_cpm(build_network(activities), build_calendars(calendars), project)
+        xcheck = cross_check(activities, cpm)
+    except Exception:
+        logger.exception("CPM computation failed; review proceeds without computed values")
+
+    seed_schedule(graph, activities, calendars, cpm, xcheck, project, project_id=project_id)
+    return activities, project, cpm
+
+
 def _run_review_pipeline(
     schedule_bytes: bytes,
     narrative_bytes: bytes,
@@ -806,35 +833,33 @@ def _run_review_pipeline(
 
     if not reseed:
         existing = graph.query(
-            "MATCH (a:Activity {projectId: $pid}) RETURN count(a) AS c LIMIT 1",
+            "MATCH (p:Project {projectId: $pid}) RETURN p.seedVersion AS seedVersion LIMIT 1",
             params={"pid": project_id},
         )
-        reseed = not existing or not existing[0]["c"]
+        reseed = not existing
         if reseed:
             logger.warning(
                 "_run_review_pipeline: project_id=%s has no seeded graph data; "
                 "falling back to a full reseed", project_id,
             )
+        elif existing[0].get("seedVersion") != SEED_VERSION:
+            # Seeded by an older build: Calendar/Activity properties the
+            # deterministic checks read (exceptionDates, the FS/SS-vs-FS/FF
+            # open-end flags, hasFreeFloatNote) are absent or stale. Refresh
+            # the schedule side only -- MERGE-based and idempotent; the
+            # narrative/SP/key-map/estimate data is unaffected and stays put.
+            logger.info(
+                "_run_review_pipeline: project_id=%s schedule graph is seedVersion=%s "
+                "(current %s); re-seeding the schedule graph",
+                project_id, existing[0].get("seedVersion"), SEED_VERSION,
+            )
+            _set_review_progress(project_id, status="running", message="Refreshing schedule graph…")
+            _seed_schedule_graph(graph, schedule_bytes, project_id)
 
     if reseed:
-        # ── Parse XER -> CPM -> crosscheck ──────────────────────────────────
-        xer_text = schedule_bytes.decode("utf-8", errors="ignore")
-        parsed = parse_xer_all(xer_text)
-        activities = parsed["activities"]
-        calendars = parsed["calendars"]
-        project = parsed["project"]
-
-        # Non-fatal: on failure the review proceeds without computed CPM values.
-        cpm = xcheck = None
-        try:
-            cpm = run_cpm(build_network(activities), build_calendars(calendars), project)
-            xcheck = cross_check(activities, cpm)
-        except Exception:
-            logger.exception("CPM computation failed; review proceeds without computed values")
-
-        # ── Seed Neo4j (schedule + narrative + SP), fenced to this project_id ──
+        # ── Parse XER -> CPM -> crosscheck -> seed Neo4j, fenced to project_id ──
         _set_review_progress(project_id, status="running", message="Seeding schedule graph…")
-        seed_schedule(graph, activities, calendars, cpm, xcheck, project, project_id=project_id)
+        activities, project, cpm = _seed_schedule_graph(graph, schedule_bytes, project_id)
 
         _set_review_progress(project_id, status="running", message="Seeding narrative graph…")
         narrative_pages = _bytes_to_pdf_pages(narrative_bytes)
