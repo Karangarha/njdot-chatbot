@@ -23,6 +23,7 @@ from app.compliance.schedule_logic import (  # noqa: E402
     evaluate_no_mandatory_constraints,
     evaluate_no_negative_float,
     evaluate_no_open_ends,
+    evaluate_schedule_logic,
 )
 
 
@@ -60,6 +61,19 @@ def test_mandatory_constraints_filters_to_mandatory_types_only():
     result = evaluate_no_mandatory_constraints(_FakeGraph(rows=rows), "proj-1")
     assert len(result.violations) == 1
     assert result.violations[0]["id"] == "A1000"
+
+
+def test_mandatory_constraints_does_not_truncate_before_filtering():
+    # Regression: the fetch used to LIMIT 40 *before* the Python type filter,
+    # so 40+ ordinary constraints could crowd out a real CS_MANDSTART and the
+    # check reported a false Pass. No LIMIT should appear in the query at all.
+    rows = [{"id": f"A{i}", "type": "CS_MSOA", "date": "2025-01-01"} for i in range(60)]
+    rows.append({"id": "D1220", "type": "CS_MANDSTART", "date": "2025-06-01"})
+    graph = _FakeGraph(rows=rows)
+    result = evaluate_no_mandatory_constraints(graph, "proj-1")
+    assert [v["id"] for v in result.violations] == ["D1220"]
+    cypher, _params = graph.calls[0]
+    assert "LIMIT" not in cypher.upper()
 
 
 def test_no_lag_flags_fs_lag_and_negative_lag_only():
@@ -101,10 +115,43 @@ def test_no_open_ends_exempts_project_milestones():
     assert EXEMPT_MILESTONE_IDS == {"M100", "M950"}
 
 
+class _ProjectAwareGraph(_FakeGraph):
+    """Empty result for every check query; a Project row whose computedCount
+    reflects whether run_cpm produced values at seed time."""
+
+    def __init__(self, computed_count):
+        super().__init__(rows=[])
+        self.computed_count = computed_count
+
+    def query(self, cypher, params=None):
+        if "MATCH (p:Project" in cypher:
+            return [{"computedCount": self.computed_count}]
+        return super().query(cypher, params)
+
+
+def test_evaluate_schedule_logic_marks_cpm_dependent_checks_when_engine_did_not_run():
+    # run_cpm raised at seed time -> no computedTotalFloat / open-end flags
+    # anywhere in the graph. An empty violation list there is not a Pass.
+    results = evaluate_schedule_logic(_ProjectAwareGraph(computed_count=None), "proj-1")
+    assert results["no_negative_float"].cpm_ran is False
+    assert results["no_open_ends"].cpm_ran is False
+    # Lag and constraints come from the XER itself, not the CPM pass.
+    assert results["no_lag"].cpm_ran is True
+    assert results["no_mandatory_constraints"].cpm_ran is True
+
+
+def test_evaluate_schedule_logic_trusts_results_when_engine_ran():
+    results = evaluate_schedule_logic(_ProjectAwareGraph(computed_count=136), "proj-1")
+    assert all(r.cpm_ran for r in results.values())
+
+
 if __name__ == "__main__":
+    test_evaluate_schedule_logic_marks_cpm_dependent_checks_when_engine_did_not_run()
+    test_evaluate_schedule_logic_trusts_results_when_engine_ran()
     test_no_negative_float_pass_when_empty()
     test_no_negative_float_fail_lists_activities()
     test_mandatory_constraints_filters_to_mandatory_types_only()
+    test_mandatory_constraints_does_not_truncate_before_filtering()
     test_no_lag_flags_fs_lag_and_negative_lag_only()
     test_no_lag_does_not_truncate_large_relationship_sets()
     test_no_open_ends_exempts_project_milestones()

@@ -29,9 +29,13 @@ EXEMPT_MILESTONE_IDS = {"M100", "M950"}
 class ScheduleLogicResult:
     violations: List[Dict[str, Any]]
     detail: str
+    # False when the CPM engine never produced computed values for this
+    # schedule -- the check can't be evaluated and must report Missing, not
+    # the Pass an empty violation list would otherwise imply.
+    cpm_ran: bool = True
 
     def as_dict(self) -> dict:
-        return {"violations": self.violations, "detail": self.detail}
+        return {"violations": self.violations, "detail": self.detail, "cpm_ran": self.cpm_ran}
 
 
 def _result(
@@ -54,8 +58,8 @@ def evaluate_no_negative_float(graph: Any, project_id: str) -> ScheduleLogicResu
     rows = graph.query(
         "MATCH (a:Activity {projectId: $pid}) WHERE a.computedTotalFloat < 0 "
         "RETURN a.taskId AS id, a.name AS name, a.computedTotalFloat AS totalFloat "
-        "ORDER BY a.computedTotalFloat LIMIT $limit",
-        params={"pid": project_id, "limit": _MAX_ROWS},
+        "ORDER BY a.computedTotalFloat",
+        params={"pid": project_id},
     ) or []
     return _result(
         rows,
@@ -65,10 +69,13 @@ def evaluate_no_negative_float(graph: Any, project_id: str) -> ScheduleLogicResu
 
 
 def evaluate_no_mandatory_constraints(graph: Any, project_id: str) -> ScheduleLogicResult:
+    # No LIMIT: the mandatory-type filter below runs in Python, so a fetch cap
+    # would let 40 ordinary constraints crowd out a real CS_MANDSTART (same
+    # truncation bug evaluate_no_lag documents). _result() caps the display.
     rows = graph.query(
         "MATCH (a:Activity {projectId: $pid})-[:CONSTRAINED_BY]->(c:Constraint) "
-        "RETURN a.taskId AS id, c.type AS type, c.date AS date LIMIT $limit",
-        params={"pid": project_id, "limit": _MAX_ROWS},
+        "RETURN a.taskId AS id, c.type AS type, c.date AS date",
+        params={"pid": project_id},
     ) or []
     mandatory_types = _MANDATORY_START | _MANDATORY_FINISH
     violations = [r for r in rows if r.get("type") in mandatory_types]
@@ -114,8 +121,8 @@ def evaluate_no_open_ends(graph: Any, project_id: str) -> ScheduleLogicResult:
         "MATCH (a:Activity {projectId: $pid}) "
         "WHERE a.isOpenStart = true OR a.isOpenEnd = true "
         "RETURN a.taskId AS id, a.name AS name, "
-        "       a.isOpenStart AS isOpenStart, a.isOpenEnd AS isOpenEnd LIMIT $limit",
-        params={"pid": project_id, "limit": _MAX_ROWS},
+        "       a.isOpenStart AS isOpenStart, a.isOpenEnd AS isOpenEnd",
+        params={"pid": project_id},
     ) or []
     violations = [r for r in rows if r["id"] not in EXEMPT_MILESTONE_IDS]
     return _result(
@@ -135,8 +142,29 @@ _EVALUATORS: Dict[str, Callable[[Any, str], ScheduleLogicResult]] = {
 }
 
 
+# Checks that read values only run_cpm produces (computedTotalFloat,
+# isOpenStart/isOpenEnd). no_lag/no_mandatory_constraints come straight
+# from the XER's relationships and constraints and are valid regardless.
+_CPM_DEPENDENT_KEYS = ("no_negative_float", "no_open_ends")
+
+_CPM_NOT_RUN_DETAIL = (
+    "The CPM engine did not run for this schedule (no computed float or "
+    "open-end values in the graph), so this rule could not be evaluated."
+)
+
+
 def evaluate_schedule_logic(graph: Any, project_id: str) -> Dict[str, ScheduleLogicResult]:
     """Run all four schedule_logic checks once per review -- each is a cheap
     read of the already-seeded graph, so there's no reason to defer any of
-    them until their specific check is selected."""
-    return {key: fn(graph, project_id) for key, fn in _EVALUATORS.items()}
+    them until their specific check is selected. If run_cpm failed at seed
+    time (Project.computedCount unset/0), the CPM-dependent checks report
+    ``cpm_ran=False`` (-> Missing) instead of a Pass built on absent data."""
+    results = {key: fn(graph, project_id) for key, fn in _EVALUATORS.items()}
+    rows = graph.query(
+        "MATCH (p:Project {projectId: $pid}) RETURN p.computedCount AS computedCount LIMIT 1",
+        params={"pid": project_id},
+    ) or []
+    if not rows or not rows[0].get("computedCount"):
+        for key in _CPM_DEPENDENT_KEYS:
+            results[key] = ScheduleLogicResult([], _CPM_NOT_RUN_DETAIL, cpm_ran=False)
+    return results

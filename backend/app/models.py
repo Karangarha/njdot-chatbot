@@ -106,11 +106,11 @@ class EvaluationSchema(BaseModel):
     ``status`` is deliberately NOT a field here — it used to be, and the
     model could say "Fail" while its own ``evidence`` described a Pass (or
     cite an activity that was never actually a breach). Status is now
-    derived in Python from ``breaching_items`` (see
-    ``app.compliance.eval_engine._derive_status``): non-empty -> Fail,
-    empty -> Pass. That makes a self-contradictory verdict structurally
-    impossible instead of something a grounding judge has to catch after
-    the fact.
+    derived in Python (see ``app.compliance.eval_engine._derive_status``):
+    non-empty ``breaching_items`` -> Fail; else ``insufficient_evidence``
+    -> Missing; else Pass. That makes a self-contradictory verdict
+    structurally impossible instead of something a grounding judge has to
+    catch after the fact.
     """
 
     considered_items: List[str] = []
@@ -121,6 +121,12 @@ class EvaluationSchema(BaseModel):
     # The subset of considered_items that actually breaches the rule.
     # Every entry must also appear in considered_items -- validated in
     # app.compliance.eval_engine, not just requested here.
+    insufficient_evidence: bool = False
+    # True when the material the rule needs is not in the evidence (a
+    # required SP section/table was not retrieved, a required narrative
+    # element or count is absent, the cross-check section is missing).
+    # Renders as Missing/needs-review rather than a green Pass. Ignored
+    # when breaching_items is non-empty.
     evidence: str   # verbatim extraction or exact metric found
     source:   str   # page number, document name, or Task ID
     cited_chunk_ids: List[str] = []   # tags copied verbatim from tagged evidence passages

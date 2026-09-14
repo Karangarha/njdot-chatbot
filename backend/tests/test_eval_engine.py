@@ -178,6 +178,28 @@ def test_derive_status_pass_on_supported_absence():
     assert _derive_status(result) == "Pass"
 
 
+def test_derive_status_missing_on_insufficient_evidence():
+    # The material the rule needs was not retrieved / is absent -- that is
+    # needs-review, never a green Pass. Ignored once breaching_items is set.
+    result = EvaluationSchema(insufficient_evidence=True, evidence="108.12 was not retrieved", source="s")
+    assert _derive_status(result) == "Missing"
+    result = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1010"], insufficient_evidence=True,
+        evidence="e", source="s",
+    )
+    assert _derive_status(result) == "Fail"
+
+
+def test_validate_items_requires_whole_token_and_tolerates_section_zero_padding():
+    # "M1" must not pass by hiding inside "M100"; "105.07.01" must match an
+    # SP that prints the section as "105.07.1".
+    evidence = "MILESTONES: M100 | Advertise ...\n[cite:sp-0] 105.07.1 UTILITY WORK ..."
+    rejected = EvaluationSchema(considered_items=["M1"], evidence="e", source="s")
+    assert "M1" in (_validate_items(rejected, evidence) or "")
+    accepted = EvaluationSchema(considered_items=["105.07.01", "M100"], evidence="e", source="s")
+    assert _validate_items(accepted, evidence) is None
+
+
 def test_validate_items_passes_when_all_items_appear_in_evidence():
     result = EvaluationSchema(
         considered_items=["B1010", "B1020"], breaching_items=["B1020"],
@@ -333,9 +355,10 @@ def test_evaluate_one_check_item_validation_retry_recovers():
 
 
 def test_evaluate_one_check_item_validation_retry_still_invalid():
-    """If the retry STILL hallucinates, proceed with it (closer to right
-    than the original) but flag it -- never crash, never silently accept
-    the fabrication without a trace."""
+    """If the retry STILL hallucinates, the items are proven absent from the
+    evidence -- that must not drive a red Fail (or a green Pass). Report
+    Missing / needs review with the note, and never spend a judge call on
+    items already known not to exist."""
     check = _make_check()
     original = EvaluationSchema(
         considered_items=["Z9999"], breaching_items=["Z9999"],
@@ -353,10 +376,121 @@ def test_evaluate_one_check_item_validation_retry_still_invalid():
 
     result, usage = _call_evaluate_one_check(check, llm, judge)
 
-    assert result.status == "Fail"  # breaching_items still non-empty on the retry
+    assert result.status == "Missing"  # fabricated breaching_items never become a Fail
     assert "could not be fully verified" in result.evidence
     assert usage["llm_call_count"] == 2  # original + item-validation retry, no judge
     assert len(judge.calls) == 0
+
+
+def test_evaluate_one_check_item_retry_call_error_is_flagged_missing():
+    """The fabrication was already proven by _validate_items; a retry call
+    that errors must not ship the original unmarked (to a judge told not to
+    re-check existence) -- flag it and report Missing."""
+    check = _make_check()
+    original = EvaluationSchema(
+        considered_items=["Z9999"], breaching_items=["Z9999"],
+        evidence="Z9999 breaches the rule", source="schedule",
+    )
+
+    class _FirstCallThenError:
+        def __init__(self, first):
+            self._first = first
+            self.calls = []
+
+        def invoke(self, messages, config=None):
+            self.calls.append(messages)
+            if self._first is not None:
+                parsed, usage_metadata = self._first
+                self._first = None
+                return {"raw": SimpleNamespace(usage_metadata=usage_metadata), "parsed": parsed, "parsing_error": None}
+            raise RuntimeError("retry call failed")
+
+    llm = _FirstCallThenError((original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}))
+    judge = _FakeStructuredLLM([])  # must not be reached
+
+    result, usage = _call_evaluate_one_check(check, llm, judge)
+
+    assert result.status == "Missing"
+    assert "Z9999" in result.evidence and "could not be verified" in result.evidence
+    assert usage["llm_call_count"] == 2  # original + failed retry attempt
+    assert len(judge.calls) == 0
+
+
+def test_evaluate_one_check_grounding_retry_that_fabricates_keeps_original_flagged():
+    """A judge-driven retry that introduces an ID absent from the evidence is
+    not a usable correction: the re-judge (told existence was already
+    checked) must never see it. Keep the validated original, flagged."""
+    check = _make_check()
+    original = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=["B1010"],
+        evidence="B1010 starts before ROW available", source="schedule",
+    )
+    retried = EvaluationSchema(
+        considered_items=["Z9999"], breaching_items=["Z9999"],
+        evidence="Z9999 breaches", source="schedule",
+    )
+    llm = _FakeStructuredLLM([
+        (original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}),
+        (retried, {"input_tokens": 12, "output_tokens": 6, "input_token_details": {}}),
+    ])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=False, reason="dates show compliance"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])  # only one entry: a re-judge of the fabricated retry must never happen
+
+    result, usage = _call_evaluate_one_check(check, llm, judge)
+
+    assert result.status == "Fail"
+    assert "B1010 starts before ROW available" in result.evidence
+    assert "Z9999" not in result.evidence
+    assert "could not be independently confirmed" in result.evidence
+    assert usage["downgraded"] == 1
+    assert len(judge.calls) == 1
+
+
+def test_evaluate_one_check_ungrounded_pass_after_double_failure_is_missing():
+    """An empty breaching list the judge rejected twice carries no
+    information -- unlike an ungrounded Fail, whose item list is often still
+    right -- so it must render as Missing, not a green COMPLIANT."""
+    check = _make_check()
+    original = EvaluationSchema(evidence="searched, nothing found", source="schedule")
+    retried = EvaluationSchema(evidence="still nothing found", source="schedule")
+    llm = _FakeStructuredLLM([
+        (original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}}),
+        (retried, {"input_tokens": 12, "output_tokens": 6, "input_token_details": {}}),
+    ])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=False, reason="the evidence lists B1010 which breaches"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+        (GroundingJudgment(grounded=False, reason="still ignores B1010"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    result, usage = _call_evaluate_one_check(check, llm, judge)
+
+    assert result.status == "Missing"
+    assert "still ignores B1010" in result.evidence
+    assert usage["downgraded"] == 1
+
+
+def test_evaluate_one_check_deterministic_runs_before_missing_sources_gate():
+    """A deterministic check listing an optional upload in source_files must
+    still get its computed verdict when that upload is absent -- the gate
+    only describes what the LLM path needs."""
+    from app.compliance.date_rule import DateRuleResult
+
+    check = _make_check(
+        check_key="award_to_construction", check_type="date_rule",
+        source_files=["schedule", "keymap", "estimate"],
+    )
+    ctx = _DeterministicContext(date_rule={
+        "award_to_construction": DateRuleResult(False, "20 business day(s) (minimum 40 for State)."),
+    })
+    llm = _FakeStructuredLLM([])  # must not be reached
+    judge = _FakeStructuredLLM([])
+
+    result, usage = _call_evaluate_one_check(check, llm, judge, deterministic=ctx)
+
+    assert result.status == "Fail"
+    assert "minimum 40" in result.evidence
+    assert usage["llm_call_count"] == 0
 
 
 def test_evaluate_one_check_grounded_pass_through():

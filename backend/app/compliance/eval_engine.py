@@ -41,6 +41,7 @@ tests and holiday-aware business-day gaps, ``app.compliance.date_rule``).
 from __future__ import annotations
 
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -95,8 +96,8 @@ compliance check at a time against the evidence provided in the user message \
 excerpts, depending on the check).
 
 You do NOT decide Pass/Fail/Missing directly -- there is no status field. \
-Instead you report two lists, and the verdict is computed from them \
-mechanically:
+Instead you report two lists and one flag, and the verdict is computed \
+from them mechanically:
 
 - considered_items: every activity ID, milestone ID, or SP/spec section \
 number the rule governs, that you actually found in the evidence. Literal \
@@ -110,6 +111,14 @@ entry must be an ID you can point to verbatim in the evidence you were \
 given -- never an item you merely suspect might exist. Empty list -> the \
 check passes. Non-empty -> the check fails on exactly those items and no \
 others.
+- insufficient_evidence: set true when the material the rule needs is NOT \
+in the evidence -- a section/table the check names was not retrieved, a \
+required narrative element or count is absent, a precomputed section is \
+missing, or the excerpt is truncated before the relevant text. This is \
+reported as "needs review", never as a Pass. Where a check instruction \
+says WARNING for missing or unretrieved material, that is this flag. Do \
+not set it merely because the rule's subject does not apply to this \
+project (that is a Pass); it is ignored when breaching_items is non-empty.
 
 Getting this right means: list every candidate item first (considered_items), \
 THEN decide which of those breach (breaching_items) -- never work backwards \
@@ -214,11 +223,15 @@ def build_compliance_facts(graph: Neo4jGraph, project_id: str = "default") -> st
     project_rows = graph.query(
         "MATCH (p:Project {projectId: $pid}) "
         "RETURN p.warnings AS warnings, p.projectFinish AS projectFinish, "
-        "       p.dataDate AS dataDate, p.criticalCount AS criticalCount LIMIT 1",
+        "       p.dataDate AS dataDate, p.criticalCount AS criticalCount, "
+        "       p.computedCount AS computedCount LIMIT 1",
         params={"pid": project_id},
     )
     project_row = project_rows[0] if project_rows else {}
     warnings = project_row.get("warnings") or []
+    # computedCount is None/0 when run_cpm raised and the graph was seeded
+    # without any computed values -- "no mismatches" would then be a lie.
+    cpm_ran = bool(project_row.get("computedCount"))
 
     lines = ["PRECOMPUTED COMPLIANCE FACTS (deterministic — read these, do not recompute):"]
 
@@ -255,7 +268,12 @@ def build_compliance_facts(graph: Neo4jGraph, project_id: str = "default") -> st
     else:
         lines.append("\nOpen-Ended Activities: none.")
 
-    if mismatches:
+    if not cpm_ran:
+        lines.append(
+            "\nP6/CPM Cross-Check Mismatches: NOT AVAILABLE — the CPM engine did not "
+            "run for this schedule, so stored values could not be verified."
+        )
+    elif mismatches:
         lines.append(f"\nP6/CPM Cross-Check Mismatches ({len(mismatches)}):")
         lines += [f"  - {r['id']} {r['name']}" for r in mismatches]
     else:
@@ -454,6 +472,8 @@ def _evaluate_schedule_logic_check(check: CheckDef, ctx: "_DeterministicContext"
     if results is None or check.check_key not in results:
         return _result(check, "Missing", "Schedule-logic facts were not computed for this review.", "schedule")
     r: ScheduleLogicResult = results[check.check_key]
+    if not r.cpm_ran:
+        return _result(check, "Missing", r.detail, "schedule graph")
     status = "Fail" if r.violations else "Pass"
     return _result(check, status, r.detail, "schedule graph (deterministic CSM Section 3.0 computation)")
 
@@ -506,10 +526,32 @@ def _accumulate_usage(totals: Dict[str, int], call_usage: Dict[str, int]) -> Non
 
 def _derive_status(result: EvaluationSchema) -> str:
     """Status is never a model output (see EvaluationSchema's docstring) --
-    Fail iff breaching_items is non-empty, Pass otherwise. Makes "Fail with
-    evidence that describes a Pass" structurally impossible: there is no
-    field left for the two to disagree in."""
-    return "Fail" if result.breaching_items else "Pass"
+    Fail iff breaching_items is non-empty; else Missing iff the model
+    flagged insufficient_evidence; else Pass. Makes "Fail with evidence
+    that describes a Pass" structurally impossible: there is no field left
+    for the two to disagree in."""
+    if result.breaching_items:
+        return "Fail"
+    if result.insufficient_evidence:
+        return "Missing"
+    return "Pass"
+
+
+_SECTION_NUMBER_RE = re.compile(r"[\d.]+")
+
+
+def _item_pattern(item: str) -> re.Pattern:
+    """Whole-token match for an item ID. Alphanumeric boundaries stop "M1"
+    matching inside "M100"; dotted section numbers tolerate leading zeros
+    per segment so the model's "105.07.01" matches an SP that prints
+    "105.07.1" (and vice versa)."""
+    if _SECTION_NUMBER_RE.fullmatch(item) and "." in item:
+        body = r"\.".join(
+            rf"0*{int(p)}" if p.isdigit() else re.escape(p) for p in item.split(".")
+        )
+    else:
+        body = re.escape(item)
+    return re.compile(rf"(?<![A-Za-z0-9]){body}(?![A-Za-z0-9])", re.IGNORECASE)
 
 
 def _validate_items(result: EvaluationSchema, evidence_blob: str) -> Optional[str]:
@@ -534,10 +576,9 @@ def _validate_items(result: EvaluationSchema, evidence_blob: str) -> Optional[st
             f"{', '.join(orphaned)}. Every breaching item must also appear in "
             f"considered_items."
         )
-    evidence_lower = evidence_blob.lower()
     hallucinated = [
         item for item in result.considered_items
-        if item and item.lower() not in evidence_lower
+        if item and not _item_pattern(item).search(evidence_blob)
     ]
     if hallucinated:
         return (
@@ -645,6 +686,16 @@ def _evaluate_one_check(
     }
     sources = check.source_files or ["schedule"]
 
+    # Deterministic checks bypass the LLM entirely -- and the missing-sources
+    # gate below, which only describes what the LLM path needs. Each
+    # evaluator reports its own Missing when an input it genuinely needs is
+    # absent (e.g. no key map -> region unresolved), so a check like
+    # award_to_construction still gets its computed verdict when an optional
+    # upload it merely lists in source_files was skipped.
+    deterministic_fn = _DETERMINISTIC_EVALUATORS.get(check.check_type)
+    if deterministic_fn is not None:
+        return deterministic_fn(check, deterministic), usage_totals
+
     # "sp"/"keymap"/"estimate" are per-review (only present if that document
     # was uploaded); "spec"/"csm" are static, pre-ingested reference
     # collections (Standard Specifications / Construction Scheduling Manual —
@@ -676,11 +727,6 @@ def _evaluate_one_check(
             status="Missing", evidence=f"Not available for this review: {', '.join(missing_sources)}.",
             source="no data provided",
         ), usage_totals
-
-    # Deterministic checks bypass the LLM entirely.
-    deterministic_fn = _DETERMINISTIC_EVALUATORS.get(check.check_type)
-    if deterministic_fn is not None:
-        return deterministic_fn(check, deterministic), usage_totals
 
     citation_lookup: Dict[str, EvidenceCandidate] = {}
 
@@ -740,12 +786,19 @@ def _evaluate_one_check(
         ), usage_totals
 
     grounding_note: Optional[str] = None
+    # An empty breaching list the judge could not ground twice carries no
+    # information either way -- unlike an ungrounded Fail, whose item list
+    # is often still right. Forces Missing instead of a green Pass.
+    ungrounded_pass = False
 
     # Mechanical item-consistency check, before any LLM judge sees the
     # answer -- catches pure ID fabrication for free (no LLM call) and only
-    # spends a retry when it actually finds something wrong.
+    # spends a retry when it actually finds something wrong. Validated
+    # against user_msg (evidence + the check text) so a section number the
+    # instruction itself names -- which the model is told to mention when
+    # it was NOT retrieved -- counts as present.
     item_validation_failed = False
-    item_error = _validate_items(result, evidence)
+    item_error = _validate_items(result, user_msg)
     if item_error is not None:
         logger.warning(
             "evaluate_checks: check %s failed item validation (%s)", check.check_key, item_error,
@@ -755,13 +808,17 @@ def _evaluate_one_check(
         _accumulate_usage(usage_totals, retry_usage)
         if retried is not None:
             result = retried
-            if _validate_items(retried, evidence) is not None:
+            if _validate_items(retried, user_msg) is not None:
                 grounding_note = "item consistency could not be fully verified after retry"
                 item_validation_failed = True
-        # else: retry call itself errored -- keep the original result
-        # unflagged, same fail-open posture as an unreachable judge below.
+        else:
+            # Retry call itself errored -- the original's fabrication is
+            # already proven (item_error), so flag it rather than shipping
+            # it unmarked to a judge that is told not to re-check existence.
+            grounding_note = f"item consistency could not be verified — {item_error}"
+            item_validation_failed = True
 
-    # A retry that still fabricates an item is already known-bad -- skip
+    # A result whose items are known-fabricated is already known-bad -- skip
     # the judge rather than spend another call (and possibly another
     # retry) verifying support for items we already know aren't real.
     if config.REVIEW_GROUNDING_JUDGE and not item_validation_failed:
@@ -778,6 +835,19 @@ def _evaluate_one_check(
             retry_config = {**invoke_config, "run_name": f"{invoke_config['run_name']}:retry"}
             retried, retry_usage = _retry_with_correction(structured_llm, user_msg, judgment.reason, retry_config)
             _accumulate_usage(usage_totals, retry_usage)
+
+            # The re-judge is told item existence was already checked, so
+            # check it: a corrective retry that introduces a fabricated ID
+            # is not a usable correction -- treat it like a failed retry
+            # call (keep the validated original, flagged) below.
+            if retried is not None:
+                retry_item_error = _validate_items(retried, user_msg)
+                if retry_item_error is not None:
+                    logger.warning(
+                        "evaluate_checks: check %s grounding retry failed item validation (%s)",
+                        check.check_key, retry_item_error,
+                    )
+                    retried = None
 
             re_judgment = None
             if retried is not None:
@@ -807,13 +877,21 @@ def _evaluate_one_check(
                 )
                 usage_totals["downgraded"] = 1
                 grounding_note = f"grounding could not be independently confirmed after retry — {failure_reason}"
+                ungrounded_pass = not retried.breaching_items
             else:
                 # Retry call itself errored -- keep the original, same
                 # fail-open posture as an unreachable judge.
                 usage_totals["downgraded"] = 1
                 grounding_note = f"grounding could not be independently confirmed — {judgment.reason}"
+                ungrounded_pass = not result.breaching_items
 
-    status = _derive_status(result)
+    # Known-fabricated items must not drive a red Fail (or a green Pass), and
+    # an empty-breach answer the judge rejected twice must not render green:
+    # both become Missing / needs-review, with the note explaining why.
+    if item_validation_failed or ungrounded_pass:
+        status = "Missing"
+    else:
+        status = _derive_status(result)
     evidence_text = result.evidence
     if grounding_note:
         evidence_text = f"{evidence_text} [Automated note: {grounding_note} — recommend human review.]"
