@@ -225,12 +225,19 @@ def fuse(
     `session_chunks`, only about two ranked lists of dicts sharing an id
     field. The returned rows carry their RRF score in ``similarity`` so a
     caller can apply a threshold.
+
+    Rows whose ``key`` field is ``None`` are dropped before scoring. Without
+    this guard, ``rows_by_id.setdefault(rid, row)`` would coalesce every
+    ``None``-keyed row into a single slot, silently merging unrelated rows
+    and under-counting them. Callers do not need to pre-filter.
     """
     scores: Dict[Any, float] = {}
     rows_by_id: Dict[Any, Dict[str, Any]] = {}
     for rows, weight in ((vector_rows, v_weight), (keyword_rows, k_weight)):
         for rank, row in enumerate(rows, start=1):
             rid = row.get(key)
+            if rid is None:
+                continue
             rows_by_id.setdefault(rid, row)
             scores[rid] = scores.get(rid, 0.0) + weight / (_RRF_K + rank)
     ordered = sorted(scores.items(), key=lambda kv: -kv[1])[:match_count]
