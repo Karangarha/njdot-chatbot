@@ -347,6 +347,12 @@ def _sp_chunk_matches_anchors(chunk: Dict[str, Any], anchors: Any) -> bool:
     """Same pin test as ``check_retrieval.pin_by_anchors``, against an
     in-memory chunk's metadata instead of a ``session_chunks`` row.
 
+    Section matching (including the dot-bounded parent/child rule -- a check
+    naming "105.07" also pins a chunk headed by "105.07.02") is delegated to
+    ``Anchors.matches_section`` so this stays in lockstep with
+    ``pin_by_anchors``'s own ``metadata->>section_id.like.<anchor>.*``
+    filter without re-deriving the boundary rule here.
+
     Uses ``anchors.pinnable_tables``, not ``anchors.tables``, for the same
     reason ``pin_by_anchors`` does (see ``Anchors.pinnable_tables``): a bare
     single-letter caption like "TABLE A" is ambiguous across documents, and
@@ -356,7 +362,7 @@ def _sp_chunk_matches_anchors(chunk: Dict[str, Any], anchors: Any) -> bool:
     (test_both_sp_closures_return_identical_passages_for_one_query).
     """
     metadata = chunk.get("metadata") or {}
-    if metadata.get("section_id") in anchors.sections:
+    if anchors.matches_section(metadata.get("section_id")):
         return True
     return bool(set(metadata.get("tables") or ()) & set(anchors.pinnable_tables))
 

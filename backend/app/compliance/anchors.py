@@ -62,6 +62,28 @@ class Anchors:
         """The BM25 query: anchors only, never the rule body."""
         return " ".join((*self.sections, *self.tables))
 
+    def matches_section(self, section_id: str | None) -> bool:
+        """Whether a chunk's section_id is pinned by these section anchors --
+        either an exact match, or a child one level or more deeper, bounded
+        by a literal dot ("105.07" matches "105.07.02" but not "105.070").
+        A check naming the parent section must also pin chunks headed by its
+        children -- exact match alone misses every document whose headings
+        only go one level deeper than the anchor.
+
+        This is the single Python-side implementation of the same rule
+        check_retrieval.pin_by_anchors applies server-side via a
+        ``metadata->>section_id.like.<anchor>.*`` PostgREST filter (that
+        path has no in-memory rows to test against, so it can't call this
+        directly) -- in-process callers holding already-fetched chunk
+        metadata (app.api.review._sp_chunk_matches_anchors) use this so the
+        two never diverge on the boundary rule again.
+        """
+        if not section_id:
+            return False
+        if section_id in self.sections:
+            return True
+        return any(section_id.startswith(f"{s}.") for s in self.sections)
+
 
 def _dedupe(values) -> Tuple[str, ...]:
     seen, out = set(), []

@@ -84,7 +84,9 @@ def pin_by_anchors(
         # does NOT match "105.07" (that's a different section, not a parent):
         # PostgREST's "*" is its documented stand-in for the SQL LIKE "%"
         # wildcard. Section anchors only -- table anchors are excluded below,
-        # a table caption is either the whole identifier or nothing.
+        # a table caption is either the whole identifier or nothing. Same
+        # rule, Python side, for callers with in-memory rows rather than a
+        # filter to send: Anchors.matches_section.
         for section in anchors.sections:
             conditions.append(f"metadata->>section_id.like.{section}.*")
     for table in anchors.pinnable_tables:
