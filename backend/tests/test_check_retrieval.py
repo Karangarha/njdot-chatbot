@@ -118,6 +118,17 @@ def test_no_anchor_means_dense_only_and_no_keyword_call():
     assert out.anchor_missing is False
 
 
+def test_top_k_of_one_still_leaves_budget_for_one_pin():
+    # int(1 * PIN_BUDGET_FRACTION) truncates to 0, which used to starve
+    # pin_by_anchors entirely and get misreported as anchor_missing even
+    # though a genuine match exists.
+    db = _FakeDB(pinned=[_chunk("t", section="105.05", tables=["TABLE 105.05-1"])])
+    out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=1)
+    assert out.pinned == 1
+    assert out.rows[0]["id"] == "t"
+    assert out.anchor_missing is False
+
+
 def test_a_project_with_no_section_metadata_degrades_silently():
     # Ingested before section-aware chunking: pinning cannot work and that is
     # not evidence the clause is absent from the document.

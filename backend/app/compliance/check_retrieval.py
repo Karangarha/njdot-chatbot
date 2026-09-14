@@ -106,7 +106,13 @@ def retrieve_for_check(
     """Pin anchored chunks, fuse dense+keyword search for the rest, dedupe."""
     anchors = extract_anchors(instruction)
 
-    pin_limit = int(top_k * PIN_BUDGET_FRACTION)
+    # int(top_k * PIN_BUDGET_FRACTION) truncates to 0 for top_k in {0, 1},
+    # and pin_by_anchors's own limit<=0 guard then rejects the query -- a
+    # genuine anchor match would be reported as anchor_missing, which is
+    # budget starvation masquerading as the module's most important signal.
+    # Whenever there's budget for any row at all, there's budget for one
+    # pin; the cap still applies at normal budgets (top_k=8 -> 4, unchanged).
+    pin_limit = max(1, int(top_k * PIN_BUDGET_FRACTION)) if top_k > 0 else 0
     pinned_rows = pin_by_anchors(db, project_id, anchors, doc_type, pin_limit)
     pinned_ids = {r.get("id") for r in pinned_rows}
 
