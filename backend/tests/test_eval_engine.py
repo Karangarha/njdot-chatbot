@@ -859,6 +859,57 @@ def test_both_sp_closures_return_identical_passages_for_one_query():
     assert anchor_missing_a == anchor_missing_b
 
 
+def test_both_sp_closures_agree_when_instruction_names_parent_section():
+    """FINDING 2's dot-bounded prefix pinning (commit d47ee99) landed in
+    check_retrieval.pin_by_anchors -- the Supabase-backed closure -- but was
+    never extended to the in-process closure's own pin test. That is the
+    same class of drift Task 8 exists to eliminate, and the parity test
+    above didn't catch it because its one fixture only exercised an exact
+    section_id match. A check naming the PARENT section "105.07" must pin a
+    chunk headed by the CHILD "105.07.02" identically on both paths.
+    """
+    from app.api.review import _build_sp_search_fn, _build_sp_search_fn_from_supabase
+    from test_check_retrieval import _FakeDB, _chunk
+
+    parent_instruction = (
+        "Special Provisions 105.07 CONFORMITY WITH AND DEVIATIONS FROM PLANS "
+        "AND STAKES: \"deviations require written approval\".\n\n"
+        "Confirm deviation approvals are documented."
+    )
+
+    child_chunk = _chunk("t", section="105.07.02", body="Child section text.", chunk_index=0)
+    vector_chunk1 = _chunk("v1", body="Vector match one.")
+    vector_chunk2 = _chunk("v2", body="Vector match two.")
+
+    embed_fn = lambda q: [0.0, 0.0, 0.0]  # noqa: E731
+    embeddings = SimpleNamespace(embed_query=embed_fn)
+
+    # The Supabase closure trusts its DB filter (already dot-bounded, per
+    # commit d47ee99) to have matched the child row -- handed back here as
+    # if the real `metadata->>section_id.like.105.07.*` filter found it.
+    db = _FakeDB(pinned=[child_chunk], vector=[vector_chunk1, vector_chunk2], keyword=())
+    supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
+
+    # child_chunk deliberately not first: if the in-process closure's
+    # dot-bounded matching is missing (the actual bug), a stable sort over
+    # this list leaves it last instead of pinned to the front.
+    sp_chunks = [vector_chunk1, vector_chunk2, child_chunk]
+    sp_vectors = [[0.0, 0.0, 0.0]] * 3
+    memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+
+    text_a, _candidates_a, anchor_missing_a = supabase_fn(parent_instruction, top_k=8)
+    text_b, _candidates_b, anchor_missing_b = memory_fn(parent_instruction, top_k=8)
+
+    tags_a = re.findall(r"\[cite:(sp-\d+)\]", text_a)
+    tags_b = re.findall(r"\[cite:(sp-\d+)\]", text_b)
+
+    assert tags_a == ["sp-0", "sp-1", "sp-2"]  # sanity: not vacuously equal
+    assert text_a == text_b
+    assert tags_a == tags_b
+    assert len(tags_a) == len(tags_b)
+    assert anchor_missing_a == anchor_missing_b
+
+
 def test_sp_anchor_missing_sole_source_reports_missing_with_no_llm_call():
     """anchor_missing=True means the project HAS section metadata and the
     check's own named anchor (TABLE 105.05-1) matched nothing in the Special
