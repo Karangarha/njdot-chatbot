@@ -35,8 +35,17 @@ def _chunk(cid, section=None, tables=(), body="body"):
 class _FakeDB:
     """Enough of the PostgREST surface for pinning plus the two searches."""
 
-    def __init__(self, pinned=(), vector=(), keyword=()):
+    def __init__(self, pinned=(), vector=(), keyword=(), metadata_rows=None):
         self._pinned, self._vector, self._keyword = list(pinned), list(vector), list(keyword)
+        # project_has_section_metadata's probe (select("metadata")) and
+        # pin_by_anchors's query (select("*")) both hit db.table(...), but
+        # they must be answerable independently -- otherwise a genuine gap
+        # (project HAS section metadata, anchor matches nothing) can never
+        # be distinguished from a pre-Task-6 project (no metadata at all),
+        # which is the exact three-way split check_retrieval exists to make.
+        # Default metadata_rows to `pinned` so tests that don't care about
+        # the split keep the old behaviour (one fixture answers both).
+        self._metadata_rows = list(pinned) if metadata_rows is None else list(metadata_rows)
         self.keyword_query = None
 
     def rpc(self, name, params):
@@ -54,14 +63,23 @@ class _FakeDB:
         return _R()
 
     def table(self, _name):
-        return _FakeTable(self._pinned)
+        return _FakeTable(pinned=self._pinned, metadata_rows=self._metadata_rows)
 
 
 class _FakeTable:
-    def __init__(self, rows):
-        self.rows = rows
+    def __init__(self, pinned, metadata_rows):
+        self._pinned = pinned
+        self._metadata_rows = metadata_rows
+        self._select_cols = None
 
-    def select(self, *a, **k): return self
+    def select(self, cols="*", *a, **k):
+        # The metadata probe asks for select("metadata"); the pin query
+        # asks for select("*"). That's the real distinction between the two
+        # callers, so route each to its own fixture instead of one shared
+        # `rows` list.
+        self._select_cols = cols
+        return self
+
     def eq(self, *a, **k): return self
     def in_(self, *a, **k): return self
     def not_(self, *a, **k): return self
@@ -69,8 +87,10 @@ class _FakeTable:
     def or_(self, *a, **k): return self
     def limit(self, *a, **k): return self
     def order(self, *a, **k): return self
+
     def execute(self):
-        return type("X", (), {"data": self.rows, "count": len(self.rows)})()
+        rows = self._metadata_rows if self._select_cols == "metadata" else self._pinned
+        return type("X", (), {"data": rows, "count": len(rows)})()
 
 
 def test_an_anchored_chunk_is_pinned_first():
@@ -136,6 +156,55 @@ def test_a_project_with_no_section_metadata_degrades_silently():
     out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=8)
     assert out.anchor_missing is False
     assert out.rows
+
+
+# The three tests below pin down the module's central three-way split --
+# anchor_missing must land on the right value for each case. Case 2 is the
+# one the original six tests could never reach: _FakeDB's metadata probe and
+# pin query used to share a single `rows` fixture, so "pinning found
+# nothing" and "the project has no section metadata" were structurally the
+# same fact. With metadata_rows answered independently of pinned, they can
+# now disagree, which is exactly what the genuine-gap case requires.
+
+
+def test_case1_no_section_metadata_anywhere_is_not_evidence_of_absence():
+    # Pre-Task-6 project: the probe (metadata_rows=[]) sees no section_id
+    # metadata at all, independent of what the pin query returns.
+    db = _FakeDB(pinned=[], vector=[_chunk("v1")], keyword=[_chunk("k1")], metadata_rows=[])
+    out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=8)
+    assert out.pinned == 0
+    assert out.anchor_missing is False
+
+
+def test_case2_section_metadata_present_but_anchor_matches_nothing_is_a_genuine_gap():
+    # The project clearly has section metadata (metadata_rows carries a row
+    # with a section_id, from some other section), yet the pin query for
+    # THIS anchor (pinned=[]) still comes back empty -- pinning had a real
+    # chance to match and didn't.
+    db = _FakeDB(
+        pinned=[],
+        vector=[_chunk("v1")],
+        keyword=[_chunk("k1")],
+        metadata_rows=[_chunk("other", section="900.01")],
+    )
+    out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=8)
+    assert out.pinned == 0
+    assert out.anchor_missing is True
+
+
+def test_case3_no_anchor_in_the_instruction_is_neither():
+    # Nothing was ever named, so this can't be a missing-evidence signal --
+    # true even though the project clearly has section metadata here
+    # (metadata_rows is non-empty), because anchors.is_empty short-circuits
+    # before project_has_section_metadata is ever queried.
+    db = _FakeDB(
+        pinned=[], vector=[_chunk("v1")], keyword=[],
+        metadata_rows=[_chunk("other", section="900.01")],
+    )
+    out = retrieve_for_check(
+        db, lambda q: [0.0] * 3, "p1", "Confirm the narrative addresses community commitments.", top_k=8,
+    )
+    assert out.anchor_missing is False
 
 
 if __name__ == "__main__":
