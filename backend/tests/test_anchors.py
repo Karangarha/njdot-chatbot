@@ -72,6 +72,34 @@ def test_deduplicates_and_preserves_first_appearance_order():
     assert a.sections == ("105.07", "105.07.02")
 
 
+def test_table_followed_by_ordinary_prose_is_not_an_anchor():
+    # "table" followed by a common noun/adverb is not a caption; a false
+    # positive here (e.g. "CAREFULLY") would AND-poison the BM25 query.
+    a = extract_anchors("Read the table's two columns carefully.")
+    assert a.tables == ()
+
+
+def test_extracts_a_single_letter_table_from_construction_scheduling_manual():
+    a = extract_anchors("Construction Scheduling Manual Table A; see the note.")
+    assert a.tables == ("TABLE A",)
+
+
+def test_working_drawing_review_time_yields_no_prose_table_anchor():
+    # Regression pin for the real bug: this check's actual catalog instruction
+    # contains "Read the table carefully" and "table gets applied by mistake",
+    # which the old case-insensitive, digit-optional _TABLE_RE matched as
+    # "TABLE CAREFULLY" / "TABLE GETS". Run the real instruction text, not a
+    # synthetic string, since that's what actually shipped the bad anchors.
+    from app.compliance.catalog import BUILTIN_CHECKS
+
+    check = next(c for c in BUILTIN_CHECKS if c.check_key == "working_drawing_review_time")
+    a = extract_anchors(check.instruction)
+    assert "TABLE 105.05-1" in a.tables  # the real caption still extracts
+    for t in a.tables:
+        identifier = t.split(" ", 1)[1]
+        assert not identifier.isalpha(), f"prose leaked into table anchor: {t!r}"
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
