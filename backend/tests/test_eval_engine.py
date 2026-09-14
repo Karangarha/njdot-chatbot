@@ -879,13 +879,20 @@ def test_sp_anchor_missing_reports_missing_with_no_llm_call():
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision"),
         }, True  # anchor_missing
 
+    llm = _FakeStructuredLLM([])
     result, usage = _call_evaluate_one_check(
-        check, _FakeStructuredLLM([]), _FakeStructuredLLM([]), sp_search_fn=sp_search_fn,
+        check, llm, _FakeStructuredLLM([]), sp_search_fn=sp_search_fn,
     )
 
     assert result.status == "Missing"
     assert "105.05" in result.evidence or "TABLE 105.05-1" in result.evidence
     assert usage["llm_call_count"] == 0
+    # usage accumulates only after invoke() returns, so a raising invoke (the
+    # empty response queue's .pop(0) would raise IndexError) also leaves
+    # llm_call_count at 0 -- that alone doesn't prove invoke was never
+    # reached. .calls is appended before the pop, so this is what actually
+    # proves it.
+    assert len(llm.calls) == 0
 
 
 def test_sp_anchor_missing_false_behaves_exactly_as_before():
