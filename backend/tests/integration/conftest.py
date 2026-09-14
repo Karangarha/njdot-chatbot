@@ -32,7 +32,7 @@ def local_db():
     if not url or not key:
         pytest.skip("local Supabase env not configured")
     if "localhost" not in url and "127.0.0.1" not in url and "kong" not in url:
-        pytest.skip(f"refusing to run integration tests against a non-local host")
+        pytest.skip("refusing to run integration tests against a non-local host")
     from supabase import create_client
     client = create_client(url, key)
     try:
