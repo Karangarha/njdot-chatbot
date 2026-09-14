@@ -765,9 +765,14 @@ def _evaluate_one_check(
             # anchor still matched nothing -- a genuine, provable gap, not a
             # pre-section-aware project where pinning simply can't work (see
             # this module's docstring). No point spending an LLM call asking
-            # the model about text it was never given; report needs-review
-            # directly via the existing insufficient_evidence -> Missing
-            # mechanism (_derive_status), naming the anchor for the reviewer.
+            # the model about text it was never given: construct
+            # ReviewCheckResult(status="Missing") directly, naming the
+            # anchor for the reviewer. This does NOT go through
+            # _derive_status -- there is no EvaluationSchema here (no LLM
+            # call was made for this check), so there is nothing for
+            # _derive_status to inspect. Direct construction is the same
+            # idiom the missing_sources short-circuit above already uses for
+            # the same reason.
             anchors = extract_anchors(check.instruction)
             named = ", ".join((*anchors.sections, *anchors.tables))
             return ReviewCheckResult(
