@@ -15,11 +15,13 @@ administrative milestone is on "CNT0 - 4 - 7 Day Work Week").
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable, Dict, Optional
 
-from app.scheduling.calendar import DEFAULT_CALENDAR, WorkCalendar, _to_date
+from app.compliance.edq import _is_non_physical
+from app.scheduling.calendar import WorkCalendar, _to_date
 
 # NJDOT catalog convention: fixed milestone task ids used across every
 # built-in schedule (see app.compliance.catalog's Administrative Dates /
@@ -56,10 +58,20 @@ def _calendar_from_row(r: Dict[str, Any]) -> WorkCalendar:
         exceptions=r.get("exceptionDates") or (),
         work_exceptions=r.get("workExceptionDates") or (),
         hours_per_day=r.get("hoursPerDay") or 8.0,
+        name=r.get("name") or "",
     )
 
 
-def _get_business_days_calendar(graph: Any, project_id: str) -> WorkCalendar:
+_WEEKDAYS = {"Mon", "Tue", "Wed", "Thu", "Fri"}
+
+_NO_BUSINESS_CALENDAR = (
+    "No Mon-Fri business-day calendar (name containing 'Bus', with holiday "
+    "exceptions seeded) was found in the schedule, so business days cannot "
+    "be counted holiday-aware."
+)
+
+
+def _get_business_days_calendar(graph: Any, project_id: str) -> Optional[WorkCalendar]:
     """The project's designated business-day calendar (NJDOT convention:
     named e.g. "CNT0 - 1 - State Bus. Days"), used for the administrative
     business-day-gap rules -- deliberately NOT the milestone's own assigned
@@ -67,17 +79,28 @@ def _get_business_days_calendar(graph: Any, project_id: str) -> WorkCalendar:
     assigned to calendar "CNT0 - 4 - 7 Day Work Week", so trusting the
     milestone's own calendar silently computed calendar days while labeled
     business days (21/21/77 instead of the correct 15/15/55) -- the exact
-    unit-confusion bug this check type exists to eliminate. Falls back to
-    a plain Mon-Fri calendar (no holiday exclusion) if no such calendar is
-    found, which is conservative but not holiday-aware.
+    unit-confusion bug this check type exists to eliminate.
+
+    A candidate must actually be a Mon-Fri calendar and carry a seeded
+    exceptionDates list (a missing property means an older seed). Ordered
+    by name so two matches resolve the same way every run. Returns None --
+    never a holiday-free default -- when nothing qualifies: counting
+    holidays as work days only inflates the gap toward a false Pass, so
+    the callers report Missing instead.
     """
     rows = graph.query(
         "MATCH (c:Calendar {projectId: $pid}) WHERE toLower(c.name) CONTAINS 'bus' "
-        "RETURN c.workDays AS workDays, c.exceptionDates AS exceptionDates, "
-        "       c.workExceptionDates AS workExceptionDates, c.hoursPerDay AS hoursPerDay LIMIT 1",
+        "RETURN c.name AS name, c.workDays AS workDays, c.exceptionDates AS exceptionDates, "
+        "       c.workExceptionDates AS workExceptionDates, c.hoursPerDay AS hoursPerDay "
+        "ORDER BY c.name",
         params={"pid": project_id},
     ) or []
-    return _calendar_from_row(rows[0]) if rows else DEFAULT_CALENDAR
+    for r in rows:
+        if r.get("exceptionDates") is None:
+            continue
+        if set(r.get("workDays") or ()) == _WEEKDAYS:
+            return _calendar_from_row(r)
+    return None
 
 
 def _weekday_check(graph: Any, project_id: str, task_id: str, label: str) -> DateRuleResult:
@@ -111,13 +134,15 @@ def _business_day_gap(
         missing = [lbl for lbl, d in ((from_label, a_date), (to_label, b_date)) if d is None]
         return DateRuleResult(None, f"Missing date(s) for: {', '.join(missing)}.")
     cal = _get_business_days_calendar(graph, project_id)
+    if cal is None:
+        return DateRuleResult(None, _NO_BUSINESS_CALENDAR)
     gap = cal.work_days_between(a_date, b_date)
     ok = gap >= minimum
     return DateRuleResult(
         ok,
         f"{from_label} ({from_id}) = {a_date.isoformat()}, {to_label} ({to_id}) = "
         f"{b_date.isoformat()}: {gap} business day(s) on the project's business-day "
-        f"calendar (minimum {minimum}).",
+        f"calendar '{cal.name}' (minimum {minimum}).",
         metric_days=gap,
     )
 
@@ -137,25 +162,26 @@ def _in_winter_window(d: date) -> bool:
 
 
 def evaluate_no_completion_in_winter(graph: Any, project_id: str) -> DateRuleResult:
-    sub = _get_milestone(graph, project_id, _M_SUBSTANTIAL)
-    fin = _get_milestone(graph, project_id, _M_FINAL)
-    sub_date = _to_date(sub.get("date")) if sub else None
-    fin_date = _to_date(fin.get("date")) if fin else None
-    if sub_date is None or fin_date is None:
-        missing = [lbl for lbl, d in (("Substantial Completion", sub_date), ("Final Completion", fin_date)) if d is None]
+    # Each milestone is an independent test against the window, so evaluate
+    # whichever resolve -- an unresolvable Final Completion must not hide a
+    # Substantial Completion that sits squarely inside Dec 15 - Mar 15.
+    resolved, missing = [], []
+    for lbl, tid in (("Substantial Completion", _M_SUBSTANTIAL), ("Final Completion", _M_FINAL)):
+        m = _get_milestone(graph, project_id, tid)
+        d = _to_date(m.get("date")) if m else None
+        if d is None:
+            missing.append(lbl)
+        else:
+            resolved.append((lbl, tid, d))
+    if not resolved:
         return DateRuleResult(None, f"Missing date(s) for: {', '.join(missing)}.")
-    violations = [
-        (lbl, d) for lbl, d in (("Substantial Completion", sub_date), ("Final Completion", fin_date))
-        if _in_winter_window(d)
-    ]
-    ok = not violations
-    detail = (
-        f"Substantial Completion (M900) = {sub_date.isoformat()}, "
-        f"Final Completion (M950) = {fin_date.isoformat()}."
-    )
+    violations = [(lbl, d) for lbl, _tid, d in resolved if _in_winter_window(d)]
+    detail = ", ".join(f"{lbl} ({tid}) = {d.isoformat()}" for lbl, tid, d in resolved) + "."
     if violations:
         detail += " In the Dec 15 - Mar 15 window: " + ", ".join(f"{lbl} ({d.isoformat()})" for lbl, d in violations) + "."
-    return DateRuleResult(ok, detail)
+    if missing:
+        detail += f" Not evaluated (no resolvable date): {', '.join(missing)}."
+    return DateRuleResult(not violations, detail)
 
 
 def evaluate_substantial_regional_deadlines(
@@ -183,8 +209,28 @@ _AWARD_MINIMUM_BY_TYPE = {"Federal": 55, "State": 40, "Pavement Preservation": 2
 # NJDOT pay-item category taxonomy would be more precise than matching
 # itemDescription substrings. Upgrade if this misclassifies a real project;
 # until then it only fires when NO federal project number is present at all.
-_MILLING_RESURFACING_TERMS = ("mill", "resurfac", "overlay", "pavement")
+# Bare "pavement" is deliberately absent: it matched striping/marking/repair
+# items and, since a hit LOWERS the award minimum (40 -> 25), a false
+# positive here always errs toward a false Pass.
+_MILLING_RESURFACING_TERMS = ("mill", "resurfac", "overlay")
 _STRUCTURE_TERMS = ("bridge", "abutment", "pier", "structural steel", "beam", "deck", "culvert")
+
+# FHWA-format federal project number as it appears in narrative prose, e.g.
+# "NHP-0049(303)" -- the corroboration the Route 49 narrative carries even
+# where the key sheet or DBE memo field is missing.
+_FHWA_PROJECT_NO_RE = re.compile(r"\b[A-Z]{2,4}-\d{4}\(\d{3}\)")
+
+
+def _narrative_federal_number(graph: Any, project_id: str) -> Optional[str]:
+    rows = graph.query(
+        "MATCH (c:NarrativeChunk {projectId: $pid}) RETURN c.text AS text",
+        params={"pid": project_id},
+    ) or []
+    for r in rows:
+        m = _FHWA_PROJECT_NO_RE.search(r.get("text") or "")
+        if m:
+            return m.group(0)
+    return None
 
 
 def _classify_project_type(
@@ -194,12 +240,20 @@ def _classify_project_type(
     "State", "Pavement Preservation", or None (couldn't classify -> Missing)."""
     if federal_project_no:
         return "Federal", f"Federal Project No. {federal_project_no} present."
+    narrative_no = _narrative_federal_number(graph, project_id)
+    if narrative_no:
+        return "Federal", f"FHWA-format Federal Project No. {narrative_no} found in the designer's narrative."
 
     rows = graph.query(
         "MATCH (e:EdqItem {projectId: $pid}) RETURN e.itemDescription AS itemDescription",
         params={"pid": project_id},
     ) or []
-    descriptions = [(r.get("itemDescription") or "").lower() for r in rows]
+    # Non-physical items (mobilization, bonds, allowances...) carry no
+    # pavement/structure signal; excluding them keeps the ratio honest.
+    descriptions = [
+        (r.get("itemDescription") or "").lower() for r in rows
+        if not _is_non_physical(r.get("itemDescription"))
+    ]
     if not descriptions:
         return "State", "No Federal Project Number found; no EDQ items available to check for pavement-preservation indicators, defaulting to State."
 
@@ -249,13 +303,15 @@ def evaluate_award_to_construction(
         return DateRuleResult(None, f"{type_detail}{conflict_note}")
 
     cal = _get_business_days_calendar(graph, project_id)
+    if cal is None:
+        return DateRuleResult(None, f"{_NO_BUSINESS_CALENDAR}{conflict_note}")
     gap = cal.work_days_between(a_date, b_date)
     minimum = _AWARD_MINIMUM_BY_TYPE[project_type]
     ok = gap >= minimum
     detail = (
         f"{type_detail} Award (M300) = {a_date.isoformat()}, Construction Start (M500) = "
         f"{b_date.isoformat()}: {gap} business day(s) on the project's business-day "
-        f"calendar (minimum {minimum} for {project_type}).{conflict_note}"
+        f"calendar '{cal.name}' (minimum {minimum} for {project_type}).{conflict_note}"
     )
     return DateRuleResult(ok, detail, metric_days=gap)
 

@@ -32,10 +32,11 @@ class _FakeGraph:
     by name, not by id -- see _get_business_days_calendar); EDQ items as a
     flat list (only used by the award_to_construction classifier)."""
 
-    def __init__(self, milestones=None, business_days_calendar=None, edq_items=None):
+    def __init__(self, milestones=None, business_days_calendar=None, edq_items=None, narrative_text=None):
         self.milestones = milestones or {}
         self.business_days_calendar = business_days_calendar
         self.edq_items = edq_items or []
+        self.narrative_text = narrative_text
 
     def query(self, cypher, params=None):
         if "MATCH (a:Activity" in cypher:
@@ -45,6 +46,8 @@ class _FakeGraph:
             return [self.business_days_calendar] if self.business_days_calendar else []
         if "MATCH (e:EdqItem" in cypher:
             return [{"itemDescription": d} for d in self.edq_items]
+        if "MATCH (c:NarrativeChunk" in cypher:
+            return [{"text": self.narrative_text}] if self.narrative_text else []
         return []
 
 
@@ -56,11 +59,43 @@ def _milestone(task_id, iso_date, calendar_id="830"):
 
 
 _MON_FRI_CAL = {
+    "name": "CNT0 - 1 - State Bus. Days",
     "workDays": ["Mon", "Tue", "Wed", "Thu", "Fri"],
     "exceptionDates": [],
     "workExceptionDates": [],
     "hoursPerDay": 8.0,
 }
+
+
+def test_ad_to_bid_gap_missing_when_no_business_day_calendar():
+    # No qualifying calendar -> Missing, never a silent holiday-free count
+    # (which only ever inflates the gap toward a false Pass).
+    graph = _FakeGraph(
+        milestones={
+            "M100": _milestone("M100", "2024-12-20"),
+            "M200": _milestone("M200", "2025-01-10"),
+        },
+        business_days_calendar=None,
+    )
+    result = evaluate_ad_to_bid_gap(graph, "proj-1")
+    assert result.satisfied is None
+    assert "business-day calendar" in result.detail
+
+
+def test_business_day_calendar_rejects_seven_day_or_unseeded_calendars():
+    seven_day = {**_MON_FRI_CAL, "name": "Bus. 7 Day", "workDays": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]}
+    graph = _FakeGraph(
+        milestones={"M100": _milestone("M100", "2024-09-05"), "M200": _milestone("M200", "2024-09-26")},
+        business_days_calendar=seven_day,
+    )
+    assert evaluate_ad_to_bid_gap(graph, "proj-1").satisfied is None
+    # exceptionDates absent entirely = seeded by an older build -> not trusted.
+    unseeded = {k: v for k, v in _MON_FRI_CAL.items() if k != "exceptionDates"}
+    graph = _FakeGraph(
+        milestones={"M100": _milestone("M100", "2024-09-05"), "M200": _milestone("M200", "2024-09-26")},
+        business_days_calendar=unseeded,
+    )
+    assert evaluate_ad_to_bid_gap(graph, "proj-1").satisfied is None
 
 
 def test_ad_date_day_pass_on_thursday():
@@ -140,6 +175,20 @@ def test_no_completion_in_winter_fails_when_either_milestone_in_window():
     assert "Substantial Completion" in result.detail
 
 
+def test_no_completion_in_winter_evaluates_resolved_milestone_when_other_is_missing():
+    # No M950 at all, but M900 sits inside the window: that is a real
+    # violation and must be reported as Fail, not hidden behind Missing.
+    graph = _FakeGraph(milestones={"M900": _milestone("M900", "2026-01-15")})
+    result = evaluate_no_completion_in_winter(graph, "proj-1")
+    assert result.satisfied is False
+    assert "Substantial Completion (M900) = 2026-01-15" in result.detail
+    assert "Not evaluated" in result.detail and "Final Completion" in result.detail
+
+
+def test_no_completion_in_winter_missing_only_when_neither_resolves():
+    assert evaluate_no_completion_in_winter(_FakeGraph(), "proj-1").satisfied is None
+
+
 def test_no_completion_in_winter_passes_outside_window():
     graph = _FakeGraph(milestones={
         "M900": _milestone("M900", "2026-08-05"),
@@ -203,6 +252,31 @@ def test_award_to_construction_classifies_pavement_preservation_from_edq_items()
     result = evaluate_award_to_construction(graph, "proj-1", federal_project_no=None)
     assert "Pavement Preservation" in result.detail
     assert result.satisfied is True
+
+
+def test_award_to_construction_pavement_terms_ignore_striping_and_non_physical_items():
+    # "Pavement Striping" no longer counts as a milling/resurfacing item, and
+    # mobilization/bonds are dropped from the denominator -- a striping-heavy
+    # State job must not be loosened to the 25-day minimum.
+    items = ["Pavement Striping", "Pavement Marking", "Concrete Pavement Repair",
+             "Mobilization", "Performance and Payment Bond", "Guide Rail"]
+    graph = _award_graph("2024-09-05", "2024-10-17", edq_items=items)  # ~30 weekdays
+    result = evaluate_award_to_construction(graph, "proj-1", federal_project_no=None)
+    assert "State" in result.detail
+    assert result.satisfied is False
+
+
+def test_award_to_construction_reads_fhwa_number_from_narrative():
+    # Key sheet field empty, no DBE memo -- but the narrative carries the
+    # FHWA-format number. That is a federal-aid project: 55-day minimum.
+    graph = _FakeGraph(
+        milestones={"M300": _milestone("M300", "2024-09-05"), "M500": _milestone("M500", "2024-11-07")},  # ~45 weekdays
+        business_days_calendar=_MON_FRI_CAL,
+        narrative_text="This project is funded under Federal Project No. NHP-0049(303).",
+    )
+    result = evaluate_award_to_construction(graph, "proj-1", federal_project_no=None)
+    assert "NHP-0049(303)" in result.detail and "Federal" in result.detail
+    assert result.satisfied is False
 
 
 def test_award_to_construction_conflicting_federal_numbers_still_classifies_and_notes_it():

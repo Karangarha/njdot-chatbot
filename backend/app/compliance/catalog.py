@@ -145,28 +145,32 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "ad_to_bid_gap", CAT_ADMIN_DATES,
         "15 Business Days: Advertisement to Bid",
         "Deterministic: computed from the Advertisement (M100) and Bid "
-        "(M200) milestone dates using the Advertisement milestone's own "
-        "calendar (holiday-aware) — no AI judgement involved. FAIL states "
-        "the actual business-day count against the 15-day minimum.",
+        "(M200) milestone dates using the project's business-day calendar "
+        "(Mon-Fri with holiday exceptions, not the milestone's own assigned "
+        "calendar) — no AI judgement involved. FAIL states the actual "
+        "business-day count against the 15-day minimum.",
         check_type="date_rule",
     ),
     CheckDef(
         "bid_to_award_gap", CAT_ADMIN_DATES,
         "15 Business Days: Bid to Award",
         "Deterministic: computed from the Bid (M200) and Award (M300) "
-        "milestone dates using the Bid milestone's own calendar "
-        "(holiday-aware) — no AI judgement involved. FAIL states the "
-        "actual business-day count against the 15-day minimum.",
+        "milestone dates using the project's business-day calendar "
+        "(Mon-Fri with holiday exceptions, not the milestone's own assigned "
+        "calendar) — no AI judgement involved. FAIL states the actual "
+        "business-day count against the 15-day minimum.",
         check_type="date_rule",
     ),
     CheckDef(
         "award_to_construction", CAT_ADMIN_DATES,
         "Award to Construction Start Timeframe (40 days State / 55 days Federal / 25-55 days Pavement)",
         "Deterministic: computed from the Award (M300) and Construction "
-        "Start (M500) milestone dates using the Award milestone's own "
-        "calendar (holiday-aware) — no AI judgement involved. Project type "
-        "is classified on PRESENCE of a Federal Project Number (key map or "
-        "DBE Goal Memo, either source counts), falling back to an EDQ "
+        "Start (M500) milestone dates using the project's business-day "
+        "calendar (Mon-Fri with holiday exceptions, not the milestone's own "
+        "assigned calendar) — no AI judgement involved. Project type is "
+        "classified on PRESENCE of a Federal Project Number (key map, DBE "
+        "Goal Memo, or an FHWA-format number such as NHP-0049(303) in the "
+        "designer's narrative — any source counts), falling back to an EDQ "
         "item-mix classification for Pavement Preservation, defaulting to "
         "State otherwise. The two sources disagreeing on the number's exact "
         "value is a separate document-consistency finding, noted but not "
@@ -383,7 +387,8 @@ BUILTIN_CHECKS: List[CheckDef] = [
         "every winter the project spans - a multi-year project has more "
         "than one, and a placement in a LATER winter still needs a "
         "cold-weather plan even if the first winter had none. No "
-        "winter placement in ANY year -> WARNING, 'no winter concrete work present.' "
+        "winter placement in ANY year -> PASS (not applicable), 'no winter "
+        "concrete work present.' "
         "Otherwise confirm three things per winter with a placement: a "
         "cold-weather concreting plan submittal finishing at least 30 days "
         "before that winter's first placement; durations allowing 7 days "
