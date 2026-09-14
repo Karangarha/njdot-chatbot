@@ -420,10 +420,13 @@ def _build_sp_search_fn(
         # at pin_limit == 0 pinning never even ran, so an empty `pinned` here
         # is budget starvation, not proof the anchor is absent -- without
         # this, this closure and retrieve_for_check disagreed at any
-        # non-positive top_k.
+        # non-positive top_k. Uses pinnable_is_empty, not is_empty, for the
+        # same reason retrieve_for_check does (see check_retrieval.py): a
+        # bare single-letter table anchor ("TABLE A") is never pinned, so
+        # its absence isn't evidence of a gap either.
         anchor_missing = (
             pin_limit > 0
-            and not anchors.is_empty
+            and not anchors.pinnable_is_empty
             and not pinned
             and any((c.get("metadata") or {}).get("section_id") for c in sp_chunks)
         )

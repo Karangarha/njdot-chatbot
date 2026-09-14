@@ -948,6 +948,52 @@ def test_both_sp_closures_agree_zero_budget_is_starvation_not_a_missing_anchor()
     assert anchor_missing_a is False
 
 
+def test_both_sp_closures_agree_a_bare_table_anchor_is_not_a_missing_anchor():
+    """FINDING 2: anchor_missing must gate on whether any PINNABLE anchor
+    exists, not on whether extract_anchors found anything at all. A check
+    whose only anchor is a bare single-letter table ("TABLE A") is one
+    pin_by_anchors (and its in-process mirror, _sp_chunk_matches_anchors)
+    never even attempts to pin -- Anchors.pinnable_tables deliberately
+    excludes it (see
+    test_check_retrieval.test_pin_filter_excludes_bare_single_letter_table_anchors)
+    -- so reporting a gap here would flag a fill pinning never tried to
+    make. The project genuinely has section metadata (elsewhere), so the
+    old is_empty-gated logic -- which only asks whether ANY anchor was
+    extracted -- would wrongly call this a genuine gap. Proves the two
+    paths can't silently diverge on this gate either: whichever path still
+    gates on is_empty reports True while the other (gating on
+    pinnable_is_empty) reports False.
+    """
+    from app.api.review import _build_sp_search_fn, _build_sp_search_fn_from_supabase
+    from test_check_retrieval import _FakeDB, _chunk
+
+    instruction = (
+        "Classification follows TABLE A for this item.\n\n"
+        "Confirm the submittal is classified per the governing table."
+    )
+    other_chunk = _chunk("other", section="900.01", body="Unrelated clause.")
+
+    embed_fn = lambda q: [0.0, 0.0, 0.0]  # noqa: E731
+    embeddings = SimpleNamespace(embed_query=embed_fn)
+
+    # pinned=[other_chunk] only satisfies the Supabase closure's existence
+    # probe -- pin_by_anchors builds no conditions for a non-pinnable-only
+    # anchor set and returns [] before ever querying this fixture (see
+    # test_check_retrieval.test_pin_by_anchors_returns_empty_when_only_an_ambiguous_table_is_named).
+    db = _FakeDB(pinned=[other_chunk], vector=[], keyword=[], metadata_rows=[other_chunk])
+    supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
+
+    sp_chunks = [other_chunk]
+    sp_vectors = [[0.0, 0.0, 0.0]]
+    memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+
+    _text_a, _candidates_a, anchor_missing_a = supabase_fn(instruction, top_k=8)
+    _text_b, _candidates_b, anchor_missing_b = memory_fn(instruction, top_k=8)
+
+    assert anchor_missing_a == anchor_missing_b
+    assert anchor_missing_a is False
+
+
 def test_sp_anchor_missing_sole_source_reports_missing_with_no_llm_call():
     """anchor_missing=True means the project HAS section metadata and the
     check's own named anchor (TABLE 105.05-1) matched nothing in the Special

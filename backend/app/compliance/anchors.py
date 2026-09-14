@@ -58,6 +58,20 @@ class Anchors:
         can retrieve it and ranking can moderate it normally."""
         return tuple(t for t in self.tables if not _AMBIGUOUS_TABLE_RE.match(t))
 
+    @property
+    def pinnable_is_empty(self) -> bool:
+        """True when there is nothing pin_by_anchors could ever pin -- no
+        section anchors and no pinnable table anchors. Differs from
+        ``is_empty`` exactly when the only anchor found is a bare
+        single-letter table caption ("TABLE A"): that's still a real anchor
+        for the keyword query (``is_empty`` is False), but pinning never
+        attempts it (``pinnable_is_empty`` is True), so a check whose only
+        anchor is "TABLE A" must not be reported as a missing-anchor gap --
+        pinning never had a chance to fill it. Both ``check_retrieval.
+        retrieve_for_check`` and ``app.api.review``'s in-process closure use
+        this (not ``is_empty``) to gate ``anchor_missing``."""
+        return not self.sections and not self.pinnable_tables
+
     def as_query(self) -> str:
         """The BM25 query: anchors only, never the rule body."""
         return " ".join((*self.sections, *self.tables))

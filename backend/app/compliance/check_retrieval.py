@@ -187,9 +187,15 @@ def retrieve_for_check(
     # database), so an empty pinned_rows there is budget starvation, not a
     # genuine gap -- the same two-case collapse PIN_BUDGET_FRACTION's own
     # top_k<=1 fix exists to prevent, one boundary further out.
+    # Uses pinnable_is_empty, not is_empty: a check whose only anchor is a
+    # bare single-letter table ("TABLE A") has nothing pin_by_anchors ever
+    # attempts to pin (Anchors.pinnable_tables excludes it), so reporting a
+    # gap there would flag a fill that was never attempted. That anchor
+    # still reaches the keyword leg via anchors.as_query() -- only the
+    # missing-anchor *signal* ignores it.
     anchor_missing = (
         pin_limit > 0
-        and not anchors.is_empty
+        and not anchors.pinnable_is_empty
         and not pinned_rows
         and project_has_section_metadata(db, project_id, doc_type)
     )
