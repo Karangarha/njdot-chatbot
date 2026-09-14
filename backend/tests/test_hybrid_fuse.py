@@ -51,9 +51,19 @@ def test_empty_inputs_are_not_an_error():
     assert fuse([], [], v_weight=0.5, k_weight=0.5, match_count=5) == []
 
 
+def test_none_id_rows_never_survive_fusion_and_are_not_coalesced():
+    # Two distinct rows that both happen to have a None id must not be
+    # merged into a single output row via rows_by_id.setdefault(None, ...).
+    none_a, none_b, real = _row(None), _row(None), _row("x")
+    out = fuse([none_a, real], [none_b], v_weight=0.5, k_weight=0.5, match_count=5)
+    assert all(r["id"] is not None for r in out)
+    assert [r["id"] for r in out] == ["x"]
+
+
 if __name__ == "__main__":
     test_a_document_in_both_lists_outranks_one_in_only_the_first()
     test_keyword_weight_can_lift_a_keyword_only_hit_above_a_vector_hit()
     test_similarity_carries_the_rrf_score_and_match_count_truncates()
     test_empty_inputs_are_not_an_error()
+    test_none_id_rows_never_survive_fusion_and_are_not_coalesced()
     print("All tests passed!")
