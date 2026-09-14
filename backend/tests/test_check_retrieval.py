@@ -208,6 +208,28 @@ def test_top_k_of_one_still_leaves_budget_for_one_pin():
     assert out.anchor_missing is False
 
 
+def test_top_k_zero_is_budget_starvation_not_a_missing_anchor():
+    # FINDING 5: at top_k=0, pin_limit is forced to 0 and pin_by_anchors
+    # never even runs -- an empty pinned_rows there is budget starvation,
+    # not proof the anchor is absent. metadata_rows proves the project DOES
+    # have section metadata (so the old code would have called this a
+    # genuine gap); anchor_missing must still come back False.
+    db = _FakeDB(pinned=[], vector=[], keyword=[], metadata_rows=[_chunk("other", section="900.01")])
+    out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=0)
+    assert out.pinned == 0
+    assert out.anchor_missing is False
+
+
+def test_negative_top_k_is_also_budget_starvation_not_a_missing_anchor():
+    # A malformed custom check's sp_top_k could reach here as negative
+    # (see test_parse_checks.py's own guard against that at the API layer)
+    # -- retrieve_for_check must not treat that as a genuine gap either.
+    db = _FakeDB(pinned=[], vector=[], keyword=[], metadata_rows=[_chunk("other", section="900.01")])
+    out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=-5)
+    assert out.pinned == 0
+    assert out.anchor_missing is False
+
+
 def test_a_project_with_no_section_metadata_degrades_silently():
     # Ingested before section-aware chunking: pinning cannot work and that is
     # not evidence the clause is absent from the document.

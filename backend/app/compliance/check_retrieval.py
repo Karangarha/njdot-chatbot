@@ -180,8 +180,16 @@ def retrieve_for_check(
     # matched: it has section metadata at all and still came up empty. A
     # project with no metadata (pre-Task-6 ingestion) degrades silently --
     # pinning could never have worked there, so its absence is not evidence.
+    # Also requires pin_limit > 0: at pin_limit == 0 pin_by_anchors never
+    # even ran (its own limit<=0 guard rejects the query before touching the
+    # database), so an empty pinned_rows there is budget starvation, not a
+    # genuine gap -- the same two-case collapse PIN_BUDGET_FRACTION's own
+    # top_k<=1 fix exists to prevent, one boundary further out.
     anchor_missing = (
-        not anchors.is_empty and not pinned_rows and project_has_section_metadata(db, project_id, doc_type)
+        pin_limit > 0
+        and not anchors.is_empty
+        and not pinned_rows
+        and project_has_section_metadata(db, project_id, doc_type)
     )
 
     return RetrievalResult(rows=rows, pinned=len(pinned_rows), anchors=anchors, anchor_missing=anchor_missing)

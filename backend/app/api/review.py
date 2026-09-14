@@ -760,6 +760,15 @@ def _parse_checks(raw: Optional[str]) -> Optional[List[CheckDef]]:
             raise HTTPException(status_code=400, detail=f"checks[{i}] must be an object")
         try:
             builtin = _BUILTIN_BY_KEY.get(item["check_key"])
+            # `or 8` alone would only catch 0/None -- a negative value (e.g.
+            # -5) is truthy in Python and would pass straight through as
+            # check_retrieval.retrieve_for_check's pin budget. A custom
+            # check's sp_top_k must be a positive int or the built-in
+            # default; check_retrieval already guards top_k<=0 for a benign
+            # 0, but a stray negative from a malformed payload should not
+            # reach it at all.
+            raw_sp_top_k = item.get("sp_top_k")
+            custom_sp_top_k = raw_sp_top_k if isinstance(raw_sp_top_k, int) and raw_sp_top_k > 0 else 8
             checks.append(CheckDef(
                 check_key=item["check_key"],
                 category=item["category"],
@@ -771,7 +780,7 @@ def _parse_checks(raw: Optional[str]) -> Optional[List[CheckDef]]:
                 # payload's value, defaulting to the dataclass defaults.
                 check_type=builtin.check_type if builtin else (item.get("check_type") or "llm"),
                 source_files=item.get("source_files") or ["schedule"],
-                sp_top_k=builtin.sp_top_k if builtin else (item.get("sp_top_k") or 8),
+                sp_top_k=builtin.sp_top_k if builtin else custom_sp_top_k,
             ))
         except KeyError as exc:
             raise HTTPException(
