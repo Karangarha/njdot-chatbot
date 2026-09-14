@@ -54,7 +54,10 @@ class _FakeDB:
         outer = self
         if name == "keyword_search_session_chunks":
             outer.keyword_query = params["search_query"]
-            data = outer._keyword
+            # Real Postgres honors match_count as a LIMIT; unsliced fixture
+            # data would hide any regression in how many rows the caller
+            # actually asks the RPC for.
+            data = outer._keyword[: params.get("match_count", len(outer._keyword))]
         else:
             data = outer._vector
 
@@ -353,6 +356,31 @@ def test_project_has_section_metadata_finds_a_later_row_not_just_the_first():
     rows = [{"metadata": {"section_id": None}}, {"metadata": {"section_id": "105.05"}}]
     assert project_has_section_metadata(_FilteringDB(rows), "p1") is True
     assert project_has_section_metadata(_FilteringDB([{"metadata": {}}]), "p1") is False
+
+
+def test_pinning_still_fills_the_budget_when_the_two_legs_overlap():
+    """Regression for the fetch-size bug: each leg used to be asked for only
+    `remaining` rows. When the dense and keyword legs return the SAME rows
+    (realistic -- an exact-match anchor ranks highly in both) and those rows
+    are also the ones already pinned, there is nothing left after the
+    pinned-id dedupe to fill the budget with.
+
+    Both legs here return the identical 8-row pool, and its first 4 rows are
+    exactly the 4 pinned rows. A `remaining`-sized fetch (4/leg) returns only
+    those 4 pinned rows per leg, so after fusion (no-op, both legs agree)
+    and the pinned dedupe, ZERO unpinned survivors are left -- the check
+    comes back with 4 rows instead of 8. Over-fetching each leg to `top_k`
+    (8) pulls the 4 genuinely-unpinned rows (f0..f3) into range, which is
+    exactly `remaining`.
+    """
+    pinned = [_chunk(f"p{i}", section="105.05", chunk_index=i) for i in range(4)]
+    pool = pinned + [_chunk(f"f{i}") for i in range(4)]
+    db = _FakeDB(pinned=pinned, vector=pool, keyword=pool)
+
+    out = retrieve_for_check(db, lambda q: [0.0] * 3, "p1", _INSTRUCTION, top_k=8)
+
+    ids = [r["id"] for r in out.rows]
+    assert len(ids) == len(set(ids)) == 8
 
 
 if __name__ == "__main__":
