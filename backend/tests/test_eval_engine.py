@@ -859,15 +859,19 @@ def test_both_sp_closures_return_identical_passages_for_one_query():
     assert anchor_missing_a == anchor_missing_b
 
 
-def test_sp_anchor_missing_reports_missing_with_no_llm_call():
+def test_sp_anchor_missing_sole_source_reports_missing_with_no_llm_call():
     """anchor_missing=True means the project HAS section metadata and the
-    check's own named anchor (TABLE 105.05-1) matched nothing -- a genuine,
-    provable gap, unlike a project ingested before section-aware chunking
-    (which must degrade silently, see the next test). Must short-circuit to
-    Missing without ever calling the LLM, and must name the anchor so a
-    reviewer knows what to look for."""
+    check's own named anchor (TABLE 105.05-1) matched nothing in the Special
+    Provision -- and here "sp" is this check's ONLY evidence source, so
+    there is nothing else left to consult. Must short-circuit to Missing
+    without ever calling the LLM, must name the anchor so a reviewer knows
+    what to look for, and must NOT claim the clause is absent from the
+    project (only that it wasn't found in the Special Provision) -- unlike a
+    project ingested before section-aware chunking (which must degrade
+    silently, see test_sp_anchor_missing_false_behaves_exactly_as_before),
+    and unlike a multi-source check (see the next test)."""
     check = _make_check(
-        check_key="working_drawing_review_time", source_files=["sp", "schedule"],
+        check_key="working_drawing_review_time", source_files=["sp"],
         instruction=(
             "Category is set by Table 105.05-1 - but the Special Provisions "
             "often REPLACE that table."
@@ -886,6 +890,8 @@ def test_sp_anchor_missing_reports_missing_with_no_llm_call():
 
     assert result.status == "Missing"
     assert "105.05" in result.evidence or "TABLE 105.05-1" in result.evidence
+    assert "not found in the Special Provision" in result.evidence
+    assert "absent from" not in result.evidence.lower()
     assert usage["llm_call_count"] == 0
     # usage accumulates only after invoke() returns, so a raising invoke (the
     # empty response queue's .pop(0) would raise IndexError) also leaves
@@ -893,6 +899,59 @@ def test_sp_anchor_missing_reports_missing_with_no_llm_call():
     # reached. .calls is appended before the pop, so this is what actually
     # proves it.
     assert len(llm.calls) == 0
+
+
+def test_sp_anchor_missing_multi_source_reaches_other_sources():
+    """anchor_missing=True but "sp" is NOT this check's sole source (it also
+    names "spec") -- must NOT short-circuit. The spec source must still be
+    queried and reach the LLM, with a note about the missing SP anchor
+    folded into the evidence rather than a terminal Missing verdict. This is
+    the FINDING 1 regression case: nearby_projects' 105.06 anchor is absent
+    from the Special Provision but the check also names "spec", whose base
+    Standard Specifications text can still answer it."""
+    check = _make_check(
+        check_key="nearby_projects", source_files=["sp", "spec"],
+        instruction="Look in: Special Provisions 105.06; Standard Specifications 105.06.",
+    )
+    original = EvaluationSchema(
+        considered_items=[], breaching_items=[],
+        evidence="105.06 base form, no adjacent work named", source="spec 105.06",
+    )
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def sp_search_fn(query, top_k=8):
+        return "[cite:sp-0] unrelated clause text", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision"),
+        }, True  # anchor_missing
+
+    spec_calls = []
+
+    def spec_search_fn(query):
+        spec_calls.append(query)
+        return "[cite:specs-0] 105.06 Cooperation with Others (base form).", {
+            "specs-0": EvidenceCandidate(kind="public", doc_type="spec", label="Standard Specifications"),
+        }
+
+    result, usage = _call_evaluate_one_check(
+        check, llm, judge, sp_search_fn=sp_search_fn, spec_search_fn=spec_search_fn,
+    )
+
+    # spec was actually queried -- the other source was reached, not skipped.
+    assert len(spec_calls) == 1
+    # the LLM (and judge) ran normally -- no terminal short-circuit.
+    assert len(llm.calls) == 1
+    assert usage["llm_call_count"] == 2  # original + judge
+    assert result.status == "Pass"
+    # the evidence the LLM actually saw carries a note about the missing SP
+    # anchor, softly worded (not claiming project-wide absence), plus the
+    # spec text that resolves the check.
+    sent_evidence = llm.calls[0][1].content
+    assert "not found in the Special Provision" in sent_evidence
+    assert "does not mean the clause is absent from the project" in sent_evidence
+    assert "105.06 Cooperation with Others (base form)" in sent_evidence
 
 
 def test_sp_anchor_missing_false_behaves_exactly_as_before():

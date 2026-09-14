@@ -44,10 +44,15 @@ two-tuple -- carried as the third element of that call's own return value
 .anchor_missing`` and ``app.api.review``'s SP closures for where it's
 computed) rather than on a separate retrieval-log record. ``anchor_missing``
 True means the project has section metadata, the check named a section/table
-anchor, and it matched nothing -- a genuine gap. ``_evaluate_one_check``
-short-circuits on that signal: no LLM call, an immediate "Missing" verdict
-naming the absent anchor. False is the default/no-anchor/no-metadata case
-and behaves exactly as before (evidence goes to the LLM as usual).
+anchor, and it matched nothing in the Special Provision. When "sp" is the
+check's sole evidence source, ``_evaluate_one_check`` short-circuits on that
+signal: no LLM call, an immediate "Missing" verdict naming the absent anchor.
+When other sources are also named, it instead appends a note identifying the
+missing anchor to the SP evidence and evaluates normally through all sources
+-- the anchor being absent from the Special Provision doesn't mean the clause
+is absent from the project when e.g. "spec" can still answer it. False is the
+default/no-anchor/no-metadata case and behaves exactly as before (evidence
+goes to the LLM as usual).
 """
 
 from __future__ import annotations
@@ -107,6 +112,19 @@ CitedSearch = Callable[[str], Tuple[str, Dict[str, EvidenceCandidate]]]
 # scheduling-manual, key-map, estimate) has no anchors and keeps the
 # two-tuple CitedSearch shape unchanged.
 SpCitedSearch = Callable[..., Tuple[str, Dict[str, EvidenceCandidate], bool]]
+
+# ``anchor_missing`` True means the project has section metadata, the check
+# named a section/table anchor, and it matched nothing in the Special
+# Provision specifically. ``_evaluate_one_check`` only short-circuits to a
+# terminal "Missing" verdict (no LLM call) when "sp" is the check's SOLE
+# evidence source -- every Special-Provision-scoped check in the catalog also
+# names at least one other source (schedule/narrative/spec/csm/...), and that
+# source may still answer the check correctly (e.g. a base Standard
+# Specifications section a Special Provision need not amend at all). In the
+# multi-source case, a note naming the missing anchor is appended to the SP
+# evidence block instead, and evaluation proceeds normally through the LLM,
+# _derive_status, and the grounding judge exactly as if anchor_missing were
+# False.
 
 _MAX_FACT_ROWS = 40
 
@@ -761,30 +779,47 @@ def _evaluate_one_check(
     if "sp" in sources:
         sp_text, sp_candidates, anchor_missing = sp_search_fn(check.instruction, top_k=check.sp_top_k)
         if anchor_missing:
-            # The project HAS section metadata and the check's own named
-            # anchor still matched nothing -- a genuine, provable gap, not a
-            # pre-section-aware project where pinning simply can't work (see
-            # this module's docstring). No point spending an LLM call asking
-            # the model about text it was never given: construct
-            # ReviewCheckResult(status="Missing") directly, naming the
-            # anchor for the reviewer. This does NOT go through
-            # _derive_status -- there is no EvaluationSchema here (no LLM
-            # call was made for this check), so there is nothing for
-            # _derive_status to inspect. Direct construction is the same
-            # idiom the missing_sources short-circuit above already uses for
-            # the same reason.
             anchors = extract_anchors(check.instruction)
             named = ", ".join((*anchors.sections, *anchors.tables))
-            return ReviewCheckResult(
-                id=check.check_key, category=check.category, name=check.name,
-                status="Missing",
-                evidence=(
-                    f"{named} was not found anywhere in this project's Special "
-                    "Provisions, which do have section-level metadata -- this "
-                    "check's named clause appears to be genuinely absent."
-                ),
-                source="special provision",
-            ), usage_totals
+            if set(sources) == {"sp"}:
+                # The project HAS section metadata, the check's own named
+                # anchor still matched nothing, and Special Provision search
+                # is this check's ONLY evidence source -- there is nothing
+                # else left to consult. No point spending an LLM call asking
+                # the model about text it was never given: construct
+                # ReviewCheckResult(status="Missing") directly, naming the
+                # anchor for the reviewer. This does NOT go through
+                # _derive_status -- there is no EvaluationSchema here (no LLM
+                # call was made for this check), so there is nothing for
+                # _derive_status to inspect. Direct construction is the same
+                # idiom the missing_sources short-circuit above already uses
+                # for the same reason.
+                return ReviewCheckResult(
+                    id=check.check_key, category=check.category, name=check.name,
+                    status="Missing",
+                    evidence=(
+                        f"{named} was not found in the Special Provision. "
+                        "Special Provision search is this check's only "
+                        "evidence source, so there is nothing else to "
+                        "consult."
+                    ),
+                    source="special provision",
+                ), usage_totals
+            # Other sources remain (spec/csm/schedule/etc.) that might still
+            # answer this check -- e.g. a Special Provision need not amend a
+            # Standard Specifications section at all, in which case "spec" is
+            # the source that actually resolves it. Don't short-circuit:
+            # append a note to the SP evidence block so the model (and a
+            # human reader) sees that the named anchor specifically was not
+            # found in the Special Provision, and let the normal verdict path
+            # (LLM + insufficient_evidence + grounding judge) decide the
+            # outcome from all sources together.
+            sp_text = (
+                f"{sp_text}\n\n[Special Provision note: {named} was not "
+                "found in the Special Provision. This does not mean the "
+                "clause is absent from the project -- check the other "
+                "evidence sources below before concluding it is missing.]"
+            )
         evidence_parts.append(sp_text)
         citation_lookup.update(sp_candidates)
     if "keymap" in sources:
