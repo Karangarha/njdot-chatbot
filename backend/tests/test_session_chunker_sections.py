@@ -19,6 +19,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from app.ingestion.section_detector import detect  # noqa: E402
 from app.ingestion.session_chunker import chunk_special_provision  # noqa: E402
 
 
@@ -40,12 +41,29 @@ def test_each_chunk_carries_the_section_it_belongs_to():
 
 
 def test_a_chunk_never_spans_two_detected_sections():
+    # A chunk tagged with one section_id must not contain a *different*
+    # section's heading line. Checking only "does 105.06's heading appear,
+    # and if so is the tag 105.06" (the previous version of this test) passes
+    # vacuously against a chunker that never segments and just tags every
+    # chunk with the last heading it saw: such a chunk would contain BOTH
+    # headings' text but be tagged with the later one, satisfying that
+    # weaker check while still genuinely spanning two sections. Scanning for
+    # every heading in the content and requiring it to match the chunk's own
+    # tag catches that: the earlier heading (105.05) would still be present
+    # and would not match a "105.06" tag.
     pages = _pages(
         "105.05 WORKING DRAWINGS\nFirst clause body.\n"
         "105.06 COOPERATION WITH OTHERS\nSecond clause body.\n"
     )
     for c in chunk_special_provision(pages):
-        assert "105.06 COOPERATION" not in c["content"] or c["metadata"]["section_id"] == "105.06"
+        tagged_section = c["metadata"]["section_id"]
+        for line in c["content"].splitlines():
+            match = detect(line)
+            if match is not None:
+                assert match["section_id"] == tagged_section, (
+                    f"chunk tagged {tagged_section!r} contains heading "
+                    f"{match['section_id']!r} from a different section"
+                )
 
 
 def test_table_captions_are_recorded_in_metadata():
