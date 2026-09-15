@@ -30,11 +30,14 @@ Each dict:
 
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 import tiktoken
+
+logger = logging.getLogger(__name__)
 
 _ENCODING_NAME  = "cl100k_base"
 _SP_MAX_TOKENS  = 600
@@ -273,6 +276,10 @@ def _extract_page_with_tables(
     try:
         import pdfplumber as _plumber
     except ImportError:
+        logger.warning(
+            "pdfplumber unavailable — Special Provision tables will be chunked as "
+            "raw linearized text instead of natural-language sentences",
+        )
         return pages
 
     enriched: List[Dict[str, Any]] = []
@@ -290,7 +297,12 @@ def _extract_page_with_tables(
                     finders     = pdf_page.find_tables()
                     tables_data = [f.extract() for f in finders]
                     table_bboxes = [f.bbox for f in finders]
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "Table extraction failed on PDF page %d — keeping the raw "
+                        "page text: %s",
+                        p_num, exc,
+                    )
                     enriched.append(page_dict)
                     continue
 
@@ -308,7 +320,12 @@ def _extract_page_with_tables(
                         return True
                     try:
                         non_table_text = pdf_page.filter(_outside).extract_text() or ""
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning(
+                            "Could not separate non-table text on PDF page %d — the "
+                            "table text may appear twice in this chunk: %s",
+                            p_num, exc,
+                        )
                         non_table_text = page_dict["text"]
                 else:
                     non_table_text = page_dict["text"]
@@ -317,7 +334,12 @@ def _extract_page_with_tables(
                 combined = "\n\n".join(parts)
                 enriched.append({**page_dict, "text": combined or page_dict["text"]})
 
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "Could not reopen %s for table extraction — chunking the raw text "
+            "instead: %s",
+            pdf_path, exc,
+        )
         return pages
 
     return enriched
