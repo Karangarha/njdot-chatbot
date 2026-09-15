@@ -35,6 +35,12 @@ if sys.platform == "win32":
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+# Imported up here, not with the app.api.* routers below, because the logging
+# block that follows calls configure_console_logging(). Safe to hoist: this
+# module imports only the stdlib, so it pulls in no part of the app that would
+# emit a record before logging is configured.
+from app.request_logging import configure_console_logging, log_request_outcome
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 # Configured BEFORE the router imports below: app/api/query.py calls get_db()
 # at module-import time, and any record it emits while the root logger is
@@ -44,6 +50,7 @@ logging.basicConfig(
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
 logging.getLogger("azure").setLevel(logging.WARNING)  # App Insights auto-instrumentation floods INFO with per-request HTTP dumps
+configure_console_logging()  # quiet per-request dependency chatter; redact uvicorn's access log
 logger = logging.getLogger(__name__)
 
 from app.api.auth import router as auth_router
@@ -53,7 +60,6 @@ from app.api.query import router as query_router
 from app.api.review import router as review_router
 from app.api.session import router as session_router
 from app.config import config
-from app.request_logging import log_request_outcome
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
