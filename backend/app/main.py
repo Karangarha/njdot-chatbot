@@ -35,6 +35,17 @@ if sys.platform == "win32":
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+# Configured BEFORE the router imports below: app/api/query.py calls get_db()
+# at module-import time, and any record it emits while the root logger is
+# still an unconfigured WARNING would be dropped instead of printed.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
+)
+logging.getLogger("azure").setLevel(logging.WARNING)  # App Insights auto-instrumentation floods INFO with per-request HTTP dumps
+logger = logging.getLogger(__name__)
+
 from app.api.auth import router as auth_router
 from app.api.conversations import router as conversations_router
 from app.api.pdf import router as pdf_router
@@ -42,13 +53,7 @@ from app.api.query import router as query_router
 from app.api.review import router as review_router
 from app.api.session import router as session_router
 from app.config import config
-
-# ── Logging ───────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
-)
-logger = logging.getLogger(__name__)
+from app.request_logging import log_request_outcome
 
 # ── App ───────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -59,6 +64,17 @@ app = FastAPI(
     ),
     version="0.1.0",
 )
+
+# ── Request outcome logging ───────────────────────────────────────────────────
+# Registered BEFORE CORSMiddleware below, and the order matters: Starlette
+# inserts each newly-added middleware at the OUTSIDE of the stack, so
+# whatever is added last ends up outermost. Adding this one first leaves
+# CORSMiddleware outermost, so a 4xx/5xx response still picks up its CORS
+# headers on the way out. Note that an UNHANDLED exception is re-raised past
+# CORSMiddleware to Starlette's own ServerErrorMiddleware, which sits outside
+# all user middleware — that synthesized 500 carries no CORS headers in any
+# ordering, so this registration order is about handled responses, not crashes.
+app.middleware("http")(log_request_outcome)
 
 # ── CORS ──────────────────────────────────────────────────────────────────────
 _allowed_origins = [
