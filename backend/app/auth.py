@@ -22,10 +22,14 @@ working for older projects that haven't rotated to asymmetric keys.
 
 from __future__ import annotations
 
+import logging
+
 import jwt
 from fastapi import HTTPException
 
 from app.config import config
+
+logger = logging.getLogger(__name__)
 
 _jwks_client: jwt.PyJWKClient | None = None
 
@@ -65,8 +69,12 @@ def user_id_from_token(authorization: str | None) -> str:
             return payload["sub"]
         except jwt.ExpiredSignatureError as exc:
             raise HTTPException(status_code=401, detail="Token expired") from exc
-        except Exception:
-            pass  # not a JWKS-signed token (or JWKS unreachable) — fall through
+        except Exception as exc:
+            # Expected for a legacy HS256-signed token, which the fallback
+            # below handles — but identical in shape to a genuinely
+            # unreachable JWKS endpoint, which is not expected at all. Log
+            # it so the two stop looking the same in production.
+            logger.warning("JWKS verification did not apply, falling back to HS256: %s", exc)
 
     if not config.SUPABASE_JWT_SECRET:
         # If the JWT secret isn't configured, extract sub without verification.
