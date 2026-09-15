@@ -170,13 +170,16 @@ def _validate_owned_path(path: str, user_id: str) -> None:
     try:
         parts = _relative_path_parts(path)
         resolved = _PATH_RESOLUTION_BASE.joinpath(*parts).parts[1:]
-    except Exception:
+    except Exception as exc:
         # yarl can raise on more than just a doubly-encoded "%2Fx" segment
         # (e.g. a "//host"-prefixed path making it parse a bogus host, or
         # a segment that fails IDNA encoding) -- any parse failure here
         # means the input is malformed/adversarial, not a legitimate
         # value, so it's rejected the same way as a resolved-but-wrong
         # path rather than propagating as an unhandled 500.
+        logger.warning(
+            "Rejected unparseable Storage path %r for user_id=%s: %s", path, user_id, exc,
+        )
         raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
     if (
         len(resolved) < 4
@@ -184,6 +187,10 @@ def _validate_owned_path(path: str, user_id: str) -> None:
         or resolved[1] != _STORAGE_BUCKET
         or resolved[2] != user_id
     ):
+        logger.warning(
+            "Rejected Storage path %r for user_id=%s (resolves to %s)",
+            path, user_id, "/".join(resolved),
+        )
         raise HTTPException(status_code=403, detail="Storage path does not belong to you.")
 
 
@@ -553,9 +560,19 @@ def _seed_edq_items_if_needed(
     if existing and existing[0]["c"]:
         return
     if not estimate_bytes:
+        logger.warning(
+            "EDQ seeding skipped for project_id=%s: no estimate document uploaded — "
+            "the edq_items check will report Missing",
+            project_id,
+        )
         return
     extraction = extract_edq_items(estimate_bytes, llm, project_id=project_id, user_id=user_id)
     if extraction is None or not extraction.items:
+        logger.warning(
+            "EDQ seeding skipped for project_id=%s: no line items could be read from "
+            "the estimate document — the edq_items check will report Missing",
+            project_id,
+        )
         return
     activities = graph.query(
         "MATCH (a:Activity {projectId: $pid}) "
@@ -563,6 +580,11 @@ def _seed_edq_items_if_needed(
         params={"pid": project_id},
     ) or []
     if not activities:
+        logger.warning(
+            "EDQ seeding skipped for project_id=%s: the schedule graph holds no "
+            "activities to match against",
+            project_id,
+        )
         return
     items = [{
         "id": f"edq:{i}", "jobId": it.job_id, "category": it.category,
@@ -572,7 +594,12 @@ def _seed_edq_items_if_needed(
     matches = match_edq_items_to_activities(
         items, activities, llm, embeddings, project_id=project_id, user_id=user_id)
     if matches is None:
-        return  # matching failed -- don't seed a false "all uncovered" state; retry next run
+        logger.warning(
+            "EDQ matching failed for project_id=%s — not seeding, so the next rerun "
+            "retries instead of recording a false 'all uncovered' result",
+            project_id,
+        )
+        return
     seed_edq_items(graph, items, matches, project_id=project_id)
 
 
