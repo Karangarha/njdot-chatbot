@@ -44,7 +44,7 @@ import os
 import tempfile
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, Response, UploadFile
@@ -54,14 +54,19 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from yarl import URL as _YarlURL
 
 from app.auth import user_id_from_token, user_id_from_token_optional
+from app.compliance.anchors import extract_anchors
 from app.compliance.catalog import BUILTIN_CHECKS, MANUAL_REVIEW_KEYS, CheckDef
+from app.compliance.check_retrieval import PIN_BUDGET_FRACTION, retrieve_for_check
 from app.compliance.cost import CostGapResult, evaluate_cost_gap
 from app.compliance.edq import EdqCoverageResult, evaluate_edq_coverage, match_edq_items_to_activities
-from app.compliance.eval_engine import evaluate_checks
+from app.compliance.date_rule import DateRuleResult, evaluate_date_rules
+from app.compliance.eval_engine import CitedSearch, EvidenceCandidate, SpCitedSearch, evaluate_checks
 from app.compliance.geo import RegionResult, resolve_region
+from app.compliance.schedule_logic import ScheduleLogicResult, evaluate_schedule_logic
 from app.config import config
 from app.database import get_db
 from app.graph_neo4j.seed import (
+    SEED_VERSION,
     seed_edq_items,
     seed_narrative,
     seed_schedule,
@@ -85,7 +90,6 @@ from app.ingestion.utility_plan_extractor import extract_utility_plan, render_ut
 from app.models import ReviewCheckResult, ReviewResponse
 from app.neo4j_client import get_neo4j
 from app.retrieval.vector_search import VectorSearcher
-from app.retrieval_langchain.sp_retriever import retrieve_sp_chunks
 from app.retrieval_langchain.utility_plan_retriever import retrieve_utility_plan_chunks
 from app.scheduling import build_calendars, build_network, cross_check, run_cpm
 # Re-exported for backward compatibility (session.py and debug scripts import
@@ -111,12 +115,17 @@ _STORAGE_BUCKET = "review-files"
 _SPEC_COLLECTION = "specs_2019"   # NJDOT Standard Specifications
 _CSM_COLLECTION = "scheduling"    # Construction Scheduling Manual
 
-# EvaluationSchema's Pass/Fail/Missing -> the frontend's existing lowercase enum.
+# ReviewCheckResult.status's Pass/Fail/Missing -> the frontend's existing lowercase enum.
 _STATUS_MAP = {"Pass": "pass", "Fail": "fail", "Missing": "warning"}
 
-# Fallback check_type by check_key, for `checks` payloads sent by a frontend
-# that predates the field — see _parse_checks.
-_BUILTIN_CHECK_TYPES = {c.check_key: c.check_type for c in BUILTIN_CHECKS}
+# Built-in check_key -> CheckDef. check_type/sp_top_k are engine dispatch,
+# not user data: a forked compliance_checks row (frontend checklist.ts
+# ensureForked) carries whatever check_type was current when the user first
+# edited their checklist and is never re-synced, so for built-ins the
+# payload's value is ignored and the catalog's is used unconditionally
+# (otherwise a stale "llm" keeps a since-deterministic check on the LLM
+# path). Custom checks keep what the payload says. See _parse_checks.
+_BUILTIN_BY_KEY = {c.check_key: c for c in BUILTIN_CHECKS}
 
 
 # ── In-process review progress store ────────────────────────────────────────
@@ -341,11 +350,36 @@ def _cosine(a: List[float], b: List[float]) -> float:
     return float(np.dot(va, vb) / denom) if denom else 0.0
 
 
+def _sp_chunk_matches_anchors(chunk: Dict[str, Any], anchors: Any) -> bool:
+    """Same pin test as ``check_retrieval.pin_by_anchors``, against an
+    in-memory chunk's metadata instead of a ``session_chunks`` row.
+
+    Section matching (including the dot-bounded parent/child rule -- a check
+    naming "105.07" also pins a chunk headed by "105.07.02") is delegated to
+    ``Anchors.matches_section`` so this stays in lockstep with
+    ``pin_by_anchors``'s own ``metadata->>section_id.like.<anchor>.*``
+    filter without re-deriving the boundary rule here.
+
+    Uses ``anchors.pinnable_tables``, not ``anchors.tables``, for the same
+    reason ``pin_by_anchors`` does (see ``Anchors.pinnable_tables``): a bare
+    single-letter caption like "TABLE A" is ambiguous across documents, and
+    pinning bypasses ranking entirely, so a wrong pin is worse than no pin.
+    Keeping this in sync with ``pin_by_anchors`` matters beyond style -- the
+    two SP search closures are tested for parity
+    (test_both_sp_closures_return_identical_passages_for_one_query).
+    """
+    metadata = chunk.get("metadata") or {}
+    if anchors.matches_section(metadata.get("section_id")):
+        return True
+    return bool(set(metadata.get("tables") or ()) & set(anchors.pinnable_tables))
+
+
 def _build_sp_search_fn(
     sp_chunks: List[Dict[str, Any]], sp_vectors: List[List[float]], embeddings: OpenAIEmbeddings,
-) -> Optional[Callable[[str], str]]:
+) -> Optional[SpCitedSearch]:
     """In-process cosine-ranked Special Provision search over already-chunked
-    and already-embedded SP text.
+    and already-embedded SP text, tagging each returned passage for citation
+    verification (e.g. ``[cite:sp-0]``).
 
     Takes precomputed ``sp_chunks``/``sp_vectors`` rather than raw bytes so
     the caller (``_run_review_pipeline``) can chunk/embed the SP PDF exactly
@@ -353,28 +387,87 @@ def _build_sp_search_fn(
     ``insert_session_chunks`` call that persists them to Supabase
     ``session_chunks`` — previously each computed its own chunks/embeddings
     independently, doubling SP embedding calls on every fresh review.
+
+    This closure has no database to pin against, so it can't call
+    ``check_retrieval.retrieve_for_check`` directly (that issues real
+    PostgREST/RPC queries). It instead pins over ``sp_chunks`` itself using
+    the identical anchor extraction and pin budget (``extract_anchors``,
+    ``PIN_BUDGET_FRACTION``) ``retrieve_for_check`` uses, so the two agree on
+    *which* chunks are anchor matches rather than merely resembling each
+    other. There is no keyword/BM25 index over in-memory chunks -- there
+    never was one here -- so the unpinned half of the budget is filled by
+    the existing cosine ranking only.
     """
     if not sp_chunks:
         return None
-    texts = [c["content"] for c in sp_chunks]
 
-    def _search(query: str, top_k: int = 5) -> str:
-        q_vec = embeddings.embed_query(query)
-        scored = sorted(zip(texts, sp_vectors), key=lambda tv: -_cosine(q_vec, tv[1]))
-        top = [t for t, _ in scored[:top_k]]
-        return "\n\n---\n\n".join(top) if top else "No matching Special Provision text found."
+    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate], bool]:
+        anchors = extract_anchors(query)
+        pin_limit = max(1, int(top_k * PIN_BUDGET_FRACTION)) if top_k > 0 else 0
+        pinned: List[Dict[str, Any]] = []
+        if pin_limit > 0 and not anchors.is_empty:
+            pinned = sorted(
+                (c for c in sp_chunks if _sp_chunk_matches_anchors(c, anchors)),
+                key=lambda c: (c.get("metadata") or {}).get("chunk_index") or 0,
+            )[:pin_limit]
+        pinned_ids = {id(c) for c in pinned}
+
+        remaining = max(top_k - len(pinned), 0)
+        ranked: List[Dict[str, Any]] = []
+        if remaining > 0:
+            q_vec = embeddings.embed_query(query)
+            pool = [(c, v) for c, v in zip(sp_chunks, sp_vectors) if id(c) not in pinned_ids]
+            ranked = [c for c, _ in sorted(pool, key=lambda cv: -_cosine(q_vec, cv[1]))[:remaining]]
+
+        top = pinned + ranked
+        # Mirrors retrieve_for_check's three-way split: a missing anchor is
+        # only evidence of a genuine gap when this project's chunks carry
+        # section metadata at all (see check_retrieval.project_has_section_metadata).
+        # Also requires pin_limit > 0, same as retrieve_for_check's own guard:
+        # at pin_limit == 0 pinning never even ran, so an empty `pinned` here
+        # is budget starvation, not proof the anchor is absent -- without
+        # this, this closure and retrieve_for_check disagreed at any
+        # non-positive top_k. Uses pinnable_is_empty, not is_empty, for the
+        # same reason retrieve_for_check does (see check_retrieval.py): a
+        # bare single-letter table anchor ("TABLE A") is never pinned, so
+        # its absence isn't evidence of a gap either.
+        anchor_missing = (
+            pin_limit > 0
+            and not anchors.pinnable_is_empty
+            and not pinned
+            and any((c.get("metadata") or {}).get("section_id") for c in sp_chunks)
+        )
+        if not top:
+            return "No matching Special Provision text found.", {}, anchor_missing
+
+        parts: List[str] = []
+        candidates: Dict[str, EvidenceCandidate] = {}
+        for i, chunk in enumerate(top):
+            tag = f"sp-{i}"
+            parts.append(f"[cite:{tag}] {chunk['content']}")
+            candidates[tag] = EvidenceCandidate(
+                kind="private", doc_type="special_provision", label="Special Provision",
+                page_pdf=(chunk.get("metadata") or {}).get("page_pdf"),
+            )
+        return "\n\n---\n\n".join(parts), candidates, anchor_missing
 
     return _search
 
 
 def _build_sp_search_fn_from_supabase(
     db: Any, embeddings: OpenAIEmbeddings, project_id: str,
-) -> Optional[Callable[[str], str]]:
+) -> Optional[SpCitedSearch]:
     """Special Provision search backed by ``session_chunks`` -- the
     ``reseed=False`` fast path's equivalent of ``_build_sp_search_fn``,
-    without re-parsing, re-chunking, or re-embedding the PDF. Reuses the same
-    ``retrieve_sp_chunks`` chat already calls, so review and chat can never
-    disagree about how SP retrieval works. Returns ``None`` if this project
+    without re-parsing, re-chunking, or re-embedding the PDF. Reuses
+    ``check_retrieval.retrieve_for_check`` -- the same pin+dense+keyword
+    composition ``_build_sp_search_fn`` now mirrors (in-memory pin, no
+    keyword leg) -- so the two review closures can never disagree about how
+    SP retrieval works, the way they used to before diverging on the
+    similarity floor. Chat's own SP tool (``sp_retriever.build_sp_tool``)
+    still calls the plain dense-only ``retrieve_sp_chunks`` beneath
+    ``retrieve_for_check`` with its own 0.2 floor; unifying that with the
+    compliance-check path is not this task. Returns ``None`` if this project
     has no SP chunks (matches "no SP uploaded" behavior).
     """
     existing = (
@@ -385,11 +478,22 @@ def _build_sp_search_fn_from_supabase(
     if not existing.count:
         return None
 
-    def _search(query: str) -> str:
-        rows = retrieve_sp_chunks(db, embeddings.embed_query, project_id, query)
-        if not rows:
-            return "No matching Special Provision text found."
-        return "\n\n---\n\n".join(r["content"] for r in rows)
+    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate], bool]:
+        result = retrieve_for_check(
+            db, embeddings.embed_query, project_id, query, top_k=top_k, doc_type="special_provision",
+        )
+        if not result.rows:
+            return "No matching Special Provision text found.", {}, result.anchor_missing
+        parts: List[str] = []
+        candidates: Dict[str, EvidenceCandidate] = {}
+        for i, r in enumerate(result.rows):
+            tag = f"sp-{i}"
+            parts.append(f"[cite:{tag}] {r['content']}")
+            candidates[tag] = EvidenceCandidate(
+                kind="private", doc_type="special_provision", label="Special Provision",
+                page_pdf=(r.get("metadata") or {}).get("page_pdf"),
+            )
+        return "\n\n---\n\n".join(parts), candidates, result.anchor_missing
 
     return _search
 
@@ -603,15 +707,17 @@ def _seed_edq_items_if_needed(
     seed_edq_items(graph, items, matches, project_id=project_id)
 
 
-def _build_static_doc_search_fn(collection: str, match_count: int = 5) -> Optional[Callable[[str], str]]:
+def _build_static_doc_search_fn(collection: str, match_count: int = 5) -> Optional[CitedSearch]:
     """Search-function factory for a static, pre-ingested reference
     collection (Standard Specifications or the Construction Scheduling
-    Manual). Unlike ``_build_sp_search_fn*``, this doesn't depend on any
-    per-review upload — the collection is embedded once, system-wide, by
-    ``backend/scripts/ingest_specs.py`` — so it's built unconditionally for
-    every review. Returns ``None`` only if the searcher itself can't be
-    constructed (e.g. missing OpenAI key), so a check requesting this source
-    degrades to "Missing" instead of crashing the whole review.
+    Manual), tagging each returned passage for citation verification (e.g.
+    ``[cite:specs_2019-0]``). Unlike ``_build_sp_search_fn*``, this doesn't
+    depend on any per-review upload — the collection is embedded once,
+    system-wide, by ``backend/scripts/ingest_specs.py`` — so it's built
+    unconditionally for every review. Returns ``None`` only if the searcher
+    itself can't be constructed (e.g. missing OpenAI key), so a check
+    requesting this source degrades to "Missing" instead of crashing the
+    whole review.
     """
     try:
         searcher = VectorSearcher()
@@ -619,15 +725,35 @@ def _build_static_doc_search_fn(collection: str, match_count: int = 5) -> Option
         logger.exception("Failed to initialize VectorSearcher for collection=%s", collection)
         return None
 
-    def _search(query: str) -> str:
+    def _search(query: str) -> Tuple[str, Dict[str, EvidenceCandidate]]:
         try:
             results = searcher.search(query, collection=collection, match_count=match_count)
         except Exception:
             logger.exception("Static-doc search failed for collection=%s", collection)
-            return "No matching reference text found (search error)."
+            return "No matching reference text found (search error).", {}
         if not results:
-            return "No matching reference text found."
-        return "\n\n---\n\n".join(r["content"] for r in results)
+            return "No matching reference text found.", {}
+        parts: List[str] = []
+        candidates: Dict[str, EvidenceCandidate] = {}
+        for i, r in enumerate(results):
+            tag = f"{collection}-{i}"
+            meta = r.get("metadata") or {}
+            parts.append(f"[cite:{tag}] {r['content']}")
+            doc = meta.get("doc")
+            # Only construct a candidate when metadata.doc is a real, truthy
+            # value -- falling back to `collection` as a fake doc_type would
+            # produce a "verified" citation pill that can't resolve via the
+            # real PDF-serving route (404s). A skipped tag still appears in
+            # the text above, so the LLM still sees the evidence; if it later
+            # cites this tag, citation_lookup.get(tag) in eval_engine returns
+            # None and the citation naturally falls back to "unverified".
+            if doc:
+                candidates[tag] = EvidenceCandidate(
+                    kind="public", doc_type=doc,
+                    label=meta.get("section_title") or doc,
+                    page_pdf=meta.get("page_pdf"), section_id=meta.get("section_id"),
+                )
+        return "\n\n---\n\n".join(parts), candidates
 
     return _search
 
@@ -676,17 +802,28 @@ def _parse_checks(raw: Optional[str]) -> Optional[List[CheckDef]]:
         if not isinstance(item, dict):
             raise HTTPException(status_code=400, detail=f"checks[{i}] must be an object")
         try:
+            builtin = _BUILTIN_BY_KEY.get(item["check_key"])
+            # `or 8` alone would only catch 0/None -- a negative value (e.g.
+            # -5) is truthy in Python and would pass straight through as
+            # check_retrieval.retrieve_for_check's pin budget. A custom
+            # check's sp_top_k must be a positive int or the built-in
+            # default; check_retrieval already guards top_k<=0 for a benign
+            # 0, but a stray negative from a malformed payload should not
+            # reach it at all.
+            raw_sp_top_k = item.get("sp_top_k")
+            custom_sp_top_k = raw_sp_top_k if isinstance(raw_sp_top_k, int) and raw_sp_top_k > 0 else 8
             checks.append(CheckDef(
                 check_key=item["check_key"],
                 category=item["category"],
                 name=item["name"],
                 instruction=item.get("instruction", ""),
-                # Catalog-lookup fallback covers payloads from frontends that
-                # predate check_type in CheckSpec — without it a deterministic
-                # check would silently run as an ordinary LLM call.
-                check_type=(item.get("check_type")
-                            or _BUILTIN_CHECK_TYPES.get(item["check_key"], "llm")),
+                # Built-ins: always the catalog's dispatch fields (see
+                # _BUILTIN_BY_KEY) -- a stale forked row must not route a
+                # deterministic check through the LLM. Custom checks: the
+                # payload's value, defaulting to the dataclass defaults.
+                check_type=builtin.check_type if builtin else (item.get("check_type") or "llm"),
                 source_files=item.get("source_files") or ["schedule"],
+                sp_top_k=builtin.sp_top_k if builtin else custom_sp_top_k,
             ))
         except KeyError as exc:
             raise HTTPException(
@@ -730,11 +867,38 @@ def _to_frontend_shape(response: ReviewResponse) -> dict:
                 "status": _STATUS_MAP.get(c.status, "warning"),
                 "finding": c.evidence,
                 "evidence": c.evidence,
+                "citations": [cit.model_dump() for cit in c.citations],
             }
             for c in response.checks
         ],
         "manual_review_items": response.manual_review_items,
     }
+
+
+def _seed_schedule_graph(
+    graph: Any, schedule_bytes: bytes, project_id: str,
+) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], Any]:
+    """Parse the XER -> CPM -> cross-check -> ``seed_schedule``. Returns
+    ``(activities, project, cpm)``. CPM failure is non-fatal (the graph is
+    seeded without computed values; ``Project.computedCount`` stays unset
+    so the deterministic checks report Missing rather than a false Pass).
+    Shared by the fresh-review path and the rerun path's stale-seed refresh.
+    """
+    xer_text = schedule_bytes.decode("utf-8", errors="ignore")
+    parsed = parse_xer_all(xer_text)
+    activities = parsed["activities"]
+    calendars = parsed["calendars"]
+    project = parsed["project"]
+
+    cpm = xcheck = None
+    try:
+        cpm = run_cpm(build_network(activities), build_calendars(calendars), project)
+        xcheck = cross_check(activities, cpm)
+    except Exception:
+        logger.exception("CPM computation failed; review proceeds without computed values")
+
+    seed_schedule(graph, activities, calendars, cpm, xcheck, project, project_id=project_id)
+    return activities, project, cpm
 
 
 def _run_review_pipeline(
@@ -781,35 +945,33 @@ def _run_review_pipeline(
 
     if not reseed:
         existing = graph.query(
-            "MATCH (a:Activity {projectId: $pid}) RETURN count(a) AS c LIMIT 1",
+            "MATCH (p:Project {projectId: $pid}) RETURN p.seedVersion AS seedVersion LIMIT 1",
             params={"pid": project_id},
         )
-        reseed = not existing or not existing[0]["c"]
+        reseed = not existing
         if reseed:
             logger.warning(
                 "_run_review_pipeline: project_id=%s has no seeded graph data; "
                 "falling back to a full reseed", project_id,
             )
+        elif existing[0].get("seedVersion") != SEED_VERSION:
+            # Seeded by an older build: Calendar/Activity properties the
+            # deterministic checks read (exceptionDates, the FS/SS-vs-FS/FF
+            # open-end flags, hasFreeFloatNote) are absent or stale. Refresh
+            # the schedule side only -- MERGE-based and idempotent; the
+            # narrative/SP/key-map/estimate data is unaffected and stays put.
+            logger.info(
+                "_run_review_pipeline: project_id=%s schedule graph is seedVersion=%s "
+                "(current %s); re-seeding the schedule graph",
+                project_id, existing[0].get("seedVersion"), SEED_VERSION,
+            )
+            _set_review_progress(project_id, status="running", message="Refreshing schedule graph…")
+            _seed_schedule_graph(graph, schedule_bytes, project_id)
 
     if reseed:
-        # ── Parse XER -> CPM -> crosscheck ──────────────────────────────────
-        xer_text = schedule_bytes.decode("utf-8", errors="ignore")
-        parsed = parse_xer_all(xer_text)
-        activities = parsed["activities"]
-        calendars = parsed["calendars"]
-        project = parsed["project"]
-
-        # Non-fatal: on failure the review proceeds without computed CPM values.
-        cpm = xcheck = None
-        try:
-            cpm = run_cpm(build_network(activities), build_calendars(calendars), project)
-            xcheck = cross_check(activities, cpm)
-        except Exception:
-            logger.exception("CPM computation failed; review proceeds without computed values")
-
-        # ── Seed Neo4j (schedule + narrative + SP), fenced to this project_id ──
+        # ── Parse XER -> CPM -> crosscheck -> seed Neo4j, fenced to project_id ──
         _set_review_progress(project_id, status="running", message="Seeding schedule graph…")
-        seed_schedule(graph, activities, calendars, cpm, xcheck, project, project_id=project_id)
+        activities, project, cpm = _seed_schedule_graph(graph, schedule_bytes, project_id)
 
         _set_review_progress(project_id, status="running", message="Seeding narrative graph…")
         narrative_pages = _bytes_to_pdf_pages(narrative_bytes)
@@ -937,6 +1099,33 @@ def _run_review_pipeline(
     # it reflects the current graph state.
     edq_coverage: Optional[EdqCoverageResult] = evaluate_edq_coverage(graph, project_id)
 
+    # Schedule-logic checks (negative float / lag / open ends / mandatory
+    # constraints) read the schedule graph, which is always seeded -- unlike
+    # geo/cost_gap/edq_coverage there's no optional-upload gate here.
+    schedule_logic: Dict[str, ScheduleLogicResult] = evaluate_schedule_logic(graph, project_id)
+
+    # award_to_construction's project-type classification checks two
+    # independent sources for the Federal Project Number (key map, DBE Goal
+    # Memo) -- present-but-different is a conflict (Missing), present in
+    # only one is not.
+    federal_project_no = (
+        getattr(keymap_extraction, "federal_project_no", None) if keymap_extraction else None
+    ) or (
+        getattr(estimate_extraction, "federal_project_number", None) if estimate_extraction else None
+    )
+    km_federal = getattr(keymap_extraction, "federal_project_no", None) if keymap_extraction else None
+    est_federal = getattr(estimate_extraction, "federal_project_number", None) if estimate_extraction else None
+    conflicting_federal_number = bool(km_federal and est_federal and km_federal != est_federal)
+
+    # Date-rule checks (weekday tests, business-day gaps, winter-window
+    # tests) likewise always run -- substantial_regional_deadlines is the
+    # one that needs keymap_geo.region, which is None (not "missing data")
+    # when no key map was uploaded; the evaluator reports that as Missing.
+    date_rule: Dict[str, DateRuleResult] = evaluate_date_rules(
+        graph, project_id, keymap_geo.region if keymap_geo else None,
+        federal_project_no=federal_project_no, conflicting_federal_number=conflicting_federal_number,
+    )
+
     # ── Evaluate the checklist ───────────────────────────────────────────────────
     # Static reference collections — independent of reseed/fast-path above,
     # since they're ingested once system-wide, not per review.
@@ -954,7 +1143,8 @@ def _run_review_pipeline(
             sp_search_fn=sp_search_fn, spec_search_fn=spec_search_fn, csm_search_fn=csm_search_fn,
             keymap_facts=keymap_facts, keymap_geo=keymap_geo,
             estimate_facts=estimate_facts, cost_gap=cost_gap,
-            edq_coverage=edq_coverage,
+            edq_coverage=edq_coverage, schedule_logic=schedule_logic,
+            date_rule=date_rule,
             utility_plan_search_fn=utility_plan_search_fn,
             project_id=project_id, user_id=user_id,
             on_progress=lambda done, total: _set_review_progress(

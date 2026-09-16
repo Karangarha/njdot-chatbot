@@ -101,20 +101,68 @@ class DebugResponse(BaseModel):
 
 class EvaluationSchema(BaseModel):
     """Structured output shape enforced via ``.with_structured_output()`` for
-    each individual compliance-check LLM call."""
+    each individual compliance-check LLM call.
 
-    status:   Literal["Pass", "Fail", "Missing"]
+    ``status`` is deliberately NOT a field here — it used to be, and the
+    model could say "Fail" while its own ``evidence`` described a Pass (or
+    cite an activity that was never actually a breach). Status is now
+    derived in Python (see ``app.compliance.eval_engine._derive_status``):
+    non-empty ``breaching_items`` -> Fail; else ``insufficient_evidence``
+    -> Missing; else Pass. That makes a self-contradictory verdict
+    structurally impossible instead of something a grounding judge has to
+    catch after the fact.
+    """
+
+    considered_items: List[str] = []
+    # Every activity ID, milestone ID, or SP/spec section number the rule
+    # governs, found in the evidence -- literal IDs only, not prose. The
+    # full candidate set, not just the ones that breach.
+    breaching_items: List[str] = []
+    # The subset of considered_items that actually breaches the rule.
+    # Every entry must also appear in considered_items -- validated in
+    # app.compliance.eval_engine, not just requested here.
+    insufficient_evidence: bool = False
+    # True when the material the rule needs is not in the evidence (a
+    # required SP section/table was not retrieved, a required narrative
+    # element or count is absent, the cross-check section is missing).
+    # Renders as Missing/needs-review rather than a green Pass. Ignored
+    # when breaching_items is non-empty.
     evidence: str   # verbatim extraction or exact metric found
     source:   str   # page number, document name, or Task ID
+    cited_chunk_ids: List[str] = []   # tags copied verbatim from tagged evidence passages
 
 
 class GroundingJudgment(BaseModel):
-    """Structured output for the second-pass grounding judge — verifies that
-    an ``EvaluationSchema`` result's evidence actually supports its status,
-    catching self-contradictory verdicts a single LLM call can produce."""
+    """Structured output for the second-pass grounding judge. With status
+    mechanically derived from breaching_items (see EvaluationSchema) and
+    item hallucination caught by a separate mechanical check, this judge's
+    remaining job is narrower than "is this grounded": does the quoted
+    evidence text actually SUPPORT treating the listed items as breaches,
+    rather than just naming real IDs that don't actually breach the rule."""
 
     grounded: bool
     reason:   str   # brief explanation, especially when grounded=False
+
+
+class ReviewCitation(BaseModel):
+    """One source reference attached to a review check's evidence.
+
+    ``verified=True`` means either the LLM named a tagged passage that was
+    actually retrieved for this check (chunk-level citation, Spec/CSM/SP/
+    Narrative), or it's an automatic whole-document reference (Key Map/
+    Estimate, which have no per-passage retrieval to verify against).
+    ``verified=False`` means the LLM claimed a citation that couldn't be
+    matched to anything retrieved -- shown flagged, never clickable.
+    """
+
+    kind:       Literal["public", "private"]
+    # public  -> doc_type is the doc_name for GET /api/pdf/{doc_type}
+    # private -> doc_type is the doc_type for GET /api/review/{project_id}/pdf/{doc_type}
+    doc_type:   str
+    label:      str
+    page_pdf:   Optional[int] = None
+    section_id: Optional[str] = None
+    verified:   bool
 
 
 class ReviewCheckResult(BaseModel):
@@ -126,6 +174,7 @@ class ReviewCheckResult(BaseModel):
     status:   Literal["Pass", "Fail", "Missing"]
     evidence: str
     source:   str
+    citations: List[ReviewCitation] = []
 
 
 class ReviewResponse(BaseModel):

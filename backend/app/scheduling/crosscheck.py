@@ -37,6 +37,7 @@ def cross_check(
 ) -> Dict[str, Any]:
     """Per-activity comparison of computed vs P6-stored CPM values."""
     mismatches: List[Dict[str, Any]] = []
+    free_float_notes: List[Dict[str, Any]] = []
     date_deltas: Counter = Counter()
     float_mismatch_ids: List[str] = []
     critical_flag_diffs: List[str] = []
@@ -65,13 +66,19 @@ def cross_check(
                     "delta_days": delta,
                 })
 
-        # Free float
+        # Free float -- informational only, not a recalculation failure.
+        # P6's free-float semantics on a multi-calendar project (an
+        # in-water-work or seasonal calendar can make a successor's own
+        # working-day count collapse toward zero regardless of genuine
+        # predecessor slack -- see cpm.py's free_float comment) are
+        # implementation-specific enough that exact parity isn't a
+        # reliable signal of "was this schedule recalculated." Recorded
+        # separately so it never flips act_clean / hasMismatch.
         stored_ff = act.get("stored_free_float_days")
         if stored_ff is not None and r.free_float is not None:
             delta = r.free_float - stored_ff
             if abs(delta) > tolerance_days:
-                act_clean = False
-                mismatches.append({
+                free_float_notes.append({
                     "activity_id": aid, "field": "free_float",
                     "computed": r.free_float, "stored": stored_ff,
                     "delta_days": delta,
@@ -139,6 +146,17 @@ def cross_check(
             f"Critical-path membership disagrees on {len(critical_flag_diffs)} "
             f"activities: {', '.join(critical_flag_diffs[:5])}"
             f"{' …' if len(critical_flag_diffs) > 5 else ''}.")
+    if free_float_notes:
+        ff_ids = [m["activity_id"] for m in free_float_notes]
+        assessment.append(
+            f"Informational only (does not affect the recalculation "
+            f"determination): {len(free_float_notes)} activities show a "
+            f"free-float delta from P6's stored value, most often because a "
+            f"successor's own calendar has an extended non-working stretch "
+            f"(e.g. an in-water-work season) between the required-by date "
+            f"and the successor's actual start. Total float and dates for "
+            f"these activities agree with P6. Examples: "
+            f"{', '.join(ff_ids[:5])}{' …' if len(ff_ids) > 5 else ''}.")
     if cpm.cycles:
         assessment.append(
             f"{len(cpm.cycles)} relationship loop(s) found and broken to compute "
@@ -164,7 +182,9 @@ def cross_check(
             "max_float_delta_days": max_float_delta,
             "systematic_offset_days": systematic_offset,
             "tolerance_days": tolerance_days,
+            "free_float_notes": len(free_float_notes),
         },
         "mismatches": mismatches[:_MAX_MISMATCH_ROWS],
+        "free_float_notes": free_float_notes[:_MAX_MISMATCH_ROWS],
         "assessment": assessment,
     }

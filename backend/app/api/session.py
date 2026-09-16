@@ -863,8 +863,11 @@ async def session_query(req: QueryRequest) -> dict:
         sources.extend(_build_tool_sources(messages))
     else:
         # ── SP-only path: no graph for this session ─────────────────────────────
+        # Chat call answering a typed question: keep the historical 0.2 floor
+        # so a weak match doesn't surface as noise (compliance checks default
+        # to no floor instead -- see sp_retriever._DEFAULT_MATCH_THRESHOLD).
         sp_rows = retrieve_sp_chunks(db, embeddings.embed_query, req.session_id, req.question,
-                                      match_count=req.match_count)
+                                      match_count=req.match_count, match_threshold=0.2)
         for row in sp_rows:
             meta = row.get("metadata", {})
             page = f"p.{meta['page_pdf']}" if meta.get("page_pdf") else ""

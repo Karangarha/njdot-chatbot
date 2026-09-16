@@ -191,8 +191,23 @@ def run_cpm(
     result = CpmResult()
     project = project or {}
 
+    _unresolved_calendars: Dict[str, List[str]] = {}
+
     def cal_of(node_data: Dict[str, Any]) -> WorkCalendar:
-        return calendars.get(str(node_data.get("calendar_id", ""))) or DEFAULT_CALENDAR
+        cal_id = str(node_data.get("calendar_id", ""))
+        cal = calendars.get(cal_id)
+        if cal is not None:
+            return cal
+        # Falling back silently here makes every activity on an unresolved
+        # calendar_id compute against Mon-Fri/no-exceptions instead of its
+        # real calendar (e.g. a 7-day or in-water-work calendar) -- exactly
+        # the shape of a false CPM cross-check mismatch. Record it instead of
+        # swallowing it so it surfaces in the schedule evidence.
+        affected = _unresolved_calendars.setdefault(cal_id or "(blank)", [])
+        activity_id = str(node_data.get("activity_id", "?"))
+        if activity_id not in affected:
+            affected.append(activity_id)
+        return DEFAULT_CALENDAR
 
     def _constraints(nd: Dict[str, Any]):
         c = nd.get("constraints", {}) or {}
@@ -457,7 +472,22 @@ def run_cpm(
 
         if status != "Complete":
             r.total_float = _bdist(cal, sb[n], lsb[n])
-            # Free float: slack before delaying any successor's early start
+            # Free float: slack before delaying any successor's early start.
+            # ponytail: this undercounts when a successor's OWN calendar has
+            # an extended non-working stretch between the predecessor's
+            # required-by date and the successor's actual start (e.g. an
+            # in-water-work seasonal moratorium) -- _bdist counts working
+            # days on the SUCCESSOR's calendar in that span, which can be
+            # ~0 even though the predecessor genuinely has months of slack
+            # (confirmed on Route 49: D1070 sits on a calendar with a ~2.5
+            # month in-water-work blackout, making every predecessor's free
+            # float compute to 0 regardless of true slack). total_float and
+            # dates are unaffected -- this is a free-float-only artifact.
+            # Not fixed here: P6's own free-float semantics on a multi-
+            # calendar project are implementation-specific enough that
+            # cross-checking it isn't a reliable signal either way (see
+            # cross_check(), which reports free-float deltas as
+            # informational rather than failing on them for this reason).
             slacks: List[int] = []
             for s in sub.successors(n):
                 c = edge_cand.get((n, s))
@@ -469,11 +499,28 @@ def run_cpm(
                 min_tf = r.total_float if min_tf is None else min(min_tf, r.total_float)
         result.activities[n] = r
 
-    # Open ends among schedulable activities
-    result.open_starts = [n for n in order if sub.in_degree(n) == 0
-                          and sub.nodes[n].get("status") != "Complete"]
-    result.open_ends = [n for n in order if sub.out_degree(n) == 0
-                        and sub.nodes[n].get("status") != "Complete"]
+    # Open ends among schedulable activities, per CSM Section 3.0: an open
+    # start needs a predecessor that actually constrains the start (FS or
+    # SS); an open finish needs a successor that actually constrains the
+    # finish (FS or FF). in_degree/out_degree == 0 undercounts -- an activity
+    # whose only predecessor is an SF or FF edge still has an open start,
+    # since neither type fixes when it begins.
+    def _incoming_types(n: str) -> set:
+        return {link["type"] for p in sub.predecessors(n) for link in sub[p][n]["links"]}
+
+    def _outgoing_types(n: str) -> set:
+        return {link["type"] for s in sub.successors(n) for link in sub[n][s]["links"]}
+
+    result.open_starts = [
+        n for n in order
+        if sub.nodes[n].get("status") != "Complete"
+        and not (_incoming_types(n) & {"FS", "SS"})
+    ]
+    result.open_ends = [
+        n for n in order
+        if sub.nodes[n].get("status") != "Complete"
+        and not (_outgoing_types(n) & {"FS", "FF"})
+    ]
 
     # ── Critical path chains via driving edges ────────────────────────────────
     critical_tf = 0 if (min_tf is None or min_tf <= 0) else min_tf
@@ -502,5 +549,16 @@ def run_cpm(
     for n in on_path:
         if n in result.activities:
             result.activities[n].on_driving_path = True
+
+    for cal_id, activity_ids in _unresolved_calendars.items():
+        msg = (
+            f"Calendar {cal_id!r} referenced by {len(activity_ids)} activity(ies) "
+            f"({', '.join(activity_ids[:8])}"
+            f"{', …' if len(activity_ids) > 8 else ''}) was not found among the "
+            f"parsed calendars -- those activities were computed against the "
+            f"default Mon-Fri calendar instead of their real one."
+        )
+        logger.warning("run_cpm: %s", msg)
+        result.warnings.append(msg)
 
     return result

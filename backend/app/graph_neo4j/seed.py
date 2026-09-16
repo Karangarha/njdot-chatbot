@@ -25,6 +25,13 @@ from app.graph_neo4j.schema import ensure_constraints
 
 logger = logging.getLogger(__name__)
 
+# Bump whenever seed_schedule writes a property the deterministic checks
+# read that older seeds lack or computed differently (2: Calendar
+# exceptionDates/workExceptionDates, Activity hasFreeFloatNote, and the
+# relType-aware isOpenStart/isOpenEnd). Stored on the Project node; the
+# review rerun fast path re-seeds the schedule graph when it doesn't match.
+SEED_VERSION = 2
+
 
 def clear_project(graph: Neo4jGraph, project_id: str) -> None:
     """Delete all nodes tagged with this projectId (and their relationships)."""
@@ -58,6 +65,10 @@ def seed_schedule(
     ensure_constraints(graph)
 
     mismatched_ids = {m.get("activity_id") for m in (crosscheck or {}).get("mismatches", [])}
+    # Free-float deltas are informational only (see crosscheck.py) -- kept
+    # separate from mismatched_ids so they never set hasMismatch/fail the
+    # cpm_consistency check, but still surfaced for the LLM to mention.
+    free_float_note_ids = {m.get("activity_id") for m in (crosscheck or {}).get("free_float_notes", [])}
     open_starts = set(getattr(cpm, "open_starts", []) or [])
     open_ends = set(getattr(cpm, "open_ends", []) or [])
 
@@ -67,13 +78,22 @@ def seed_schedule(
         cal_id = str(cal.get("id", ""))
         if not cal_id:
             continue
+        exceptions = cal.get("exceptions") or []
+        work_exceptions = cal.get("work_exceptions") or []
         cal_rows.append({
             "calendarId": cal_id,
             "name": cal.get("name", "Calendar"),
             "workDays": list(cal.get("work_days") or []),
             "hoursPerDay": cal.get("day_hr_cnt", 8.0),
-            "exceptionCount": len(cal.get("exceptions") or []),
-            "workExceptionCount": len(cal.get("work_exceptions") or []),
+            "exceptionCount": len(exceptions),
+            "workExceptionCount": len(work_exceptions),
+            # Actual dates (not just counts) so deterministic checks can
+            # reconstruct a real WorkCalendar and count business days
+            # holiday-aware -- e.g. app.compliance.date_rule's
+            # ad_to_bid_gap/bid_to_award_gap, which need the same "exclude
+            # State holidays" exclusion the CPM engine already applies.
+            "exceptionDates": [e["date"] for e in exceptions if e.get("date")],
+            "workExceptionDates": [e["date"] for e in work_exceptions if e.get("date")],
         })
     if cal_rows:
         graph.query(
@@ -132,6 +152,7 @@ def seed_schedule(
             "storedLateStart": act.get("late_start"),
             "storedLateFinish": act.get("late_finish"),
             "hasMismatch": aid in mismatched_ids,
+            "hasFreeFloatNote": aid in free_float_note_ids,
             "isOpenStart": aid in open_starts,
             "isOpenEnd": aid in open_ends,
             **computed,
@@ -257,12 +278,16 @@ def seed_schedule(
                 "driving": (pid, aid) in driving_pairs,
             })
     if prec_rows:
+        # relType is part of the MERGE key: P6 allows several relationships
+        # of different types between one pair (SS+FF, FS+SS), and a
+        # pair-only MERGE would keep just the last row written -- hiding an
+        # FS lag behind a lag-free SS from evaluate_no_lag.
         graph.query(
             "UNWIND $rows AS row "
             "MATCH (p:Activity {taskId: row.predId, projectId: $projectId}), "
             "      (s:Activity {taskId: row.succId, projectId: $projectId}) "
-            "MERGE (p)-[r:PRECEDES]->(s) "
-            "SET r.relType = row.relType, r.lagDays = row.lagDays, r.driving = row.driving",
+            "MERGE (p)-[r:PRECEDES {relType: row.relType}]->(s) "
+            "SET r.lagDays = row.lagDays, r.driving = row.driving",
             params={"rows": prec_rows, "projectId": project_id},
         )
 
@@ -287,6 +312,7 @@ def seed_schedule(
         # Precomputed so a re-run can read the duration straight back without
         # re-parsing the XER / re-running CPM — see review.py's reseed=False path.
         "durationDays": duration_days,
+        "seedVersion": SEED_VERSION,
     }
     graph.query(
         "MERGE (p:Project {projectId: $projectId}) SET p += $props",
