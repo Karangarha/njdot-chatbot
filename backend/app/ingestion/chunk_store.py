@@ -48,10 +48,13 @@ def insert_session_chunks(db: Any, session_id: str, chunks: List[Dict[str, Any]]
             # without it this surfaces only as a generic 500 (or a generic
             # "review failed" progress message), with nothing naming Supabase,
             # the session, or how far the write got.
+            #
+            # doc_type is the FIRST row's: chunks may be heterogeneous, so read
+            # it as "the batch starts with" rather than "the batch is".
             logger.error(
                 "Supabase session_chunks insert failed for session_id=%s "
-                "(batch %d-%d of %d rows, doc_type=%s): %s",
+                "(batch %d-%d of %d rows, first doc_type=%s): %s",
                 session_id, i, i + len(batch), len(rows),
-                batch[0]["doc_type"] if batch else "?", exc, exc_info=True,
+                batch[0]["doc_type"], exc, exc_info=True,
             )
             raise

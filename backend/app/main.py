@@ -49,7 +49,6 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(name)s  %(message)s",
 )
-logging.getLogger("azure").setLevel(logging.WARNING)  # App Insights auto-instrumentation floods INFO with per-request HTTP dumps
 configure_console_logging()  # quiet per-request dependency chatter; redact uvicorn's access log
 logger = logging.getLogger(__name__)
 

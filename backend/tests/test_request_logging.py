@@ -166,6 +166,13 @@ def test_access_filter_redacts_the_supabase_jwt_from_the_query_string():
     assert "/api/query" in logged      # the path itself is still useful
 
 
+def test_access_filter_keeps_paths_that_merely_contain_status():
+    """The two SSE streams are known and fixed. A substring match would also
+    swallow these -- invisibly, since a dropped access line leaves no trace."""
+    for path in ("/api/health/status-history", "/api/statusboard", "/api/review/1/status_summary"):
+        assert _AccessLogHygiene().filter(_access_record(path)) is True, path
+
+
 def test_access_filter_leaves_ordinary_requests_alone():
     record = _access_record("/api/conversations")
     assert _AccessLogHygiene().filter(record) is True
@@ -210,11 +217,28 @@ def test_configure_console_logging_is_idempotent():
     """main.py calls it once, but --reload re-imports; a second call must not
     stack duplicate filters and log every access line twice."""
     access = logging.getLogger("uvicorn.access")
-    before = len([f for f in access.filters if isinstance(f, _AccessLogHygiene)])
-    configure_console_logging()
-    configure_console_logging()
-    after = len([f for f in access.filters if isinstance(f, _AccessLogHygiene)])
-    assert after == max(before, 1)
+    original = list(access.filters)
+    try:
+        configure_console_logging()
+        configure_console_logging()
+        installed = [f for f in access.filters if isinstance(f, _AccessLogHygiene)]
+        assert len(installed) == 1
+    finally:
+        # Same courtesy as the sibling test above: this mutates a process-wide
+        # logger, and a filter left behind silently drops records (and rewrites
+        # record.args) for every later test in the session.
+        access.filters = original
+
+
+def test_the_provider_sdks_are_left_audible():
+    """httpx's per-request INFO line used to be the only visible sign of a 429.
+    Silencing httpx removed it, and on_llm_error never fires for a retry the
+    SDK handles internally -- so the SDKs own "Retrying request to ..." INFO
+    line is the sole remaining rate-limiting signal. Quieting them takes it."""
+    for name in ("openai", "anthropic"):
+        assert name not in _NOISY_DEPENDENCIES, (
+            f"{name} is silenced -- provider rate limiting is now invisible"
+        )
 
 
 def test_app_loggers_are_not_quieted():

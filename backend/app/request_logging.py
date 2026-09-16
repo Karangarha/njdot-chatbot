@@ -1,9 +1,19 @@
-"""Inbound request outcome logging.
+"""Console logging policy: inbound requests, and what the console prints.
 
-One Starlette middleware dispatch function, registered once in
-``app.main``, that logs every request this app rejected (4xx) or broke on
-(5xx / unhandled exception). Covers every route in ``app.api`` — present
-and future — without each handler having to remember to log.
+Three things, all wired up once from ``app.main``:
+
+* ``log_request_outcome`` — a Starlette middleware dispatch function that
+  logs every request this app rejected (4xx) or broke on (5xx / unhandled
+  exception). Covers every route in ``app.api`` — present and future —
+  without each handler having to remember to log.
+* ``configure_console_logging`` — drops the chatty third-party loggers to
+  WARNING, so this app's own lines stay findable in the Azure log stream.
+* ``_AccessLogHygiene`` — a filter on uvicorn's own access log that redacts
+  query strings and drops the two SSE progress streams.
+
+The last two live here rather than in ``main.py`` for the same reason as the
+first: they are testable only if they can be imported without importing the
+app.
 
 Lives in its own module rather than inline in ``main.py`` so tests can
 import it against a throwaway FastAPI app: importing ``app.main`` executes
@@ -45,7 +55,7 @@ logger = logging.getLogger("app.request")
 # matter with far better attribution than a bare status line.
 _NOISY_DEPENDENCIES = (
     "httpx", "httpcore", "hpack",          # one line per outbound request
-    "openai", "anthropic",                  # SDK request plumbing
+    "azure",                                # App Insights auto-instrumentation dumps every request
     "langchain", "langchain_core", "langchain_openai", "langchain_classic",
     "langgraph", "langgraph_sdk", "langsmith",
     "neo4j", "neo4j_graphrag",
@@ -53,6 +63,15 @@ _NOISY_DEPENDENCIES = (
     "urllib3", "requests", "charset_normalizer",
     "filelock", "asyncio", "dotenv", "tqdm", "opentelemetry",
 )
+
+# Deliberately NOT in that tuple: "openai" and "anthropic". Both SDKs retry
+# 429s internally, below LangChain's callback layer -- on_llm_error never
+# fires for a retry that eventually succeeds, so a heavily throttled review
+# would take three times as long with nothing in the log saying why. On every
+# path this app uses, their only INFO record is
+# ``Retrying request to <url> in <n> seconds`` (openai/_base_client.py,
+# anthropic/_base_client.py): exactly that missing signal, one line per retry
+# rather than one per request.
 
 
 class _AccessLogHygiene(logging.Filter):
@@ -84,7 +103,10 @@ class _AccessLogHygiene(logging.Filter):
         if not isinstance(full_path, str):
             return True
         path = full_path.split("?", 1)[0]
-        if "/status" in path:
+        # Matched by shape, not by substring: a bare ``"/status" in path``
+        # would also silently swallow a future /api/health/status or
+        # /api/jobs/{id}/status-history, and nothing would report the loss.
+        if path.endswith("/status") or path.startswith("/api/session/status/"):
             return False
         if "?" in full_path:
             record.args = (args[0], args[1], path + "?<redacted>", args[3], args[4])

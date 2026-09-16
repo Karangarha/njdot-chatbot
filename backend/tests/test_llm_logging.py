@@ -30,17 +30,20 @@ from tests.logcapture import capture_logs  # noqa: E402
 _LOGGER_NAME = "app.llm"
 
 
-def test_llm_error_logs_an_error_with_traceback():
+def test_llm_error_logs_a_warning_because_a_fallback_may_still_recover():
+    """One provider attempt failed; .with_fallbacks() may answer on Claude and
+    return a correct result. The handler cannot see that outcome, so it logs
+    the degraded-path level and leaves ERROR to the call site, which can."""
     handler = LLMLoggingCallbackHandler(operation="evaluate-check:no_lag")
     with capture_logs(_LOGGER_NAME) as records:
         handler.on_llm_error(RuntimeError("429 rate limit"), run_id=uuid4())
 
     assert len(records) == 1
-    assert records[0].levelno == logging.ERROR
+    assert records[0].levelno == logging.WARNING
     text = records[0].getMessage()
     assert "evaluate-check:no_lag" in text
     assert "429 rate limit" in text
-    assert records[0].exc_info is not None
+    assert records[0].exc_info is None  # WARNING carries no traceback
 
 
 def test_llm_error_without_operation_still_logs():
@@ -54,63 +57,36 @@ def test_llm_error_without_operation_still_logs():
     assert "bad request" in records[0].getMessage()
 
 
-def test_retry_logs_a_warning():
-    """A retry means the call failed once but the run continues -- WARNING,
-    not ERROR, per this plan's level policy. Note this hook is dormant in
-    practice: langchain-core 1.4.9 emits on_retry only from the legacy
-    BaseLLM path, never from ChatOpenAI/ChatAnthropic."""
-
-    class _RetryState:
-        outcome = None
-        attempt_number = 2
-
-        def __init__(self):
-            class _Outcome:
-                @staticmethod
-                def exception():
-                    return TimeoutError("read timeout")
-            self.outcome = _Outcome()
-
-    handler = LLMLoggingCallbackHandler(operation="extract-key-map")
-    with capture_logs(_LOGGER_NAME) as records:
-        handler.on_retry(_RetryState(), run_id=uuid4())
-
-    assert len(records) == 1
-    assert records[0].levelno == logging.WARNING
-    text = records[0].getMessage()
-    assert "extract-key-map" in text
-    assert "read timeout" in text
-    assert records[0].exc_info is None  # WARNING carries no traceback
-
-
-def test_retry_with_no_outcome_does_not_crash():
-    """tenacity's RetryCallState can carry outcome=None on the first call."""
-
-    class _RetryState:
-        outcome = None
-        attempt_number = 1
-
-    handler = LLMLoggingCallbackHandler()
-    with capture_logs(_LOGGER_NAME) as records:
-        handler.on_retry(_RetryState(), run_id=uuid4())
-
-    assert len(records) == 1
-    assert records[0].levelno == logging.WARNING
-
-
-def test_tool_and_retriever_and_chain_errors_log():
+def test_tool_and_retriever_errors_log_an_error_with_traceback():
+    """Nothing retries these: the agent gets a failed tool result and answers
+    without it, so this line is the only record the call ever happened."""
     handler = LLMLoggingCallbackHandler(operation="chat-agent-response")
     with capture_logs(_LOGGER_NAME) as records:
         handler.on_tool_error(RuntimeError("cypher exploded"), run_id=uuid4())
         handler.on_retriever_error(RuntimeError("pgvector down"), run_id=uuid4())
-        handler.on_chain_error(RuntimeError("chain broke"), run_id=uuid4())
 
-    assert len(records) == 3
+    assert len(records) == 2
     assert all(r.levelno == logging.ERROR for r in records)
+    assert all(r.exc_info is not None for r in records)
     joined = " ".join(r.getMessage() for r in records)
     assert "cypher exploded" in joined
     assert "pgvector down" in joined
-    assert "chain broke" in joined
+
+
+def test_chain_errors_are_deliberately_not_logged():
+    """LangChain fires on_chain_error at EVERY level of a nested runnable, and
+    with_structured_output(include_raw=True).with_fallbacks([...]) is several
+    levels deep -- implementing it printed one failure, traceback and all, two
+    or three times over. The inner on_llm_error/on_tool_error already reported
+    the cause. This pins the decision against a future "completeness" edit."""
+    assert "on_chain_error" not in vars(LLMLoggingCallbackHandler), (
+        "on_chain_error is back -- see the handler docstring for why it is not implemented"
+    )
+
+    handler = LLMLoggingCallbackHandler(operation="evaluate-check:no_lag")
+    with capture_logs(_LOGGER_NAME, logging.DEBUG) as records:
+        handler.on_chain_error(RuntimeError("chain broke"), run_id=uuid4())
+    assert records == []
 
 
 def test_build_callbacks_always_includes_the_logging_handler():
@@ -160,6 +136,17 @@ _CALLBACK_SITE_MODULES = [
     "app/ingestion/edq_extractor.py",
     "app/ingestion/utility_plan_extractor.py",
 ]
+
+
+def test_the_review_labels_each_check_not_the_whole_review():
+    """The per-check label is the reason this logging exists: with one handler
+    shared across all 57 checks, every LLM failure in a review printed the same
+    operation and named none of them. build_callbacks() therefore has to be
+    called inside the submit loop, where check_key is in scope."""
+    source = (_ROOT / "app/compliance/eval_engine.py").read_text(encoding="utf-8")
+    assert 'operation=f"evaluate-check:{check.check_key}"' in source, (
+        "eval_engine no longer labels its callbacks per check"
+    )
 
 
 def test_every_llm_call_site_uses_build_callbacks():

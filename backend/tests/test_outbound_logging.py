@@ -51,17 +51,37 @@ def test_neo4j_connection_failure_logs_an_error():
     assert "bolt refused" in records[0].getMessage()
 
 
-def test_jwks_verification_failure_logs_a_warning():
+class _FakeJWKSClient:
+    @staticmethod
+    def get_signing_key_from_jwt(token):
+        raise RuntimeError("jwks endpoint unreachable")
+
+
+def test_jwks_failure_with_a_secret_configured_logs_a_warning():
     """Falling through from JWKS to the legacy HS256 secret is a normal,
-    supported path (older Supabase projects) -- but today it is completely
-    silent, so a genuinely unreachable JWKS endpoint looks identical to an
-    old-format token."""
+    supported path (older Supabase projects) -- but it used to be completely
+    silent, so a genuinely unreachable JWKS endpoint looked identical to an
+    old-format token. The signature still gets verified, so: WARNING."""
     from app import auth as auth_module
 
-    class _FakeJWKSClient:
-        @staticmethod
-        def get_signing_key_from_jwt(token):
-            raise RuntimeError("jwks endpoint unreachable")
+    with patch.object(auth_module, "_get_jwks_client", return_value=_FakeJWKSClient()), \
+         patch.object(auth_module.config, "SUPABASE_JWT_SECRET", "legacy-hs256-secret"), \
+         patch("app.auth.jwt.decode", return_value={"sub": "user-1"}):
+        with capture_logs("app.auth") as records:
+            assert auth_module.user_id_from_token("Bearer sometoken") == "user-1"
+
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert "jwks endpoint unreachable" in records[0].getMessage()
+
+
+def test_jwks_failure_without_a_secret_logs_an_error_naming_the_unverified_fallback():
+    """SUPABASE_JWT_SECRET is optional (config.py defaults it to ""). With it
+    unset, a JWKS outage drops straight through to verify_signature=False and
+    every attacker-supplied JWT with a `sub` claim is accepted. Authentication
+    silently degrading is not a WARNING -- and the line has to say so, since
+    it is the only indication the unverified branch engaged."""
+    from app import auth as auth_module
 
     with patch.object(auth_module, "_get_jwks_client", return_value=_FakeJWKSClient()), \
          patch.object(auth_module.config, "SUPABASE_JWT_SECRET", ""), \
@@ -70,8 +90,10 @@ def test_jwks_verification_failure_logs_a_warning():
             assert auth_module.user_id_from_token("Bearer sometoken") == "user-1"
 
     assert len(records) == 1
-    assert records[0].levelno == logging.WARNING
-    assert "jwks endpoint unreachable" in records[0].getMessage()
+    assert records[0].levelno == logging.ERROR
+    text = records[0].getMessage()
+    assert "jwks endpoint unreachable" in text
+    assert "without signature verification" in text
 
 
 def test_admin_user_lookup_transport_failure_logs_a_warning():
@@ -142,6 +164,8 @@ def test_pdf_storage_transport_failure_logs_an_error():
     from app.api import pdf as pdf_module
 
     class _FailingClient:
+        closed = False
+
         def __init__(self, *args, **kwargs):
             pass
 
@@ -150,6 +174,9 @@ def test_pdf_storage_transport_failure_logs_an_error():
 
         async def send(self, *args, **kwargs):
             raise httpx.ConnectError("name resolution failed")
+
+        async def aclose(self):
+            type(self).closed = True
 
     with patch("app.api.pdf.httpx.AsyncClient", _FailingClient):
         with capture_logs("app.api.pdf") as records:
@@ -162,6 +189,9 @@ def test_pdf_storage_transport_failure_logs_an_error():
     assert len(records) == 1
     assert records[0].levelno == logging.ERROR
     assert "name resolution failed" in records[0].getMessage()
+    # Under a sustained Storage outage every request takes this path, so a
+    # client left open here leaks a connection pool per request.
+    assert _FailingClient.closed is True, "the AsyncClient was leaked on the error path"
 
 
 if __name__ == "__main__":

@@ -707,10 +707,7 @@ def evaluate_checks(
 
     results_by_index: Dict[int, ReviewCheckResult] = {}
     with review_span_cm as review_span:
-        callbacks = build_callbacks(
-            trace_id=trace_id, parent_span_id=getattr(review_span, "id", None),
-            operation="compliance-review",
-        )
+        review_span_id = getattr(review_span, "id", None)
         with ThreadPoolExecutor(max_workers=config.REVIEW_CHECK_CONCURRENCY) as executor:
             future_to_index = {
                 executor.submit(
@@ -718,7 +715,16 @@ def evaluate_checks(
                     schedule_facts, narrative_text,
                     sp_search_fn, spec_search_fn, csm_search_fn, keymap_facts, estimate_facts,
                     utility_plan_search_fn,
-                    deterministic_ctx, project_id, user_id, callbacks,
+                    deterministic_ctx, project_id, user_id,
+                    # Built per check, not once per review: the handler's
+                    # operation label is fixed at construction, so a single
+                    # shared list logs the same label against all 57 checks
+                    # and names none of them. Same trace_id/parent_span_id,
+                    # so Langfuse still nests every check under one span.
+                    build_callbacks(
+                        trace_id=trace_id, parent_span_id=review_span_id,
+                        operation=f"evaluate-check:{check.check_key}",
+                    ),
                 ): i
                 for i, check in enumerate(checks)
             }

@@ -41,11 +41,16 @@ async def serve_pdf(doc_name: str, page: int | None = None) -> StreamingResponse
     filename = _DOC_TO_FILENAME.get(doc_name, f"{doc_name}.pdf")
     url = _storage_url(filename)
 
+    # Constructed outside the try, and closed by hand on every exit path: the
+    # StreamingResponse below outlives this function, so the client cannot be
+    # an ``async with`` -- but one left open when send() raises leaks its
+    # connection pool on every request for as long as Storage is down.
+    client = httpx.AsyncClient(timeout=30.0)
     try:
-        client = httpx.AsyncClient(timeout=30.0)
         request = client.build_request("GET", url)
         upstream = await client.send(request, stream=True)
     except httpx.RequestError as exc:
+        await client.aclose()
         logger.error(
             "Storage unreachable for doc=%r file=%r: %s", doc_name, filename, exc, exc_info=True,
         )

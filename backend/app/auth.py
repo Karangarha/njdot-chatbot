@@ -74,7 +74,16 @@ def user_id_from_token(authorization: str | None) -> str:
             # below handles — but identical in shape to a genuinely
             # unreachable JWKS endpoint, which is not expected at all. Log
             # it so the two stop looking the same in production.
-            logger.warning("JWKS verification did not apply, falling back to HS256: %s", exc)
+            if config.SUPABASE_JWT_SECRET:
+                logger.warning("JWKS verification did not apply, falling back to HS256: %s", exc)
+            else:
+                # No secret configured means the next branch decodes the token
+                # WITHOUT checking its signature — any JWT carrying a `sub` is
+                # accepted. That is a security posture change, not a fallback.
+                logger.error(
+                    "JWKS verification failed and SUPABASE_JWT_SECRET is unset — accepting "
+                    "this token without signature verification: %s", exc,
+                )
 
     if not config.SUPABASE_JWT_SECRET:
         # If the JWT secret isn't configured, extract sub without verification.
