@@ -9,7 +9,10 @@ FROM node:22-slim
 WORKDIR /vercel/path0
 
 COPY package.json package-lock.json ./
-RUN npm install --no-audit --no-fund
+# Optional "ca" build secret: only for building behind a TLS-inspecting proxy.
+RUN --mount=type=secret,id=ca,required=false \
+    if [ -s /run/secrets/ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/ca npm_config_cafile=/run/secrets/ca; fi && \
+    npm install --no-audit --no-fund
 
 COPY . .
 
@@ -26,7 +29,9 @@ ENV CI=1 \
     NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY=$NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY \
     NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 
-RUN npm run build
+RUN --mount=type=secret,id=ca,required=false \
+    if [ -s /run/secrets/ca ]; then export NODE_EXTRA_CA_CERTS=/run/secrets/ca; fi && \
+    npm run build
 
 COPY --from=sandbox-files localhost-forward.mjs /sandbox/localhost-forward.mjs
 

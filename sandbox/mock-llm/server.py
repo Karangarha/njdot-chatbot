@@ -225,7 +225,7 @@ def _classify(system: str, user: str) -> str:
         return "cypher"
     if '"entities"' in both and '"relations"' in both:
         return "entities"
-    if re.search(r"numbered list|exactly \d+ lines", both, re.I):
+    if re.search(r"numbered list|exactly \d+ lines|Output ONLY the numbered sentences", both, re.I):
         return "contextualize"
     return "text"
 
@@ -265,8 +265,8 @@ def text_answer(kind: str, system: str, user: str) -> str:
     if kind == "entities":
         return json.dumps({"entities": [], "relations": []})
     if kind == "contextualize":
-        m = re.search(r"exactly (\d+)", system + user)
-        n = int(m.group(1)) if m else 1
+        # One line per numbered chunk in the prompt ("N. [doc=...").
+        n = max([int(x) for x in re.findall(r"^(\d+)\. \[", user, re.M)] or [1])
         return "\n".join(f"{i}. Mock context summary for chunk {i}." for i in range(1, n + 1))
     q = user.strip()[-300:]
     return f"Sandbox mock response. You asked about: {q}"

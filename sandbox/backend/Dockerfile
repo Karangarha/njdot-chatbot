@@ -17,7 +17,11 @@ WORKDIR /home/site/wwwroot
 # a virtualenv named "antenv" built from requirements.txt at the app root.
 # The image's startup script (oryx create-script -virtualEnvName antenv)
 # activates it before running the startup command.
-RUN python -m venv antenv && \
+# The optional "ca" build secret is only for building behind a TLS-inspecting
+# proxy (e.g. a corporate network); without it this is a plain pip install.
+RUN --mount=type=secret,id=ca,required=false \
+    if [ -s /run/secrets/ca ]; then export PIP_CERT=/run/secrets/ca; fi && \
+    python -m venv antenv && \
     antenv/bin/pip install --no-cache-dir --upgrade pip && \
     antenv/bin/pip install --no-cache-dir -r requirements.txt
 
@@ -33,6 +37,12 @@ ENV PORT=8000 \
 EXPOSE 8000
 
 # ENTRYPOINT is the image's /opt/startup/init_container.sh; its argument is
-# the Web App's "Startup Command" — copied verbatim from the Azure setup
-# notes in .github/workflows/azure-deploy-backend.yml.
-CMD ["uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+# the Web App's "Startup Command" (docker-compose.yml passes
+# AZURE_STARTUP_COMMAND).
+#
+# Why "python -m uvicorn" and not the bare "uvicorn ..." written in the
+# setup notes of .github/workflows/azure-deploy-backend.yml: Oryx's generated
+# startup.sh exposes the antenv virtualenv only through PYTHONPATH — its bin/
+# is never put on PATH, and the runtime image has no global uvicorn — so the
+# bare command dies with "uvicorn: not found" (reproduced in this image).
+CMD ["python -m uvicorn app.main:app --host 0.0.0.0 --port 8000"]
