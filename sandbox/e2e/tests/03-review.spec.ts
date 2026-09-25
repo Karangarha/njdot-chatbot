@@ -96,8 +96,10 @@ test.describe("Document Review — checklist manager", () => {
       await page.getByRole("button", { name: "Add check" }).click();
       await page.getByPlaceholder("e.g. Schedule Logic or a new category").fill("Sandbox");
       await page.getByPlaceholder("Short title shown in results").fill(name);
-      await expect(page.getByRole("button", { name: "Save check" })).toBeEnabled();
+      // Save needs name + rule + at least one source file.
+      await expect(page.getByRole("button", { name: "Save check" })).toBeDisabled();
       await page.getByPlaceholder(/Describe exactly what to verify/).fill("Verify the sandbox check runs.");
+      await expect(page.getByRole("button", { name: "Save check" })).toBeEnabled();
       await page.getByRole("button", { name: "Save check" }).click();
       await expect(checkRow(page, name)).toBeVisible();
       await expect(checkRow(page, name).getByText("Custom")).toBeVisible();
