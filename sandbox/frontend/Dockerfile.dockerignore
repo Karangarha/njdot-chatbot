@@ -1,0 +1,12 @@
+# Mirrors what Vercel ignores / never has: local installs, build output and
+# local env files (Vercel only sees env vars set in project settings).
+node_modules/
+.next/
+out/
+build/
+coverage/
+.vercel/
+.env
+.env.*
+*.tsbuildinfo
+next-env.d.ts

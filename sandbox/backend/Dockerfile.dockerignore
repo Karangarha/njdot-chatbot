@@ -1,0 +1,14 @@
+# Same exclusions the real deploy gets from .gitignore (the workflow deploys a
+# fresh checkout, so none of these reach Azure either).
+.env
+.env.*
+venv/
+.venv/
+antenv/
+env/
+**/__pycache__/
+**/*.pyc
+.pytest_cache/
+data/eval/results_latest.json
+data/table_chunks.jsonl
+data/docling_table_chunks.jsonl

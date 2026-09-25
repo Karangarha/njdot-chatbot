@@ -1,0 +1,108 @@
+# NJDOT local sandbox — production-shaped copies of the backend (Azure App
+# Service) and frontend (Vercel), wired to the Supabase already running on
+# your machine. Drive it with ./sandbox.sh; settings live in sandbox/.env
+# (copy sandbox.env.example).
+#
+#   browser ──▶ frontend :3000  (next build + next start, Vercel env)
+#          ├──▶ backend  :8000  (App Service Python 3.13 image + Oryx-style antenv)
+#          └──▶ your Supabase   (SUPABASE_URL, e.g. supabase start on :54321)
+#   backend ──▶ mock-llm :4010  (OpenAI + Anthropic stand-in; or real APIs)
+#           ──▶ neo4j    :7688  (bundled Neo4j 5; or NEO4J_URI → your own)
+
+name: njdot-sandbox
+
+x-host-gateway: &host-gateway
+  # Lets containers reach services on your machine (your local Supabase) as
+  # host.docker.internal — built into Docker Desktop, needed on Linux.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+
+services:
+  mock-llm:
+    build: ./mock-llm
+    ports:
+      - "4010:4010"
+    environment:
+      MOCK_FAIL_OPENAI: ${MOCK_FAIL_OPENAI:-false}
+      MOCK_FAIL_ANTHROPIC: ${MOCK_FAIL_ANTHROPIC:-false}
+
+  neo4j:
+    image: neo4j:5-community
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-sandbox-neo4j-pw}
+      NEO4J_server_memory_heap_max__size: 1G
+    ports:
+      - "7475:7474"   # browser UI at http://localhost:7475 (7474 left free for Neo4j Desktop)
+      - "7688:7687"
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${NEO4J_AUTH#neo4j/}\" 'RETURN 1' >/dev/null 2>&1"]
+      interval: 5s
+      timeout: 5s
+      retries: 40
+
+  backend:
+    <<: *host-gateway
+    # App Service images are published for amd64 only (Azure runs amd64);
+    # Apple Silicon runs this under emulation.
+    platform: linux/amd64
+    build:
+      context: ../backend
+      dockerfile: ../sandbox/backend/Dockerfile
+    ports:
+      - "8000:8000"
+    # Azure "App settings" — the variables backend/app/config.py reads.
+    environment:
+      SUPABASE_URL: ${SUPABASE_URL_FROM_DOCKER:-http://host.docker.internal:54321}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?set SUPABASE_SERVICE_ROLE_KEY in sandbox/.env}
+      SUPABASE_JWT_SECRET: ${SUPABASE_JWT_SECRET:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-sk-sandbox-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-sk-ant-sandbox-mock}
+      # SDKs read OPENAI_BASE_URL / ANTHROPIC_BASE_URL; langchain-openai also
+      # reads OPENAI_API_BASE. Unset these three to hit the real APIs.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://mock-llm:4010/v1}
+      OPENAI_API_BASE: ${OPENAI_BASE_URL:-http://mock-llm:4010/v1}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-http://mock-llm:4010}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4o}
+      NEO4J_URI: ${NEO4J_URI:-bolt://neo4j:7687}
+      NEO4J_USERNAME: ${NEO4J_USERNAME:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-sandbox-neo4j-pw}
+      NEO4J_DATABASE: ${NEO4J_DATABASE:-neo4j}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      ENVIRONMENT: production
+      REVIEW_CHECK_CONCURRENCY: ${REVIEW_CHECK_CONCURRENCY:-8}
+      REVIEW_GROUNDING_JUDGE: ${REVIEW_GROUNDING_JUDGE:-true}
+    depends_on:
+      mock-llm:
+        condition: service_started
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/opt/python/3/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 30s
+
+  frontend:
+    <<: *host-gateway
+    build:
+      context: ../frontend
+      dockerfile: ../sandbox/frontend/Dockerfile
+      additional_contexts:
+        sandbox-files: ./frontend
+      # Vercel inlines NEXT_PUBLIC_* at build time — same here.
+      args:
+        NEXT_PUBLIC_SUPABASE_URL: ${SUPABASE_URL:-http://127.0.0.1:54321}
+        NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY: ${SUPABASE_ANON_KEY:?set SUPABASE_ANON_KEY in sandbox/.env}
+        NEXT_PUBLIC_API_URL: ${API_URL:-http://localhost:8000}
+    ports:
+      - "3000:3000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
