@@ -129,7 +129,7 @@ def test_check_missing_for_unavailable_source_logs_a_warning():
     with capture_logs(_EVAL_LOGGER) as records:
         result, usage = _evaluate_one_check(
             check, MagicMock(), MagicMock(),
-            schedule_facts="", narrative_text="",
+            schedule_facts="", narrative_result=("", {}),
             sp_search_fn=None, spec_search_fn=None, csm_search_fn=None,
             keymap_facts=None, estimate_facts=None, utility_plan_search_fn=None,
             deterministic=_DeterministicContext(),

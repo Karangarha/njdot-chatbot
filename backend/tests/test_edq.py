@@ -91,7 +91,7 @@ def test_get_edq_item_details_scopes_query_to_project_and_item_id():
 
 def test_edq_coverage_tool_summary_on_empty_input():
     graph = _FakeGraph(coverage_rows=[
-        {"id": "edq:1", "jobId": "0001", "category": "0001", "itemDescription": "MOBILIZATION", "bestConfidence": 0.9},
+        {"id": "edq:1", "jobId": "0001", "category": "0001", "itemDescription": "CONCRETE FOR PIER", "bestConfidence": 0.9},
         {"id": "edq:2", "jobId": "0002", "category": "0001", "itemDescription": "TRAINEES", "bestConfidence": None},
     ])
     tool = build_edq_coverage_tool(graph, project_id="proj-1")
@@ -122,14 +122,39 @@ def test_edq_coverage_tool_strips_whitespace_input():
 
 def test_evaluate_edq_coverage_all_covered_is_pass():
     graph = _FakeGraph(coverage_rows=[
-        {"id": "edq:1", "jobId": "0001", "category": "0001", "itemDescription": "MOBILIZATION", "bestConfidence": 0.9},
-        {"id": "edq:2", "jobId": "0002", "category": "0001", "itemDescription": "TRAINEES", "bestConfidence": 0.75},
+        {"id": "edq:1", "jobId": "0001", "category": "0001", "itemDescription": "CONCRETE FOR PIER", "bestConfidence": 0.9},
+        {"id": "edq:2", "jobId": "0002", "category": "0001", "itemDescription": "GUIDE RAIL", "bestConfidence": 0.75},
     ])
     result = evaluate_edq_coverage(graph, "proj-1")
     assert result.status == "Pass"
     assert result.uncovered == 0
     assert result.low_confidence == 0
     assert result.fully_covered == 2
+    assert result.total_items == 2
+
+
+def test_evaluate_edq_coverage_excludes_non_physical_items():
+    # Non-physical items get no schedule activity by nature -- confirmed on
+    # the Route 49 fixture, they were dragging every review toward a false
+    # Fail (31/108 "unmatched" before this exclusion). Even an unmatched
+    # (bestConfidence=None) non-physical item must not count as uncovered.
+    graph = _FakeGraph(coverage_rows=[
+        {"id": "edq:1", "jobId": "0001", "category": "0001", "itemDescription": "MOBILIZATION", "bestConfidence": None},
+        {"id": "edq:2", "jobId": "0002", "category": "0001", "itemDescription": "PERFORMANCE AND PAYMENT BOND", "bestConfidence": None},
+        {"id": "edq:3", "jobId": "0003", "category": "0001", "itemDescription": "FIELD OFFICE MAINTENANCE", "bestConfidence": None},
+        {"id": "edq:4", "jobId": "0004", "category": "0001", "itemDescription": "PROGRESS SCHEDULE UPDATE", "bestConfidence": None},
+        {"id": "edq:5", "jobId": "0005", "category": "0001", "itemDescription": "TRAFFIC CONTROL COORDINATOR", "bestConfidence": None},
+        {"id": "edq:6", "jobId": "0006", "category": "0001", "itemDescription": "TRAINING", "bestConfidence": None},
+        {"id": "edq:7", "jobId": "0007", "category": "0001", "itemDescription": "ALLOWANCE FOR UTILITY WORK", "bestConfidence": None},
+        {"id": "edq:8", "jobId": "0008", "category": "0001", "itemDescription": "FUEL PRICE ADJUSTMENT", "bestConfidence": None},
+        {"id": "edq:9", "jobId": "0009", "category": "0001", "itemDescription": "CONCRETE FOR PIER", "bestConfidence": 0.9},
+    ])
+    result = evaluate_edq_coverage(graph, "proj-1")
+    assert result.status == "Pass"
+    assert result.total_items == 1
+    assert result.uncovered == 0
+    assert result.fully_covered == 1
+    assert "Excluded 8 non-physical item(s)" in result.detail
 
 
 def test_evaluate_edq_coverage_low_confidence_is_missing():
@@ -160,6 +185,7 @@ if __name__ == "__main__":
     test_edq_coverage_tool_per_item_on_nonempty_input()
     test_edq_coverage_tool_strips_whitespace_input()
     test_evaluate_edq_coverage_all_covered_is_pass()
+    test_evaluate_edq_coverage_excludes_non_physical_items()
     test_evaluate_edq_coverage_low_confidence_is_missing()
     test_evaluate_edq_coverage_no_rows_is_none_status()
     print("All tests passed!")

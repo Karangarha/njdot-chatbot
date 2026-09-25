@@ -38,7 +38,22 @@ async function hasOwnChecks(userId: string): Promise<boolean> {
   return (count ?? 0) > 0
 }
 
-/** Copy-on-write: clone the shared built-ins into the user's set (once). */
+/** Postgres unique_violation — the fork lost a race, someone else got there first. */
+const PG_UNIQUE_VIOLATION = '23505'
+
+/**
+ * Copy-on-write: clone the shared built-ins into the user's set (once).
+ *
+ * The hasOwnChecks() gate is an optimisation, not the guarantee: it is a
+ * read followed by a write, so two edits issued close together can both
+ * pass it and both insert the full built-in set (this is how one account
+ * ended up with 114 rows / 57 distinct check_key, every check running
+ * twice). The real guarantee is the partial unique index on
+ * (user_id, check_key) from sql/compliance_checks_unique_check_key.sql:
+ * the losing insert fails as a whole (Postgres applies a multi-row INSERT
+ * atomically), leaving exactly one set of 57 behind. Swallow that one
+ * error and surface every other.
+ */
 export async function ensureForked(userId: string): Promise<void> {
   if (await hasOwnChecks(userId)) return
   const sb = createClient()
@@ -57,7 +72,8 @@ export async function ensureForked(userId: string): Promise<void> {
     enabled: b.enabled,
     sort_order: b.sort_order,
   }))
-  await sb.from(TABLE).insert(rows)
+  const { error } = await sb.from(TABLE).insert(rows)
+  if (error && error.code !== PG_UNIQUE_VIOLATION) throw error
 }
 
 /** Enable/disable a check (drives which checks run). */
