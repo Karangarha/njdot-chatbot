@@ -8,6 +8,7 @@ Runnable two ways:
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -16,6 +17,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from app.ingestion.chunk_store import insert_session_chunks   # noqa: E402
+from tests.logcapture import capture_logs                     # noqa: E402
 
 
 class _FakeExecuted:
@@ -83,6 +85,73 @@ def test_doc_type_read_from_metadata():
     _, rows = db.calls[0]
     assert rows[0]["doc_type"] == "estimate"
     assert rows[0]["metadata"]["doc_type"] == "estimate"
+
+
+class _FailingTable:
+    """Mimics a Supabase table whose insert blows up at .execute()."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def insert(self, rows):
+        return self
+
+    def execute(self):
+        raise self._exc
+
+
+class FailingDB:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def table(self, name):
+        return _FailingTable(self._exc)
+
+
+def test_insert_failure_logs_an_error_and_reraises():
+    """This is the one RUNTIME Supabase call site the logging work
+    instruments. Both /api/review and /api/session ingestion funnel their
+    chunk writes through here, and before this the failure surfaced only as
+    a generic 500 or a generic "review failed" progress message with nothing
+    naming Supabase. The exception must still propagate -- a half-written
+    chunk set has to fail the ingest, not be swallowed."""
+    db = FailingDB(RuntimeError("connection reset by peer"))
+
+    with capture_logs("app.ingestion.chunk_store") as records:
+        try:
+            insert_session_chunks(db, "proj-9", [_chunk("a", "special_provision")])
+            assert False, "insert_session_chunks must re-raise"
+        except RuntimeError as exc:
+            assert "connection reset by peer" in str(exc)
+
+    assert len(records) == 1
+    assert records[0].levelno == logging.ERROR
+    text = records[0].getMessage()
+    assert "proj-9" in text                    # which session
+    assert "special_provision" in text         # which document type
+    assert "connection reset by peer" in text  # what actually failed
+    assert records[0].exc_info is not None
+
+
+def test_insert_failure_reports_how_far_it_got():
+    """A partial write is the dangerous case -- the log must say which batch
+    failed, not just that something did."""
+    db = FailingDB(RuntimeError("boom"))
+    chunks = [_chunk(f"c{i}", "key_map") for i in range(120)]
+
+    with capture_logs("app.ingestion.chunk_store") as records:
+        try:
+            insert_session_chunks(db, "proj-10", chunks)
+            assert False, "insert_session_chunks must re-raise"
+        except RuntimeError:
+            pass
+
+    # Fails on the very first batch, so exactly one record -- and it names
+    # the batch bounds and the total.
+    assert len(records) == 1
+    text = records[0].getMessage()
+    assert "120" in text
+    assert "0-50" in text
 
 
 if __name__ == "__main__":

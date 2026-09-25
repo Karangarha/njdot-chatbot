@@ -8,7 +8,10 @@ ingestion) so a chunk's insert shape is defined in exactly one place.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List
+
+logger = logging.getLogger(__name__)
 
 _DB_BATCH = 50
 
@@ -36,4 +39,22 @@ def insert_session_chunks(db: Any, session_id: str, chunks: List[Dict[str, Any]]
         for c in chunks
     ]
     for i in range(0, len(rows), _DB_BATCH):
-        db.table("session_chunks").insert(rows[i : i + _DB_BATCH]).execute()
+        batch = rows[i : i + _DB_BATCH]
+        try:
+            db.table("session_chunks").insert(batch).execute()
+        except Exception as exc:
+            # Re-raised, not swallowed: a half-written chunk set must still
+            # fail the ingest. The log is here purely for attribution --
+            # without it this surfaces only as a generic 500 (or a generic
+            # "review failed" progress message), with nothing naming Supabase,
+            # the session, or how far the write got.
+            #
+            # doc_type is the FIRST row's: chunks may be heterogeneous, so read
+            # it as "the batch starts with" rather than "the batch is".
+            logger.error(
+                "Supabase session_chunks insert failed for session_id=%s "
+                "(batch %d-%d of %d rows, first doc_type=%s): %s",
+                session_id, i, i + len(batch), len(rows),
+                batch[0]["doc_type"], exc, exc_info=True,
+            )
+            raise

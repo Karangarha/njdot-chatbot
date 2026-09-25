@@ -79,8 +79,11 @@ Each dict in the returned list has:
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 # ── Regex patterns ────────────────────────────────────────────────────────────
 
@@ -162,7 +165,7 @@ class TableExtractor:
         list[dict]
             One dict per detected table.  Empty list if none found.
         """
-        table_objects = self._find_tables(page)
+        table_objects = self._find_tables(page, page_pdf)
         if not table_objects:
             return []
 
@@ -174,15 +177,19 @@ class TableExtractor:
                 )
                 if result is not None:
                     results.append(result)
-            except Exception:
-                # One bad table should never abort the page
-                pass
+            except Exception as exc:
+                # One bad table should never abort the page -- but a table
+                # skipped here is a table the retrieval index never sees, so
+                # it must not vanish silently.
+                logger.warning(
+                    "Skipped table %d on PDF page %d: %s", idx, page_pdf, exc,
+                )
 
         return results
 
     # ── Private: table discovery ──────────────────────────────────────────────
 
-    def _find_tables(self, page: Any) -> List[Any]:
+    def _find_tables(self, page: Any, page_pdf: int) -> List[Any]:
         """
         Try strict line-based detection; fall back to relaxed settings.
 
@@ -192,15 +199,22 @@ class TableExtractor:
             tables = page.find_tables(table_settings=_SETTINGS_STRICT)
             if tables:
                 return tables
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Strict table detection failed on PDF page %d, retrying relaxed: %s",
+                page_pdf, exc,
+            )
 
         try:
             tables = page.find_tables(table_settings=_SETTINGS_RELAXED)
             if tables:
                 return tables
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                "Relaxed table detection also failed on PDF page %d — no tables "
+                "extracted from this page: %s",
+                page_pdf, exc,
+            )
 
         return []
 
@@ -238,7 +252,7 @@ class TableExtractor:
         markdown   = self._to_markdown(raw_rows)
 
         table_id, table_title = self._find_caption(page, bbox, page_pdf, idx)
-        footnotes             = self._find_footnotes(page, bbox)
+        footnotes             = self._find_footnotes(page, bbox, page_pdf, idx)
         if footnotes:
             markdown += "\n\nNotes:\n" + "\n".join(footnotes)
 
@@ -279,7 +293,12 @@ class TableExtractor:
         try:
             caption_page = page.crop((0.0, scan_top, page.width, top))
             caption_text = caption_page.extract_text() or ""
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Caption scan failed for table %d on PDF page %d — the table will "
+                "fall back to a positional id: %s",
+                idx, page_pdf, exc,
+            )
             caption_text = ""
 
         # Walk lines in reverse (closest to the table wins)
@@ -297,6 +316,8 @@ class TableExtractor:
         self,
         page: Any,
         bbox: Tuple[float, float, float, float],
+        page_pdf: int,
+        idx: int,
     ) -> List[str]:
         """
         Crop the zone below the table bottom and collect footnote lines.
@@ -312,7 +333,11 @@ class TableExtractor:
         try:
             fn_page = page.crop((0.0, bottom, page.width, scan_bottom))
             fn_text = fn_page.extract_text() or ""
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Footnote scan failed below table %d on PDF page %d: %s",
+                idx, page_pdf, exc,
+            )
             return []
 
         footnotes: List[str] = []

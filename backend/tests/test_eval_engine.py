@@ -208,7 +208,7 @@ def _call_evaluate_one_check(check, structured_llm, structured_judge_llm, **over
         deterministic=_DeterministicContext(),
         project_id="default",
         user_id=None,
-        langfuse_handler=None,
+        callbacks=[],
     )
     kwargs.update(overrides)
     return _evaluate_one_check(check, structured_llm, structured_judge_llm, **kwargs)
