@@ -65,6 +65,20 @@ _PATTERNS: list[tuple[str, re.Pattern[str]]] = [
 # DIVISION, SECTION, and APPENDIX headings.
 _DASH_RE = re.compile(r'\s+[–—-]\s+')
 
+# Table-caption dialect shared with app.compliance.anchors and
+# app.ingestion.session_chunker: a caption recorded in chunk metadata must be
+# matchable by an anchor extracted from a check instruction later, so both
+# sides use this same pattern object rather than two textually-similar but
+# different ones. The identifier after "TABLE" must be digit-led
+# ("105.05-1") or a lone letter ("Table A") -- not just any word -- so
+# ordinary prose like "read the table carefully" is never misread as a
+# caption. Public: this module is the project's authority on heading
+# dialect and imports nothing but `re`, so it is the dependency-safe home
+# for this pattern (compliance may depend on ingestion; not the reverse).
+TABLE_RE = re.compile(
+    r"\bTABLE\s+(?:\d[\dA-Z]*(?:\.[\dA-Z]+)*(?:-\d+)?|[A-Z]\b)", re.IGNORECASE
+)
+
 
 # ── Public types ──────────────────────────────────────────────────────────────
 

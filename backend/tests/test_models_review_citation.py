@@ -18,8 +18,18 @@ from app.models import EvaluationSchema, ReviewCheckResult, ReviewCitation  # no
 
 
 def test_evaluation_schema_defaults_cited_chunk_ids_to_empty_list():
-    result = EvaluationSchema(status="Pass", evidence="e", source="s")
+    result = EvaluationSchema(evidence="e", source="s")
     assert result.cited_chunk_ids == []
+
+
+def test_evaluation_schema_defaults_item_lists_to_empty():
+    # status is not a field here at all (see EvaluationSchema's docstring) --
+    # it's derived from breaching_items in eval_engine.py, never authored
+    # directly.
+    result = EvaluationSchema(evidence="e", source="s")
+    assert result.considered_items == []
+    assert result.breaching_items == []
+    assert not hasattr(result, "status")
 
 
 def test_review_check_result_defaults_citations_to_empty_list():

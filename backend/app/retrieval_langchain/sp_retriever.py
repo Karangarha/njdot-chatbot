@@ -20,7 +20,17 @@ from langchain_core.tools import Tool
 
 logger = logging.getLogger(__name__)
 
-_MATCH_THRESHOLD = 0.2
+# Retrieval used to drop every chunk below 0.2 cosine. For chat that is a
+# reasonable floor; for a compliance check it is not, because the query is a
+# 150-word rule that embeds far from a 600-token clause even when that clause
+# is the right one. Below the floor the check received no SP text at all and
+# answered from its other sources, silently. Callers now choose.
+_DEFAULT_MATCH_THRESHOLD = 0.0
+
+# match_session_chunks ranks across every doc_type in the session, so a
+# post-filter to one type throws rows away. Ask for enough that the survivors
+# still fill the caller's budget.
+_DOC_TYPE_OVERFETCH = 4
 
 
 def retrieve_sp_chunks(
@@ -29,12 +39,13 @@ def retrieve_sp_chunks(
     project_id: str,
     query: str,
     match_count: int = 8,
+    match_threshold: float = _DEFAULT_MATCH_THRESHOLD,
+    doc_type: str = "special_provision",
 ) -> List[Dict[str, Any]]:
     """Vector-search this project's Special Provision chunks.
 
-    Returns raw RPC rows (``content``, ``doc_type``, ``metadata``, ``similarity``) —
-    same shape ``session_query`` already consumes, so downstream formatting
-    (source lists, citations) doesn't need to change in Phase 6.
+    Returns raw RPC rows (``content``, ``doc_type``, ``metadata``,
+    ``similarity``) -- the shape ``session_query`` already consumes.
     """
     embedding = embed_fn(query)
     rows = (
@@ -43,14 +54,14 @@ def retrieve_sp_chunks(
             {
                 "query_embedding": embedding,
                 "p_session_id": project_id,
-                "match_count": match_count,
-                "match_threshold": _MATCH_THRESHOLD,
+                "match_count": match_count * _DOC_TYPE_OVERFETCH,
+                "match_threshold": match_threshold,
             },
         )
         .execute()
         .data
     ) or []
-    return [r for r in rows if r.get("doc_type") == "special_provision"]
+    return [r for r in rows if r.get("doc_type") == doc_type][:match_count]
 
 
 def build_sp_tool(
@@ -61,7 +72,9 @@ def build_sp_tool(
     """LangChain Tool wrapping ``retrieve_sp_chunks`` for a bound project."""
 
     def _tool(query: str) -> str:
-        rows = retrieve_sp_chunks(db, embed_fn, project_id, query)
+        # Chat tool call: a weak match here is noise for the user, so keep
+        # the historical 0.2 floor rather than the compliance-path default.
+        rows = retrieve_sp_chunks(db, embed_fn, project_id, query, match_threshold=0.2)
         if not rows:
             return json.dumps({"chunks": [], "note": "No matching Special Provision text found."})
         chunks = [

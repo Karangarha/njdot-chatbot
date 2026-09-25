@@ -801,6 +801,8 @@ def _common_pipeline_patches(graph=None):
     stack.enter_context(patch("app.api.review.seed_narrative"))
     stack.enter_context(patch("app.api.review._seed_edq_items_if_needed"))
     stack.enter_context(patch("app.api.review.evaluate_edq_coverage", return_value=None))
+    stack.enter_context(patch("app.api.review.evaluate_schedule_logic", return_value={}))
+    stack.enter_context(patch("app.api.review.evaluate_date_rules", return_value={}))
     stack.enter_context(patch("app.api.review._build_static_doc_search_fn", return_value=None))
     stack.enter_context(patch("app.api.review.evaluate_checks", return_value=[]))
     return stack

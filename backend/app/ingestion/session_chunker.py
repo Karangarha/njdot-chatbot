@@ -5,8 +5,9 @@ Three document types — all deterministic, zero LLM calls:
   chunk_narrative(pages)               Section-heading-based chunks for the
                                         designer narrative (~10 pages).
 
-  chunk_special_provision(pages)       Sliding-window chunks for large SP PDFs
-                                        (~200 pages, 600 tok / 100 overlap).
+  chunk_special_provision(pages)       Section-bounded, then sliding-window
+                                        chunks for large SP PDFs (~200 pages,
+                                        600 tok / 100 overlap per section).
 
   xer_to_markdown(activities, cals)    Convert XER activity list to NL-rich
                                         Markdown with all activity names visible.
@@ -24,6 +25,8 @@ Each dict:
   content   str   – text of the chunk
   metadata  dict  – doc_type, page_pdf (int|None), chunk_index (int),
                     section_heading (str, narrative only),
+                    section_id (str|None), section_title (str|None),
+                    tables (list[str]) (special provision only),
                     section (str, XER section type),
                     phase (str, XER phase chunks only)
 """
@@ -35,6 +38,16 @@ from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
 import tiktoken
+
+# Reuse section_detector's tightened TABLE-caption dialect (digit-led or
+# single-letter identifier only) rather than inventing a second, looser one
+# here: a caption recorded in chunk metadata must be matchable by an anchor
+# extracted from a check instruction later (app.compliance.anchors imports
+# this same pattern). section_detector is this project's authority on
+# heading dialect and imports nothing but `re` -- unlike app.compliance,
+# which pulls in LangChain and the app config -- so depending on it keeps
+# this zero-LLM-call ingestion module's dependency direction correct.
+from app.ingestion.section_detector import TABLE_RE
 
 _ENCODING_NAME  = "cl100k_base"
 _SP_MAX_TOKENS  = 600
@@ -351,12 +364,61 @@ def _detect_sp_boilerplate(pages: List[Dict[str, Any]], sample_size: int = 15) -
     return {line for line, count in line_counts.items() if count >= threshold}
 
 
+def _segment_by_section(
+    pages: List[Dict[str, Any]],
+    boilerplate: set,
+) -> List[Dict[str, Any]]:
+    """Split cleaned page text into (section_id, section_title, lines, page) runs.
+
+    A run starts at each line ``section_detector.detect`` recognises as a
+    heading and ends at the next one. Text before the first heading becomes a
+    run with no section, which is normal for cover pages and preambles.
+
+    ``line_pages`` tracks the source PDF page of every entry in ``lines``,
+    1:1, so a chunk built from this run can later report the page its own
+    text actually came from instead of just the run's heading page (see
+    ``_page_at`` in ``chunk_special_provision``).
+    """
+    from app.ingestion.section_detector import detect
+
+    runs: List[Dict[str, Any]] = []
+    cur: Dict[str, Any] = {
+        "section_id": None, "section_title": None,
+        "lines": [], "line_pages": [], "page": 1,
+    }
+    for page in pages:
+        for line in page["text"].splitlines():
+            if line.strip() in boilerplate:
+                continue
+            match = detect(line)
+            if match:
+                if cur["lines"]:
+                    runs.append(cur)
+                cur = {
+                    "section_id": match["section_id"],
+                    "section_title": match["title"],
+                    "lines": [line],
+                    "line_pages": [page["page_num"]],
+                    "page": page["page_num"],
+                }
+            else:
+                if not cur["lines"]:
+                    cur["page"] = page["page_num"]
+                cur["lines"].append(line)
+                cur["line_pages"].append(page["page_num"])
+    if cur["lines"]:
+        runs.append(cur)
+    return runs
+
+
 def chunk_special_provision(
     pages: List[Dict[str, Any]],
     pdf_path: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Chunk a Special Provision PDF using a sliding token window.
+    Chunk a Special Provision PDF on detected section boundaries first, then
+    apply a sliding token window within any section that is longer than the
+    budget.
 
     When ``pdf_path`` is provided, pdfplumber extracts tables as structured
     rows which are converted to NL sentences (e.g. "Route: 49, Station: 12+75,
@@ -366,7 +428,7 @@ def chunk_special_provision(
     Page headers/footers (project name, contract number, page N of M) are
     detected by finding lines that repeat across pages and stripped.
 
-    600 tokens max, 100-token overlap.
+    600 tokens max, 100-token overlap, per section.
 
     Parameters
     ----------
@@ -387,50 +449,63 @@ def chunk_special_provision(
         pages = _extract_page_with_tables(pdf_path, pages)
 
     boilerplate = _detect_sp_boilerplate(pages)
-
-    # Build a flat token stream, recording which PDF page each token came from
-    page_token_starts: List[tuple[int, int]] = []   # (token_offset, page_num)
-    all_tokens: List[int] = []
-
-    for page in pages:
-        cleaned = "\n".join(
-            ln for ln in page["text"].splitlines()
-            if ln.strip() not in boilerplate
-        ).strip()
-        if not cleaned:
-            continue
-        page_token_starts.append((len(all_tokens), page["page_num"]))
-        all_tokens.extend(enc.encode(cleaned + "\n"))
-
-    def _page_at(token_idx: int) -> int:
-        page_num = page_token_starts[0][1] if page_token_starts else 1
-        for start, pnum in page_token_starts:
-            if start <= token_idx:
-                page_num = pnum
-            else:
-                break
-        return page_num
+    runs = _segment_by_section(pages, boilerplate)
 
     chunks: List[Dict[str, Any]] = []
-    start = 0
-    idx   = 0
+    idx = 0
+    for run in runs:
+        lines = run["lines"]
+        if not "\n".join(lines).strip():
+            continue
 
-    while start < len(all_tokens):
-        end  = min(start + _SP_MAX_TOKENS, len(all_tokens))
-        text = enc.decode(all_tokens[start:end]).strip()
-        if text:
-            chunks.append({
-                "content": text,
-                "metadata": {
-                    "doc_type":    "special_provision",
-                    "page_pdf":    _page_at(start),
-                    "chunk_index": idx,
-                },
-            })
-            idx += 1
-        if end >= len(all_tokens):
-            break
-        start = end - _SP_OVERLAP
+        # Encode the run's lines grouped into same-page blocks (mirroring how
+        # the deleted top-level _page_at built page_token_starts across the
+        # whole document), so a window's start offset maps back to the real
+        # page it came from -- not just the page the run's own heading is on.
+        page_token_starts: List[tuple] = []   # (token_offset, page_num)
+        run_tokens: List[int] = []
+        i, n = 0, len(lines)
+        while i < n:
+            page_num = run["line_pages"][i]
+            j = i
+            while j < n and run["line_pages"][j] == page_num:
+                j += 1
+            page_token_starts.append((len(run_tokens), page_num))
+            run_tokens.extend(enc.encode("\n".join(lines[i:j]) + "\n"))
+            i = j
+
+        def _page_at(token_idx: int, _starts=page_token_starts) -> int:
+            page_num = _starts[0][1] if _starts else run["page"]
+            for start, pnum in _starts:
+                if start <= token_idx:
+                    page_num = pnum
+                else:
+                    break
+            return page_num
+
+        start = 0
+        while start < len(run_tokens):
+            end  = min(start + _SP_MAX_TOKENS, len(run_tokens))
+            body = enc.decode(run_tokens[start:end]).strip()
+            if body:
+                chunks.append({
+                    "content": body,
+                    "metadata": {
+                        "doc_type":      "special_provision",
+                        "page_pdf":      _page_at(start),
+                        "chunk_index":   idx,
+                        "section_id":    run["section_id"],
+                        "section_title": run["section_title"],
+                        "tables": sorted({
+                            m.group(0).upper()
+                            for m in TABLE_RE.finditer(body)
+                        }),
+                    },
+                })
+                idx += 1
+            if end >= len(run_tokens):
+                break
+            start = end - _SP_OVERLAP
 
     return chunks
 
