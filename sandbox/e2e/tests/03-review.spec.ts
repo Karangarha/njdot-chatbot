@@ -248,7 +248,9 @@ test.describe("Document Review — full run with the Route 49 files", () => {
     });
 
     await test.step("project appears in the sidebar and reloads from the DB", async () => {
-      await page.getByRole("button", { name: "New Review" }).first().click();
+      // Two "New Review" buttons exist: the results header's and the
+      // off-screen sidebar's — click the visible one.
+      await page.getByRole("button", { name: "New Review" }).filter({ visible: true }).first().click();
       await page.getByRole("button", { name: "Open sidebar" }).click();
       const item = page.locator("aside").getByRole("button", { name: /✓|Untitled Project|Route/ }).first();
       await expect(item).toBeVisible();
