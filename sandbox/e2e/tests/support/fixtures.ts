@@ -125,6 +125,11 @@ export class Monitor {
 
 function attach(page: Page, m: Monitor): void {
   const startTimes = new Map<Request, number>();
+  // Status as soon as headers arrive: a request can still end up "failed"
+  // (e.g. ERR_ABORTED when the page navigates away mid-body) after the
+  // server has answered, and that answer is what the tests check.
+  const statuses = new Map<Request, number>();
+  page.on("response", (res) => statuses.set(res.request(), res.status()));
   page.on("console", (msg) => m.record({ kind: "console", level: msg.type(), text: msg.text() }));
   page.on("pageerror", (err) => m.record({ kind: "pageerror", text: `${err.name}: ${err.message}` }));
   page.on("request", (req) => startTimes.set(req, Date.now()));
@@ -142,7 +147,14 @@ function attach(page: Page, m: Monitor): void {
     });
   });
   page.on("requestfailed", (req) =>
-    m.record({ kind: "requestfailed", method: req.method(), url: req.url(), failure: req.failure()?.errorText, resourceType: req.resourceType() }),
+    m.record({
+      kind: "requestfailed",
+      method: req.method(),
+      url: req.url(),
+      status: statuses.get(req),
+      failure: req.failure()?.errorText,
+      resourceType: req.resourceType(),
+    }),
   );
 }
 
