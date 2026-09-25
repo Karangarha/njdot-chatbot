@@ -277,6 +277,8 @@ test.describe("Document Review — full run with the Route 49 files", () => {
     await login(page, main);
     await openReviewTab(page);
     await page.getByRole("button", { name: "Manage Checklist" }).click();
+    // Wait for the list to load (subtitle shows "Loading…" until then).
+    await expect(page.getByText(/\d+ of \d+ checks selected to run/)).toBeVisible();
     const boxes = page.getByRole("checkbox");
     const n = await boxes.count();
     for (let i = 0; i < n; i++) {
