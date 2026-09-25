@@ -102,7 +102,7 @@ test.describe("Document Review — checklist manager", () => {
       await expect(page.getByRole("button", { name: "Save check" })).toBeEnabled();
       await page.getByRole("button", { name: "Save check" }).click();
       await expect(checkRow(page, name)).toBeVisible();
-      await expect(checkRow(page, name).getByText("Custom")).toBeVisible();
+      await expect(checkRow(page, name).getByText("Custom", { exact: true })).toBeVisible();
     });
 
     await test.step("edit it", async () => {
