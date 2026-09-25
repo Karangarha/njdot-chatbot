@@ -78,8 +78,8 @@ test.describe("signup", () => {
     await page.getByRole("button", { name: "Create Account" }).click();
     await page.waitForURL("**/chat");
     await expect(page.getByRole("button", { name: "User menu" })).toHaveText("JS");
-    expect(monitor.calls("/auth/v1/signup", "POST")[0]?.status).toBe(200);
-    expect(monitor.calls("/auth/v1/token", "POST")[0]?.status).toBe(200);
+    expect((await monitor.call("/auth/v1/signup", "POST")).status).toBe(200);
+    expect((await monitor.call("/auth/v1/token", "POST")).status).toBe(200);
   });
 
   test("signing up an existing email shows an error", async ({ page, main, monitor }) => {
@@ -121,7 +121,7 @@ test.describe("login / logout", () => {
     await page.getByRole("button", { name: "User menu" }).click();
     await page.getByRole("button", { name: "Sign Out" }).click();
     await page.waitForURL(`${env.frontendUrl}/`);
-    expect(monitor.calls("/auth/v1/logout", "POST").length).toBe(1);
+    expect((await monitor.call("/auth/v1/logout", "POST")).status).toBeLessThan(300);
     await page.goto("/chat");
     await expect(page).toHaveURL(/\/login/);
   });
@@ -144,10 +144,18 @@ test.describe("password flows", () => {
     await page.locator("#confirm").fill(next);
     await page.getByRole("button", { name: "Update Password" }).click();
     await expect(page.getByText("Password updated!")).toBeVisible();
-    const call = monitor.calls("/api/auth/change-password", "POST")[0];
-    expect(call?.status).toBe(200);
+    const call = await monitor.call("/api/auth/change-password", "POST");
+    expect(call.status).toBe(200);
     updateAccount("pw", { password: next });
-    await page.waitForURL("**/chat", { timeout: 10_000 });
+    // The page promises "Redirecting you back…" to /chat. The backend changes
+    // the password through the Supabase admin API, which revokes the user's
+    // sessions, so middleware.ts sees no session and sends them to /login.
+    monitor.allow(/auth\/v1\/user -> 403/);
+    await page.waitForURL(/\/(chat|login)/, { timeout: 10_000 });
+    expect(
+      new URL(page.url()).pathname,
+      "after a successful password change the user is logged out (admin password update revokes sessions) instead of returning to /chat",
+    ).toBe("/chat");
   });
 
   test("forgot password: email → new password → login with it", async ({ page, accounts, monitor }) => {
@@ -165,7 +173,7 @@ test.describe("password flows", () => {
     await page.locator("#email").fill(a.email);
     await page.getByRole("button", { name: "Continue" }).click();
     await expect(page.getByText("Set your new password")).toBeVisible();
-    expect(monitor.calls("/api/auth/request-reset", "POST")[0]?.status).toBe(200);
+    expect((await monitor.call("/api/auth/request-reset", "POST")).status).toBe(200);
 
     // "Start over" returns to the email step
     await page.getByRole("button", { name: "Start over" }).click();
@@ -179,7 +187,7 @@ test.describe("password flows", () => {
     await page.getByRole("button", { name: "Update Password" }).click();
     await page.waitForURL("**/login?reset=success");
     await expect(page.getByText("Password updated successfully.", { exact: false })).toBeVisible();
-    expect(monitor.calls("/api/auth/reset-password", "POST")[0]?.status).toBe(200);
+    expect((await monitor.call("/api/auth/reset-password", "POST")).status).toBe(200);
     updateAccount("pw", { password: next });
 
     await page.getByLabel("Email address").fill(a.email);
@@ -193,6 +201,6 @@ test.describe("password flows", () => {
     await page.locator("#email").fill(`nobody-${Date.now()}@njdot-sandbox.test`);
     await page.getByRole("button", { name: "Continue" }).click();
     await expect(page.getByText("Set your new password")).toBeVisible();
-    expect(monitor.calls("/api/auth/request-reset", "POST")[0]?.status).toBe(200);
+    expect((await monitor.call("/api/auth/request-reset", "POST")).status).toBe(200);
   });
 });

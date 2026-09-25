@@ -79,12 +79,16 @@ test.describe("Document Review — checklist manager", () => {
     test.skip(total === 0, "no built-in checks — run ./sandbox/sandbox.sh seed");
 
     await test.step("toggle the first check off (forks built-ins into the user's rows)", async () => {
+      // Controlled checkbox: it flips only after the Supabase round-trip, so
+      // click and wait for the counter rather than using uncheck().
       const box = page.getByRole("checkbox").first();
-      await box.uncheck();
+      await box.click();
       await expect(page.getByText(`${total - 1} of ${total} checks selected to run`)).toBeVisible();
-      expect(monitor.calls(/\/rest\/v1\/compliance_checks/, "POST").length).toBeGreaterThan(0); // fork insert
-      expect(monitor.calls(/\/rest\/v1\/compliance_checks/, "PATCH").at(-1)?.status).toBeLessThan(300);
-      await box.check();
+      await expect(box).not.toBeChecked();
+      expect((await monitor.call(/\/rest\/v1\/compliance_checks/, "POST")).status).toBe(201); // fork insert
+      expect((await monitor.call(/\/rest\/v1\/compliance_checks/, "PATCH", "last")).status).toBeLessThan(300);
+      await box.click();
+      await expect(page.getByText(`${total} of ${total} checks selected to run`)).toBeVisible();
     });
 
     const name = `Sandbox custom check ${Date.now()}`;
@@ -169,9 +173,9 @@ test.describe("Document Review — full run with the Route 49 files", () => {
     });
 
     await test.step("project saved to review_projects and session indexing started", async () => {
-      expect(monitor.calls(/\/api\/session\/upload$/, "POST")[0]?.status).toBe(200);
-      expect(monitor.calls(/\/rest\/v1\/review_projects/, "POST")[0]?.status).toBe(201);
-      expect(monitor.calls(/\/rest\/v1\/review_projects/, "PATCH")[0]?.status).toBeLessThan(300);
+      expect((await monitor.call(/\/api\/session\/upload$/, "POST")).status).toBe(200);
+      expect((await monitor.call(/\/rest\/v1\/review_projects/, "POST")).status).toBe(201);
+      expect((await monitor.call(/\/rest\/v1\/review_projects/, "PATCH")).status).toBeLessThan(300);
     });
 
     await test.step("results: summary pills filter, sections collapse, cards render", async () => {
@@ -214,7 +218,7 @@ test.describe("Document Review — full run with the Route 49 files", () => {
     await test.step("Document Q&A: SSE until ready, history, ask a question", async () => {
       await page.getByRole("button", { name: "Document Q&A" }).click();
       await expect(page.getByText(/chunks indexed/)).toBeVisible({ timeout: 8 * 60_000 });
-      expect(monitor.calls(new RegExp(`/api/session/messages/${projectId}`), "GET")[0]?.status).toBe(200);
+      expect((await monitor.call(new RegExp(`/api/session/messages/${projectId}`), "GET")).status).toBe(200);
 
       const box = page.getByPlaceholder("Ask about the narrative, special provisions, or schedule…");
       await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
@@ -251,7 +255,7 @@ test.describe("Document Review — full run with the Route 49 files", () => {
       await row.hover();
       await row.getByRole("button", { name: "Delete project" }).click();
       await row.getByRole("button", { name: "Yes" }).click();
-      expect(monitor.calls(/\/rest\/v1\/review_projects\?/, "DELETE")[0]?.status).toBeLessThan(300);
+      expect((await monitor.call(/\/rest\/v1\/review_projects\?/, "DELETE")).status).toBeLessThan(300);
       await page.reload();
       await openReviewTab(page);
       await page.getByRole("button", { name: "Open sidebar" }).click();
@@ -263,7 +267,15 @@ test.describe("Document Review — full run with the Route 49 files", () => {
     await login(page, main);
     await openReviewTab(page);
     await page.getByRole("button", { name: "Manage Checklist" }).click();
-    for (const box of await page.getByRole("checkbox").all()) if (await box.isChecked()) await box.uncheck();
+    const boxes = page.getByRole("checkbox");
+    const n = await boxes.count();
+    for (let i = 0; i < n; i++) {
+      if (await boxes.nth(i).isChecked()) {
+        await boxes.nth(i).click();
+        await expect(boxes.nth(i)).not.toBeChecked();
+      }
+    }
+    await expect(page.getByText(/^0 of \d+ checks selected to run/)).toBeVisible();
     await page.getByRole("button", { name: "Done" }).click();
     await zoneInput(page, "Construction Schedule (.xer)").setInputFiles(FILES.schedule);
     await zoneInput(page, "Designer Narrative PDF").setInputFiles(FILES.narrative);

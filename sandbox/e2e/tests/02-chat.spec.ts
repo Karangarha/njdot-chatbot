@@ -38,7 +38,7 @@ test.describe("Smart Assistant chat", () => {
     const body = await ask(page, q);
 
     // Request body carried the collection
-    const post = monitor.calls("/api/query", "POST")[0];
+    const post = await monitor.call("/api/query", "POST");
     expect(JSON.parse(post.postData ?? "{}")).toEqual({ query: q, collection: "scheduling" });
     // Response contract (frontend/src/lib/types.ts QueryResponse)
     expect(typeof body.answer).toBe("string");
@@ -71,7 +71,7 @@ test.describe("Smart Assistant chat", () => {
     const res = page.waitForResponse((r) => r.url().endsWith("/api/query"), { timeout: 60_000 });
     await page.getByRole("button", { name: "Contract Execution Timeline" }).click();
     expect((await res).status()).toBe(200);
-    const sent = JSON.parse(monitor.calls("/api/query", "POST")[0].postData ?? "{}");
+    const sent = JSON.parse((await monitor.call("/api/query", "POST")).postData ?? "{}");
     expect(sent.query).toBe("How many days does a contractor have to execute the contract after award?");
     expect(sent.collection).toBeNull();
     // The other three pills are present
@@ -107,12 +107,14 @@ test.describe("Smart Assistant chat", () => {
     await ask(page, q);
     await page.getByRole("button", { name: "Open sidebar" }).click();
     await page.getByRole("button", { name: "New Chat" }).click();
-    await expect(page.getByText(q)).toHaveCount(0);
+    // The sidebar stays in the DOM (translated off-screen), so only count
+    // occurrences outside it: the chat thread itself must be empty.
+    await expect(page.getByText(q)).toHaveCount(await page.locator("aside").getByText(q).count());
 
     await openSidebar(page);
     await page.locator("aside").getByRole("button", { name: new RegExp(q) }).click();
     await expect(page.getByText(q).first()).toBeVisible();
-    expect(monitor.calls(/\/rest\/v1\/messages\?.*conversation_id=eq\./, "GET").at(-1)?.status).toBe(200);
+    expect((await monitor.call(/\/rest\/v1\/messages\?.*conversation_id=eq\./, "GET", "last")).status).toBe(200);
   });
 
   test("delete a conversation removes it (and it stays gone after reload)", async ({ page, monitor }) => {
@@ -120,15 +122,17 @@ test.describe("Smart Assistant chat", () => {
     await ask(page, q);
     await openSidebar(page);
     const row = page.locator("aside div.group", { hasText: q.slice(0, 40) });
+    const sidebar = page.locator("aside");
     await row.hover();
     await row.getByRole("button", { name: "Delete conversation" }).click();
-    await expect(row.getByText("Delete?")).toBeVisible();
-    await row.getByRole("button", { name: "No" }).click();
+    // The confirm prompt replaces the row's title, so look for it in the sidebar.
+    await expect(sidebar.getByText("Delete?")).toBeVisible();
+    await sidebar.getByRole("button", { name: "No", exact: true }).click();
     await row.hover();
     await row.getByRole("button", { name: "Delete conversation" }).click();
-    await row.getByRole("button", { name: "Yes" }).click();
+    await sidebar.getByRole("button", { name: "Yes", exact: true }).click();
     await expect(page.locator("aside").getByText(q.slice(0, 40))).toHaveCount(0);
-    expect(monitor.calls(/\/rest\/v1\/conversations\?/, "DELETE")[0]?.status).toBeLessThan(300);
+    expect((await monitor.call(/\/rest\/v1\/conversations\?/, "DELETE")).status).toBeLessThan(300);
 
     // The real test: is the row actually gone in the database? A missing RLS
     // DELETE policy makes Supabase answer 204 while deleting nothing.

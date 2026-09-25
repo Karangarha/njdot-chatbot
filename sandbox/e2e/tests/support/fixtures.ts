@@ -39,6 +39,17 @@ export class Monitor {
     );
   }
 
+  /** Like calls(), but waits (up to 15s) for a matching request to have
+   *  finished — responses are logged on "requestfinished", which can land a
+   *  moment after the UI has already reacted to them. */
+  async call(match: RegExp | string, method?: string, which: "first" | "last" = "first"): Promise<LogEntry> {
+    await expect
+      .poll(() => this.calls(match, method).length, { message: `waiting for ${method ?? "any"} ${match}`, timeout: 15_000 })
+      .toBeGreaterThan(0);
+    const all = this.calls(match, method);
+    return which === "last" ? all[all.length - 1] : all[0];
+  }
+
   record(e: Omit<LogEntry, "t">): void {
     this.entries.push({ t: Date.now() - this.started, ...e });
   }
