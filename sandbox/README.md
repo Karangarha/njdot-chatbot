@@ -33,6 +33,18 @@ If `supabase status` isn't run from your Supabase project folder, set
 by hand. Email confirmations must be off (`[auth.email] enable_confirmations = false`,
 the local default), because the suite signs up fresh users on every run.
 
+**Results of the first full run:** [`FINDINGS.md`](FINDINGS.md) (triaged) and
+[`reports/2026-09-25-REPORT.md`](reports/2026-09-25-REPORT.md) (raw).
+
+Extra commands:
+- `./sandbox/sandbox.sh checks` runs `next build` (for build warnings),
+  ESLint and the backend unit tests inside the production images. `test`
+  runs it automatically.
+- `AZURE_STARTUP_COMMAND` in `.env` reproduces the Web App's exact Startup
+  Command.
+- `PW_CHROMIUM_EXECUTABLE` tells Playwright to use an already-installed
+  Chromium.
+
 ## What the suite covers (37 tests)
 
 - **01 landing/auth:**

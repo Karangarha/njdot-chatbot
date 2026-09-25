@@ -17,9 +17,11 @@ const LOGS = path.join(SANDBOX, "logs");
 const E2E = path.join(SANDBOX, "e2e");
 
 const read = (p) => (fs.existsSync(p) ? fs.readFileSync(p, "utf8") : null);
+// `docker compose logs --timestamps` lines look like
+// "backend-1  | 2026-09-25T22:56:09.634Z <message>" — drop both parts.
+const strip = (s) => s.replace(/^[\w.-]+\s+\|\s?/, "").replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z\s?/, "");
 const norm = (s) =>
-  s
-    .replace(/^\S+Z\s+/, "") // docker --timestamps prefix
+  strip(s)
     .replace(/\d{4}-\d{2}-\d{2}[ T][\d:.,]+/g, "<ts>")
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, "<uuid>")
     .replace(/sandbox-\w+-\d+@/g, "sandbox-<user>@")
@@ -31,7 +33,7 @@ class Bucket {
   constructor() { this.map = new Map(); }
   add(text, where) {
     const key = norm(text).slice(0, 600);
-    const cur = this.map.get(key) ?? { count: 0, where: new Set(), sample: text.trim() };
+    const cur = this.map.get(key) ?? { count: 0, where: new Set(), sample: strip(text).trim() };
     cur.count++;
     if (where) cur.where.add(where);
     this.map.set(key, cur);
@@ -86,14 +88,14 @@ for (const line of (read(path.join(E2E, ".state", "findings.jsonl")) ?? "").spli
 // ── Service logs ─────────────────────────────────────────────────────────────
 function scanPython(text) {
   const errors = new Bucket(), warnings = new Bucket(), tracebacks = new Bucket();
-  const lines = text.split("\n");
+  const lines = text.split("\n").map(strip);
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     if (/Traceback \(most recent call last\)/.test(l)) {
       const block = [l];
-      while (++i < lines.length && (/^\S+Z\s+(\s|Traceback|During handling|The above exception)/.test(lines[i]) || /^\s/.test(lines[i]))) block.push(lines[i]);
+      while (++i < lines.length && (/^(\s|Traceback|During handling|The above exception)/.test(lines[i]) || lines[i] === "")) block.push(lines[i]);
       if (i < lines.length) block.push(lines[i]); // the "XError: message" line
-      tracebacks.add(block.map((b) => b.replace(/^\S+Z\s/, "")).join("\n"));
+      tracebacks.add(block.join("\n"));
       continue;
     }
     if (/\b(ERROR|CRITICAL)\b/.test(l)) errors.add(l);
@@ -115,9 +117,9 @@ const backendLog = read(path.join(LOGS, "backend.log"));
 const frontendLog = read(path.join(LOGS, "frontend.log"));
 const mockLog = read(path.join(LOGS, "mock-llm.log"));
 const neoLog = read(path.join(LOGS, "neo4j.log"));
-const backend = backendLog ? scanPython(backendLog) : null;
-const frontend = frontendLog ? scanGeneric(frontendLog, /⨯|\bError\b|ERR_|Unhandled|unreachable/i, /\bwarn(ing)?\b|⚠/i) : null;
-const neo = neoLog ? scanGeneric(neoLog, /\bERROR\b/, /\bWARN\b/) : null;
+const backend = backendLog !== null ? scanPython(backendLog) : null;
+const frontend = frontendLog !== null ? scanGeneric(frontendLog, /⨯|\bError\b|ERR_|Unhandled|unreachable/i, /\bwarn(ing)?\b|⚠/i) : null;
+const neo = neoLog !== null ? scanGeneric(neoLog, /\bERROR\b/, /\bWARN\b/) : null;
 const mock = { errors: new Bucket(), warnings: new Bucket() };
 const mockKinds = {};
 for (const l of (mockLog ?? "").split("\n")) {
@@ -131,9 +133,35 @@ for (const l of (mockLog ?? "").split("\n")) {
   } catch {}
 }
 
+// ── Static checks (./sandbox.sh checks) ─────────────────────────────────────
+const nextBuild = read(path.join(LOGS, "static-next-build.log"));
+const eslint = read(path.join(LOGS, "static-eslint.log"));
+const pytest = read(path.join(LOGS, "static-pytest.log"));
+const staticWarnings = new Bucket();
+const staticErrors = new Bucket();
+for (const l of (nextBuild ?? "").split("\n")) {
+  if (/⚠|warn/i.test(l)) staticWarnings.add(`next build: ${l.trim()}`);
+  if (/Failed to compile|Type error|⨯/.test(l)) staticErrors.add(`next build: ${l.trim()}`);
+}
+let eslintFile = "";
+for (const l of (eslint ?? "").split("\n")) {
+  if (/^\//.test(l)) eslintFile = l.replace(/^.*\/src\//, "src/");
+  const m = l.match(/^\s+(\d+:\d+)\s+(error|warning)\s+(.*)$/);
+  if (m) (m[2] === "error" ? staticErrors : staticWarnings).add(`eslint ${eslintFile}:${m[1]} ${m[3].replace(/\s{2,}/g, "  ")}`);
+}
+const pytestSummary = (pytest ?? "").trim().split("\n").pop() ?? "";
+if (/failed|error/i.test(pytestSummary)) staticErrors.add(`pytest: ${pytestSummary}`);
+for (const m of (pytest ?? "").matchAll(/^\s+\S+: (\w*Warning): (.*)$/gm)) staticWarnings.add(`pytest ${m[1]}: ${m[2]}`);
+
 // ── Write the report ─────────────────────────────────────────────────────────
 const row = (name, e, w) => `| ${name} | ${e ?? "–"} | ${w ?? "–"} |`;
-const annotations = tests.flatMap((t) => t.annotations.map((a) => ({ ...a, test: t.title })));
+const seen = new Set();
+const annotations = tests
+  .flatMap((t) => t.annotations.map((a) => ({ ...a, test: t.title })))
+  .filter((a) => {
+    const k = `${a.type}|${a.description}|${a.test}`;
+    return seen.has(k) ? false : seen.add(k);
+  });
 const out = [];
 out.push(`# NJDOT sandbox run report`, "", `Generated ${new Date().toISOString()}`, "");
 out.push(`## Summary`, "");
@@ -148,7 +176,8 @@ out.push(row("Browser (console + network)", browserErrors.size, browserWarnings.
 out.push(row("Backend — Azure container", backend ? `${backend.errors.size} + ${backend.tracebacks.size} tracebacks` : "no log", backend?.warnings.size));
 out.push(row("Frontend — Vercel container", frontend?.errors.size ?? "no log", frontend?.warnings.size));
 out.push(row("Mock LLM", mockLog ? mock.errors.size : "no log", mock.warnings.size));
-out.push(row("Neo4j", neo?.errors.size ?? "no log", neo?.warnings.size), "");
+out.push(row("Neo4j", neo?.errors.size ?? "no log", neo?.warnings.size));
+out.push(row("Static checks (build / lint / pytest)", nextBuild || eslint || pytest ? staticErrors.size : "not run", staticWarnings.size), "");
 
 out.push(`## Failed tests`, "");
 const failed = [...by("failed"), ...by("timedOut")];
@@ -171,6 +200,7 @@ if (backend) {
 if (frontend) out.push(`## Frontend server errors`, "", frontend.errors.md(), `## Frontend server warnings`, "", frontend.warnings.md());
 out.push(`## Mock LLM`, "", `Calls by kind: \`${JSON.stringify(mockKinds)}\``, "", `Errors:`, mock.errors.md(), `Warnings:`, mock.warnings.md());
 if (neo) out.push(`## Neo4j errors`, "", neo.errors.md(), `## Neo4j warnings`, "", neo.warnings.md());
+out.push(`## Static checks`, "", pytest ? `Backend unit tests: \`${pytestSummary}\`` : "_./sandbox.sh checks not run_", "", "Errors:", staticErrors.md(), "Warnings:", staticWarnings.md());
 out.push(`## All tests`, "", "| Status | Test | Time |", "|---|---|---|");
 for (const t of tests) out.push(`| ${t.status} | ${t.title} | ${(t.ms / 1000).toFixed(1)}s |`);
 

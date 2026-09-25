@@ -118,6 +118,10 @@ test.describe("Smart Assistant chat", () => {
   });
 
   test("delete a conversation removes it (and it stays gone after reload)", async ({ page, monitor }) => {
+    const keep = `Keep me ${Date.now()}`;
+    await ask(page, keep);
+    await openSidebar(page);
+    await page.getByRole("button", { name: "New Chat" }).click();
     const q = `Delete me ${Date.now()}`;
     await ask(page, q);
     await openSidebar(page);
@@ -138,6 +142,10 @@ test.describe("Smart Assistant chat", () => {
     // DELETE policy makes Supabase answer 204 while deleting nothing.
     await page.reload();
     await openSidebar(page);
+    // Wait for the list to actually load (the kept conversation shows up)
+    // before asserting the deleted one is absent — otherwise this passes
+    // vacuously on an empty, still-loading sidebar.
+    await expect(page.locator("aside").getByText(keep)).toBeVisible();
     await expect(
       page.locator("aside").getByText(q.slice(0, 40)),
       "conversation came back after reload — the DELETE matched 0 rows (no RLS delete policy on conversations?)",

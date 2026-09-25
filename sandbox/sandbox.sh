@@ -10,6 +10,7 @@
 #              manual if missing  (seed --all ingests every collection)
 #   test       run the Playwright E2E suite, then collect every service log
 #   logs       save all service logs to sandbox/logs/
+#   checks     next build warnings, eslint, backend pytest inside the images
 #   report     re-collect logs and rebuild sandbox/logs/REPORT.md
 #   down       stop the sandbox containers (your Supabase is never touched)
 set -euo pipefail
@@ -142,10 +143,26 @@ cmd_seed() {
 cmd_logs() {
   load_env
   mkdir -p "$HERE/logs"
+  # SANDBOX_LOGS_SINCE (set by `test`) limits logs to the current run.
+  local since=()
+  [[ -n "${SANDBOX_LOGS_SINCE:-}" ]] && since=(--since "$SANDBOX_LOGS_SINCE")
   for svc in backend frontend mock-llm neo4j; do
-    "${COMPOSE[@]}" logs --no-color --timestamps "$svc" > "$HERE/logs/$svc.log" 2>&1 || true
+    "${COMPOSE[@]}" logs --no-color --timestamps "${since[@]}" "$svc" > "$HERE/logs/$svc.log" 2>&1 || true
   done
   ok "logs written to sandbox/logs/"
+}
+
+cmd_checks() {  # static checks inside the production-shaped images → logs/static-*.log
+  load_env
+  mkdir -p "$HERE/logs"
+  say "next build (Vercel image) — build-time warnings"
+  docker run --rm njdot-sandbox-frontend sh -c 'rm -rf .next && npm run build 2>&1' > "$HERE/logs/static-next-build.log" 2>&1 || true
+  say "eslint (not run by Vercel's build, reported for completeness)"
+  docker run --rm njdot-sandbox-frontend sh -c 'npx eslint src 2>&1' > "$HERE/logs/static-eslint.log" 2>&1 || true
+  say "backend unit tests (App Service image)"
+  docker run --rm --entrypoint sh njdot-sandbox-backend -c \
+    'cd /home/site/wwwroot && antenv/bin/pip install -q pytest >/dev/null 2>&1; antenv/bin/python -m pytest -q --ignore=tests/integration -p no:cacheprovider 2>&1' \
+    > "$HERE/logs/static-pytest.log" 2>&1 || true
 }
 
 cmd_test() {
@@ -154,9 +171,12 @@ cmd_test() {
   [[ -d node_modules ]] || npm ci
   npx playwright install chromium
   local rc=0
+  export SANDBOX_LOGS_SINCE
+  SANDBOX_LOGS_SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   SANDBOX_COMPOSE="docker compose -f $HERE/docker-compose.yml --env-file $ENV_FILE" \
     npx playwright test "$@" || rc=$?
   cmd_logs
+  cmd_checks
   node "$HERE/report/build-report.mjs"
   say "Every error + warning: sandbox/logs/REPORT.md  ← send this back for triage"
   say "HTML report: npx --prefix sandbox/e2e playwright show-report sandbox/e2e/playwright-report"
@@ -177,7 +197,8 @@ case "${1:-}" in
   seed) shift; cmd_seed "$@" ;;
   test) shift; cmd_test "$@" ;;
   logs) cmd_logs ;;
+  checks) cmd_checks ;;
   report) cmd_logs; node "$HERE/report/build-report.mjs" ;;
   down) shift; cmd_down "$@" ;;
-  *) sed -n '2,16p' "$0"; exit 1 ;;
+  *) sed -n '2,17p' "$0"; exit 1 ;;
 esac
