@@ -167,7 +167,12 @@ test.describe("Document Review — full run with the Route 49 files", () => {
       );
       for (const u of uploads) expect(u.status, u.url).toBe(200);
 
-      await expect(page.getByText("Schedule Compliance Review")).toBeVisible({ timeout: 12 * 60_000 });
+      // Results or the error the UI shows on SSE status=error — whichever
+      // comes first, so a failed review fails the test right away.
+      const done = page.getByText("Schedule Compliance Review");
+      const failed = page.getByText(/unexpected error occurred|Lost connection while waiting|review failed/i);
+      await expect(done.or(failed)).toBeVisible({ timeout: 12 * 60_000 });
+      if (await failed.isVisible()) throw new Error(`review failed in the UI: "${await failed.first().textContent()}" — see logs/backend.log`);
       const sse = monitor.calls(new RegExp(`/api/review/${projectId}/status\\?token=`));
       expect(sse.length, "SSE status stream was opened").toBeGreaterThan(0);
     });

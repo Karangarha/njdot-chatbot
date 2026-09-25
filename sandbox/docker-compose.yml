@@ -31,6 +31,10 @@ services:
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-sandbox-neo4j-pw}
       NEO4J_server_memory_heap_max__size: 1G
+      # APOC core ships inside the image (labs/); langchain-neo4j's schema
+      # refresh calls apoc.meta.data(), which Aura/Desktop also provide.
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
     ports:
       - "7475:7474"   # browser UI at http://localhost:7475 (7474 left free for Neo4j Desktop)
       - "7688:7687"
