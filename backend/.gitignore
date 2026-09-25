@@ -8,6 +8,11 @@
 # tests/test_chunk_store.py are actually trackable.
 !tests/
 !tests/*
+# Un-ignore the integration test subpackage (same pattern as the app/
+# subpackages below) — !tests/* only reaches tests/'s direct children, not
+# files nested inside tests/integration/.
+!tests/integration/
+!tests/integration/*
 # Un-ignore the SQL migrations (same pattern) — needed for this branch's new
 # 009_review_projects_sp_keymap_estimate_supabase_only.sql.
 !migrations/
@@ -48,3 +53,5 @@
 !app/scheduling/*
 # Un-ignore the env var template (no secrets — placeholders only)
 !.env.example
+# Un-ignore the pytest marker registration (no secrets)
+!pytest.ini

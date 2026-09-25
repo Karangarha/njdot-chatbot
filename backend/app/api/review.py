@@ -54,11 +54,13 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from yarl import URL as _YarlURL
 
 from app.auth import user_id_from_token, user_id_from_token_optional
+from app.compliance.anchors import extract_anchors
 from app.compliance.catalog import BUILTIN_CHECKS, MANUAL_REVIEW_KEYS, CheckDef
+from app.compliance.check_retrieval import PIN_BUDGET_FRACTION, retrieve_for_check
 from app.compliance.cost import CostGapResult, evaluate_cost_gap
 from app.compliance.edq import EdqCoverageResult, evaluate_edq_coverage, match_edq_items_to_activities
 from app.compliance.date_rule import DateRuleResult, evaluate_date_rules
-from app.compliance.eval_engine import CitedSearch, EvidenceCandidate, evaluate_checks
+from app.compliance.eval_engine import CitedSearch, EvidenceCandidate, SpCitedSearch, evaluate_checks
 from app.compliance.geo import RegionResult, resolve_region
 from app.compliance.schedule_logic import ScheduleLogicResult, evaluate_schedule_logic
 from app.config import config
@@ -88,7 +90,6 @@ from app.ingestion.utility_plan_extractor import extract_utility_plan, render_ut
 from app.models import ReviewCheckResult, ReviewResponse
 from app.neo4j_client import get_neo4j
 from app.retrieval.vector_search import VectorSearcher
-from app.retrieval_langchain.sp_retriever import retrieve_sp_chunks
 from app.retrieval_langchain.utility_plan_retriever import retrieve_utility_plan_chunks
 from app.scheduling import build_calendars, build_network, cross_check, run_cpm
 # Re-exported for backward compatibility (session.py and debug scripts import
@@ -342,9 +343,33 @@ def _cosine(a: List[float], b: List[float]) -> float:
     return float(np.dot(va, vb) / denom) if denom else 0.0
 
 
+def _sp_chunk_matches_anchors(chunk: Dict[str, Any], anchors: Any) -> bool:
+    """Same pin test as ``check_retrieval.pin_by_anchors``, against an
+    in-memory chunk's metadata instead of a ``session_chunks`` row.
+
+    Section matching (including the dot-bounded parent/child rule -- a check
+    naming "105.07" also pins a chunk headed by "105.07.02") is delegated to
+    ``Anchors.matches_section`` so this stays in lockstep with
+    ``pin_by_anchors``'s own ``metadata->>section_id.like.<anchor>.*``
+    filter without re-deriving the boundary rule here.
+
+    Uses ``anchors.pinnable_tables``, not ``anchors.tables``, for the same
+    reason ``pin_by_anchors`` does (see ``Anchors.pinnable_tables``): a bare
+    single-letter caption like "TABLE A" is ambiguous across documents, and
+    pinning bypasses ranking entirely, so a wrong pin is worse than no pin.
+    Keeping this in sync with ``pin_by_anchors`` matters beyond style -- the
+    two SP search closures are tested for parity
+    (test_both_sp_closures_return_identical_passages_for_one_query).
+    """
+    metadata = chunk.get("metadata") or {}
+    if anchors.matches_section(metadata.get("section_id")):
+        return True
+    return bool(set(metadata.get("tables") or ()) & set(anchors.pinnable_tables))
+
+
 def _build_sp_search_fn(
     sp_chunks: List[Dict[str, Any]], sp_vectors: List[List[float]], embeddings: OpenAIEmbeddings,
-) -> Optional[CitedSearch]:
+) -> Optional[SpCitedSearch]:
     """In-process cosine-ranked Special Provision search over already-chunked
     and already-embedded SP text, tagging each returned passage for citation
     verification (e.g. ``[cite:sp-0]``).
@@ -355,16 +380,59 @@ def _build_sp_search_fn(
     ``insert_session_chunks`` call that persists them to Supabase
     ``session_chunks`` — previously each computed its own chunks/embeddings
     independently, doubling SP embedding calls on every fresh review.
+
+    This closure has no database to pin against, so it can't call
+    ``check_retrieval.retrieve_for_check`` directly (that issues real
+    PostgREST/RPC queries). It instead pins over ``sp_chunks`` itself using
+    the identical anchor extraction and pin budget (``extract_anchors``,
+    ``PIN_BUDGET_FRACTION``) ``retrieve_for_check`` uses, so the two agree on
+    *which* chunks are anchor matches rather than merely resembling each
+    other. There is no keyword/BM25 index over in-memory chunks -- there
+    never was one here -- so the unpinned half of the budget is filled by
+    the existing cosine ranking only.
     """
     if not sp_chunks:
         return None
 
-    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate]]:
-        q_vec = embeddings.embed_query(query)
-        scored = sorted(zip(sp_chunks, sp_vectors), key=lambda cv: -_cosine(q_vec, cv[1]))
-        top = [c for c, _ in scored[:top_k]]
+    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate], bool]:
+        anchors = extract_anchors(query)
+        pin_limit = max(1, int(top_k * PIN_BUDGET_FRACTION)) if top_k > 0 else 0
+        pinned: List[Dict[str, Any]] = []
+        if pin_limit > 0 and not anchors.is_empty:
+            pinned = sorted(
+                (c for c in sp_chunks if _sp_chunk_matches_anchors(c, anchors)),
+                key=lambda c: (c.get("metadata") or {}).get("chunk_index") or 0,
+            )[:pin_limit]
+        pinned_ids = {id(c) for c in pinned}
+
+        remaining = max(top_k - len(pinned), 0)
+        ranked: List[Dict[str, Any]] = []
+        if remaining > 0:
+            q_vec = embeddings.embed_query(query)
+            pool = [(c, v) for c, v in zip(sp_chunks, sp_vectors) if id(c) not in pinned_ids]
+            ranked = [c for c, _ in sorted(pool, key=lambda cv: -_cosine(q_vec, cv[1]))[:remaining]]
+
+        top = pinned + ranked
+        # Mirrors retrieve_for_check's three-way split: a missing anchor is
+        # only evidence of a genuine gap when this project's chunks carry
+        # section metadata at all (see check_retrieval.project_has_section_metadata).
+        # Also requires pin_limit > 0, same as retrieve_for_check's own guard:
+        # at pin_limit == 0 pinning never even ran, so an empty `pinned` here
+        # is budget starvation, not proof the anchor is absent -- without
+        # this, this closure and retrieve_for_check disagreed at any
+        # non-positive top_k. Uses pinnable_is_empty, not is_empty, for the
+        # same reason retrieve_for_check does (see check_retrieval.py): a
+        # bare single-letter table anchor ("TABLE A") is never pinned, so
+        # its absence isn't evidence of a gap either.
+        anchor_missing = (
+            pin_limit > 0
+            and not anchors.pinnable_is_empty
+            and not pinned
+            and any((c.get("metadata") or {}).get("section_id") for c in sp_chunks)
+        )
         if not top:
-            return "No matching Special Provision text found.", {}
+            return "No matching Special Provision text found.", {}, anchor_missing
+
         parts: List[str] = []
         candidates: Dict[str, EvidenceCandidate] = {}
         for i, chunk in enumerate(top):
@@ -374,19 +442,25 @@ def _build_sp_search_fn(
                 kind="private", doc_type="special_provision", label="Special Provision",
                 page_pdf=(chunk.get("metadata") or {}).get("page_pdf"),
             )
-        return "\n\n---\n\n".join(parts), candidates
+        return "\n\n---\n\n".join(parts), candidates, anchor_missing
 
     return _search
 
 
 def _build_sp_search_fn_from_supabase(
     db: Any, embeddings: OpenAIEmbeddings, project_id: str,
-) -> Optional[CitedSearch]:
+) -> Optional[SpCitedSearch]:
     """Special Provision search backed by ``session_chunks`` -- the
     ``reseed=False`` fast path's equivalent of ``_build_sp_search_fn``,
-    without re-parsing, re-chunking, or re-embedding the PDF. Reuses the same
-    ``retrieve_sp_chunks`` chat already calls, so review and chat can never
-    disagree about how SP retrieval works. Returns ``None`` if this project
+    without re-parsing, re-chunking, or re-embedding the PDF. Reuses
+    ``check_retrieval.retrieve_for_check`` -- the same pin+dense+keyword
+    composition ``_build_sp_search_fn`` now mirrors (in-memory pin, no
+    keyword leg) -- so the two review closures can never disagree about how
+    SP retrieval works, the way they used to before diverging on the
+    similarity floor. Chat's own SP tool (``sp_retriever.build_sp_tool``)
+    still calls the plain dense-only ``retrieve_sp_chunks`` beneath
+    ``retrieve_for_check`` with its own 0.2 floor; unifying that with the
+    compliance-check path is not this task. Returns ``None`` if this project
     has no SP chunks (matches "no SP uploaded" behavior).
     """
     existing = (
@@ -397,20 +471,22 @@ def _build_sp_search_fn_from_supabase(
     if not existing.count:
         return None
 
-    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate]]:
-        rows = retrieve_sp_chunks(db, embeddings.embed_query, project_id, query, match_count=top_k)
-        if not rows:
-            return "No matching Special Provision text found.", {}
+    def _search(query: str, top_k: int = 8) -> Tuple[str, Dict[str, EvidenceCandidate], bool]:
+        result = retrieve_for_check(
+            db, embeddings.embed_query, project_id, query, top_k=top_k, doc_type="special_provision",
+        )
+        if not result.rows:
+            return "No matching Special Provision text found.", {}, result.anchor_missing
         parts: List[str] = []
         candidates: Dict[str, EvidenceCandidate] = {}
-        for i, r in enumerate(rows):
+        for i, r in enumerate(result.rows):
             tag = f"sp-{i}"
             parts.append(f"[cite:{tag}] {r['content']}")
             candidates[tag] = EvidenceCandidate(
                 kind="private", doc_type="special_provision", label="Special Provision",
                 page_pdf=(r.get("metadata") or {}).get("page_pdf"),
             )
-        return "\n\n---\n\n".join(parts), candidates
+        return "\n\n---\n\n".join(parts), candidates, result.anchor_missing
 
     return _search
 
@@ -700,6 +776,15 @@ def _parse_checks(raw: Optional[str]) -> Optional[List[CheckDef]]:
             raise HTTPException(status_code=400, detail=f"checks[{i}] must be an object")
         try:
             builtin = _BUILTIN_BY_KEY.get(item["check_key"])
+            # `or 8` alone would only catch 0/None -- a negative value (e.g.
+            # -5) is truthy in Python and would pass straight through as
+            # check_retrieval.retrieve_for_check's pin budget. A custom
+            # check's sp_top_k must be a positive int or the built-in
+            # default; check_retrieval already guards top_k<=0 for a benign
+            # 0, but a stray negative from a malformed payload should not
+            # reach it at all.
+            raw_sp_top_k = item.get("sp_top_k")
+            custom_sp_top_k = raw_sp_top_k if isinstance(raw_sp_top_k, int) and raw_sp_top_k > 0 else 8
             checks.append(CheckDef(
                 check_key=item["check_key"],
                 category=item["category"],
@@ -711,7 +796,7 @@ def _parse_checks(raw: Optional[str]) -> Optional[List[CheckDef]]:
                 # payload's value, defaulting to the dataclass defaults.
                 check_type=builtin.check_type if builtin else (item.get("check_type") or "llm"),
                 source_files=item.get("source_files") or ["schedule"],
-                sp_top_k=builtin.sp_top_k if builtin else (item.get("sp_top_k") or 8),
+                sp_top_k=builtin.sp_top_k if builtin else custom_sp_top_k,
             ))
         except KeyError as exc:
             raise HTTPException(

@@ -207,6 +207,43 @@ def classify_query(query: str) -> Tuple[float, float, str]:
     return v, k, "semantic"
 
 
+def fuse(
+    vector_rows: List[Dict[str, Any]],
+    keyword_rows: List[Dict[str, Any]],
+    v_weight: float,
+    k_weight: float,
+    match_count: int,
+    key: str = "id",
+) -> List[Dict[str, Any]]:
+    """Reciprocal Rank Fusion over two ranked lists.
+
+        rrf(d) = v_weight/(k + rank_v(d)) + k_weight/(k + rank_k(d))
+
+    with k = _RRF_K, 1-based ranks, and an absent list contributing nothing.
+
+    Table-agnostic on purpose: it knows nothing about `chunks` or
+    `session_chunks`, only about two ranked lists of dicts sharing an id
+    field. The returned rows carry their RRF score in ``similarity`` so a
+    caller can apply a threshold.
+
+    Rows whose ``key`` field is ``None`` are dropped before scoring. Without
+    this guard, ``rows_by_id.setdefault(rid, row)`` would coalesce every
+    ``None``-keyed row into a single slot, silently merging unrelated rows
+    and under-counting them. Callers do not need to pre-filter.
+    """
+    scores: Dict[Any, float] = {}
+    rows_by_id: Dict[Any, Dict[str, Any]] = {}
+    for rows, weight in ((vector_rows, v_weight), (keyword_rows, k_weight)):
+        for rank, row in enumerate(rows, start=1):
+            rid = row.get(key)
+            if rid is None:
+                continue
+            rows_by_id.setdefault(rid, row)
+            scores[rid] = scores.get(rid, 0.0) + weight / (_RRF_K + rank)
+    ordered = sorted(scores.items(), key=lambda kv: -kv[1])[:match_count]
+    return [{**rows_by_id[rid], "similarity": score} for rid, score in ordered]
+
+
 # ── Main class ────────────────────────────────────────────────────────────────
 
 class HybridRanker:
@@ -338,57 +375,47 @@ class HybridRanker:
         """
         Merge two ranked lists using weighted Reciprocal Rank Fusion.
 
-        For each unique chunk *d*:
-
-            score(d) = v_weight × 1/(_RRF_K + rank_v(d))
-                     + k_weight × 1/(_RRF_K + rank_k(d))
+        The RRF scoring itself is delegated to the table-agnostic ``fuse()``
+        helper (see module docstring for the formula); this method adds the
+        section-level deduplication and, in debug mode, the per-list rank
+        annotations that ``HybridRanker.search`` exposes to callers.
 
         Chunks that appear in only one list still receive a partial score.
+        Rows with no ``id`` are dropped before fusion, same as before.
 
         When ``debug=True``, each returned dict also carries:
             ``_vector_rank``  – 1-based rank in *v_results*; ``None`` if absent.
             ``_keyword_rank`` – 1-based rank in *k_results*; ``None`` if absent.
         """
-        scores:   Dict[str, float]          = {}
-        data:     Dict[str, Dict[str, Any]] = {}
-        v_ranks:  Dict[str, int]            = {}   # rid → 1-based vector rank
-        k_ranks:  Dict[str, int]            = {}   # rid → 1-based keyword rank
+        v_valid = [r for r in v_results if r.get("id") is not None]
+        k_valid = [r for r in k_results if r.get("id") is not None]
 
-        for rank, result in enumerate(v_results, start=1):
-            rid = result["id"]
-            if rid is None:
-                continue
-            scores[rid] = scores.get(rid, 0.0) + v_weight * (1.0 / (_RRF_K + rank))
-            if rid not in data:
-                data[rid] = result
-            v_ranks[rid] = rank
+        v_ranks: Dict[str, int] = {r["id"]: rank for rank, r in enumerate(v_valid, start=1)}
+        k_ranks: Dict[str, int] = {r["id"]: rank for rank, r in enumerate(k_valid, start=1)}
 
-        for rank, result in enumerate(k_results, start=1):
-            rid = result["id"]
-            if rid is None:
-                continue
-            scores[rid] = scores.get(rid, 0.0) + k_weight * (1.0 / (_RRF_K + rank))
-            if rid not in data:
-                data[rid] = result
-            k_ranks[rid] = rank
+        # Fuse with an unbounded match_count: the section dedup below may
+        # need to look past the top `match_count` scores to still fill
+        # `match_count` unique sections, exactly as the inline merge used to.
+        fused = fuse(
+            v_valid, k_valid, v_weight, k_weight,
+            match_count=len(v_valid) + len(k_valid),
+        )
 
-        # Sort by descending RRF score, then deduplicate by section_id so that
-        # continuation chunks from the same subpart don't consume multiple slots.
-        # The highest-ranked chunk per section_id is kept; lower-ranked siblings
-        # are skipped unless we run out of unique sections before match_count.
-        sorted_ids = sorted(scores, key=lambda x: scores[x], reverse=True)
-
+        # Deduplicate by section_id so that continuation chunks from the
+        # same subpart don't consume multiple slots. The highest-ranked
+        # chunk per section_id is kept; lower-ranked siblings are skipped
+        # unless we run out of unique sections before match_count.
         merged: List[Dict[str, Any]] = []
         seen_sections: set = set()
-        for rid in sorted_ids:
+        for result in fused:
             if len(merged) >= match_count:
                 break
-            result   = dict(data[rid])
-            section  = result.get("metadata", {}).get("section_id") or rid
+            rid     = result["id"]
+            section = result.get("metadata", {}).get("section_id") or rid
             if section in seen_sections:
                 continue
             seen_sections.add(section)
-            result["similarity"] = round(scores[rid], 6)
+            result["similarity"] = round(result["similarity"], 6)
             if debug:
                 result["_vector_rank"]  = v_ranks.get(rid)
                 result["_keyword_rank"] = k_ranks.get(rid)

@@ -12,6 +12,7 @@ Runnable two ways:
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -710,7 +711,7 @@ def test_evaluate_one_check_builds_verified_citation_from_matched_tag():
     def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Gas work is prohibited in July.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7),
-        }
+        }, False  # anchor_missing -- unrelated to this check, no anchor named
 
     result, _ = _call_evaluate_one_check(check, llm, judge, sp_search_fn=sp_search_fn)
 
@@ -736,7 +737,7 @@ def test_evaluate_one_check_flags_unmatched_citation_tag():
     def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Gas work is prohibited in July.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=7),
-        }
+        }, False  # anchor_missing -- unrelated to this check, no anchor named
 
     result, _ = _call_evaluate_one_check(check, llm, judge, sp_search_fn=sp_search_fn)
 
@@ -790,7 +791,7 @@ def test_evaluate_one_check_grounding_unresolved_keeps_citations_from_final_answ
     def sp_search_fn(query, top_k=8):
         return "[cite:sp-0] Some SP text.", {
             "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision", page_pdf=1),
-        }
+        }, False  # anchor_missing -- unrelated to this check, no anchor named
 
     result, _ = _call_evaluate_one_check(
         check, llm, judge, sp_search_fn=sp_search_fn, keymap_facts="KEY MAP FACTS: ...",
@@ -800,6 +801,341 @@ def test_evaluate_one_check_grounding_unresolved_keeps_citations_from_final_answ
     assert "recommend human review" in result.evidence.lower()
     doc_types = {c.doc_type for c in result.citations}
     assert doc_types == {"special_provision", "key_map"}
+
+
+def test_both_sp_closures_return_identical_passages_for_one_query():
+    """The fresh-review closure applied no similarity floor and the rerun
+    closure applied 0.2, so the same check retrieved differently depending on
+    which code path ran. One implementation, one result.
+
+    Builds both app.api.review SP closures over the same backing data (the
+    _FakeDB/_chunk fakes from test_check_retrieval.py) and runs one
+    identical, anchored query through each.
+    """
+    from app.api.review import _build_sp_search_fn, _build_sp_search_fn_from_supabase
+    from test_check_retrieval import _FakeDB, _chunk, _INSTRUCTION
+
+    # One anchor-matching chunk (pinned by both closures) plus two plain
+    # chunks that only the dense leg can surface.
+    pinned_chunk = _chunk(
+        "t", section="105.05", tables=["TABLE 105.05-1"], body="Pinned SP text.", chunk_index=0,
+    )
+    vector_chunk1 = _chunk("v1", body="Vector match one.")
+    vector_chunk2 = _chunk("v2", body="Vector match two.")
+
+    # A zero query embedding makes _cosine() return 0.0 for every candidate
+    # (norm(query)=0 => denom=0), so the in-process closure's ranking is a
+    # stable sort that preserves list order -- the same order _FakeDB hands
+    # back verbatim (it does not do real vector math either). No keyword
+    # rows on either side, so the RRF fuse the Supabase closure performs
+    # never has a keyword-driven reordering to diverge on.
+    embed_fn = lambda q: [0.0, 0.0, 0.0]  # noqa: E731
+    embeddings = SimpleNamespace(embed_query=embed_fn)
+
+    db = _FakeDB(pinned=[pinned_chunk], vector=[vector_chunk1, vector_chunk2], keyword=())
+    supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
+
+    # pinned_chunk is deliberately NOT first here (unlike the Supabase
+    # closure's separate `pinned=` fixture above, which is pin-only by
+    # construction and so can't prove anything about ordering). If the
+    # in-process closure's pinning were disabled, a stable sort over this
+    # list would leave pinned_chunk last -- so this fixture only produces
+    # sp-0/sp-1/sp-2 order matching the Supabase closure when pinning
+    # actually moves it to the front.
+    sp_chunks = [vector_chunk1, vector_chunk2, pinned_chunk]
+    sp_vectors = [[0.0, 0.0, 0.0]] * 3
+    memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+
+    text_a, _candidates_a, anchor_missing_a = supabase_fn(_INSTRUCTION, top_k=8)
+    text_b, _candidates_b, anchor_missing_b = memory_fn(_INSTRUCTION, top_k=8)
+
+    tags_a = re.findall(r"\[cite:(sp-\d+)\]", text_a)
+    tags_b = re.findall(r"\[cite:(sp-\d+)\]", text_b)
+
+    assert tags_a == ["sp-0", "sp-1", "sp-2"]  # sanity: not vacuously equal
+    assert text_a == text_b
+    assert tags_a == tags_b
+    assert len(tags_a) == len(tags_b)
+    assert anchor_missing_a == anchor_missing_b
+
+
+def test_both_sp_closures_agree_when_instruction_names_parent_section():
+    """FINDING 2's dot-bounded prefix pinning (commit d47ee99) landed in
+    check_retrieval.pin_by_anchors -- the Supabase-backed closure -- but was
+    never extended to the in-process closure's own pin test. That is the
+    same class of drift Task 8 exists to eliminate, and the parity test
+    above didn't catch it because its one fixture only exercised an exact
+    section_id match. A check naming the PARENT section "105.07" must pin a
+    chunk headed by the CHILD "105.07.02" identically on both paths.
+    """
+    from app.api.review import _build_sp_search_fn, _build_sp_search_fn_from_supabase
+    from test_check_retrieval import _FakeDB, _chunk
+
+    parent_instruction = (
+        "Special Provisions 105.07 CONFORMITY WITH AND DEVIATIONS FROM PLANS "
+        "AND STAKES: \"deviations require written approval\".\n\n"
+        "Confirm deviation approvals are documented."
+    )
+
+    child_chunk = _chunk("t", section="105.07.02", body="Child section text.", chunk_index=0)
+    vector_chunk1 = _chunk("v1", body="Vector match one.")
+    vector_chunk2 = _chunk("v2", body="Vector match two.")
+
+    embed_fn = lambda q: [0.0, 0.0, 0.0]  # noqa: E731
+    embeddings = SimpleNamespace(embed_query=embed_fn)
+
+    # The Supabase closure trusts its DB filter (already dot-bounded, per
+    # commit d47ee99) to have matched the child row -- handed back here as
+    # if the real `metadata->>section_id.like.105.07.*` filter found it.
+    db = _FakeDB(pinned=[child_chunk], vector=[vector_chunk1, vector_chunk2], keyword=())
+    supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
+
+    # child_chunk deliberately not first: if the in-process closure's
+    # dot-bounded matching is missing (the actual bug), a stable sort over
+    # this list leaves it last instead of pinned to the front.
+    sp_chunks = [vector_chunk1, vector_chunk2, child_chunk]
+    sp_vectors = [[0.0, 0.0, 0.0]] * 3
+    memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+
+    text_a, _candidates_a, anchor_missing_a = supabase_fn(parent_instruction, top_k=8)
+    text_b, _candidates_b, anchor_missing_b = memory_fn(parent_instruction, top_k=8)
+
+    tags_a = re.findall(r"\[cite:(sp-\d+)\]", text_a)
+    tags_b = re.findall(r"\[cite:(sp-\d+)\]", text_b)
+
+    assert tags_a == ["sp-0", "sp-1", "sp-2"]  # sanity: not vacuously equal
+    assert text_a == text_b
+    assert tags_a == tags_b
+    assert len(tags_a) == len(tags_b)
+    assert anchor_missing_a == anchor_missing_b
+
+
+def test_both_sp_closures_agree_zero_budget_is_starvation_not_a_missing_anchor():
+    """FINDING 1: check_retrieval.retrieve_for_check only calls a missing
+    anchor a genuine gap when pin_limit > 0 -- at top_k<=0 pin_by_anchors
+    never even runs (its own limit<=0 guard), so an empty pin there is
+    budget starvation, not proof the anchor is absent (see
+    test_check_retrieval.test_top_k_zero_is_budget_starvation_not_a_missing_anchor).
+    The in-process closure's own anchor_missing never got that guard. Proves
+    the two can't silently diverge again: if either path drops the
+    ``pin_limit > 0`` guard, this project (which genuinely has section
+    metadata elsewhere) makes that one path report True while the other
+    still reports False.
+    """
+    from app.api.review import _build_sp_search_fn, _build_sp_search_fn_from_supabase
+    from test_check_retrieval import _FakeDB, _chunk, _INSTRUCTION
+
+    # Non-empty so the Supabase closure's "does this project have SP chunks"
+    # existence probe passes -- pin_by_anchors itself is never reached at
+    # top_k=0 (pin_limit forces it to short-circuit before touching the DB),
+    # so this fixture cannot accidentally get pinned.
+    other_chunk = _chunk("other", section="900.01", body="Unrelated clause.")
+
+    embed_fn = lambda q: [0.0, 0.0, 0.0]  # noqa: E731
+    embeddings = SimpleNamespace(embed_query=embed_fn)
+
+    db = _FakeDB(pinned=[other_chunk], vector=[], keyword=[], metadata_rows=[other_chunk])
+    supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
+
+    sp_chunks = [other_chunk]
+    sp_vectors = [[0.0, 0.0, 0.0]]
+    memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+
+    _text_a, _candidates_a, anchor_missing_a = supabase_fn(_INSTRUCTION, top_k=0)
+    _text_b, _candidates_b, anchor_missing_b = memory_fn(_INSTRUCTION, top_k=0)
+
+    assert anchor_missing_a == anchor_missing_b
+    assert anchor_missing_a is False
+
+
+def test_both_sp_closures_agree_a_bare_table_anchor_is_not_a_missing_anchor():
+    """FINDING 2: anchor_missing must gate on whether any PINNABLE anchor
+    exists, not on whether extract_anchors found anything at all. A check
+    whose only anchor is a bare single-letter table ("TABLE A") is one
+    pin_by_anchors (and its in-process mirror, _sp_chunk_matches_anchors)
+    never even attempts to pin -- Anchors.pinnable_tables deliberately
+    excludes it (see
+    test_check_retrieval.test_pin_filter_excludes_bare_single_letter_table_anchors)
+    -- so reporting a gap here would flag a fill pinning never tried to
+    make. The project genuinely has section metadata (elsewhere), so the
+    old is_empty-gated logic -- which only asks whether ANY anchor was
+    extracted -- would wrongly call this a genuine gap. Proves the two
+    paths can't silently diverge on this gate either: whichever path still
+    gates on is_empty reports True while the other (gating on
+    pinnable_is_empty) reports False.
+    """
+    from app.api.review import _build_sp_search_fn, _build_sp_search_fn_from_supabase
+    from test_check_retrieval import _FakeDB, _chunk
+
+    instruction = (
+        "Classification follows TABLE A for this item.\n\n"
+        "Confirm the submittal is classified per the governing table."
+    )
+    other_chunk = _chunk("other", section="900.01", body="Unrelated clause.")
+
+    embed_fn = lambda q: [0.0, 0.0, 0.0]  # noqa: E731
+    embeddings = SimpleNamespace(embed_query=embed_fn)
+
+    # pinned=[other_chunk] only satisfies the Supabase closure's existence
+    # probe -- pin_by_anchors builds no conditions for a non-pinnable-only
+    # anchor set and returns [] before ever querying this fixture (see
+    # test_check_retrieval.test_pin_by_anchors_returns_empty_when_only_an_ambiguous_table_is_named).
+    db = _FakeDB(pinned=[other_chunk], vector=[], keyword=[], metadata_rows=[other_chunk])
+    supabase_fn = _build_sp_search_fn_from_supabase(db, embeddings, "p1")
+
+    sp_chunks = [other_chunk]
+    sp_vectors = [[0.0, 0.0, 0.0]]
+    memory_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
+
+    _text_a, _candidates_a, anchor_missing_a = supabase_fn(instruction, top_k=8)
+    _text_b, _candidates_b, anchor_missing_b = memory_fn(instruction, top_k=8)
+
+    assert anchor_missing_a == anchor_missing_b
+    assert anchor_missing_a is False
+
+
+def test_sp_anchor_missing_sole_source_reports_missing_with_no_llm_call():
+    """anchor_missing=True means the project HAS section metadata and the
+    check's own named anchor (TABLE 105.05-1) matched nothing in the Special
+    Provision -- and here "sp" is this check's ONLY evidence source, so
+    there is nothing else left to consult. Must short-circuit to Missing
+    without ever calling the LLM, must name the anchor so a reviewer knows
+    what to look for, and must NOT claim the clause is absent from the
+    project (only that it wasn't found in the Special Provision) -- unlike a
+    project ingested before section-aware chunking (which must degrade
+    silently, see test_sp_anchor_missing_false_behaves_exactly_as_before),
+    and unlike a multi-source check (see the next test)."""
+    check = _make_check(
+        check_key="working_drawing_review_time", source_files=["sp"],
+        instruction=(
+            "Category is set by Table 105.05-1 - but the Special Provisions "
+            "often REPLACE that table."
+        ),
+    )
+
+    def sp_search_fn(query, top_k=8):
+        return "[cite:sp-0] unrelated clause text", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision"),
+        }, True  # anchor_missing
+
+    llm = _FakeStructuredLLM([])
+    result, usage = _call_evaluate_one_check(
+        check, llm, _FakeStructuredLLM([]), sp_search_fn=sp_search_fn,
+    )
+
+    assert result.status == "Missing"
+    assert "105.05" in result.evidence or "TABLE 105.05-1" in result.evidence
+    assert "not found in the Special Provision" in result.evidence
+    assert "absent from" not in result.evidence.lower()
+    assert usage["llm_call_count"] == 0
+    # usage accumulates only after invoke() returns, so a raising invoke (the
+    # empty response queue's .pop(0) would raise IndexError) also leaves
+    # llm_call_count at 0 -- that alone doesn't prove invoke was never
+    # reached. .calls is appended before the pop, so this is what actually
+    # proves it.
+    assert len(llm.calls) == 0
+
+
+def test_sp_anchor_missing_multi_source_reaches_other_sources():
+    """anchor_missing=True but "sp" is NOT this check's sole source (it also
+    names "spec") -- must NOT short-circuit. The spec source must still be
+    queried and reach the LLM, with a note about the missing SP anchor
+    folded into the evidence rather than a terminal Missing verdict. This is
+    the FINDING 1 regression case: nearby_projects' 105.06 anchor is absent
+    from the Special Provision but the check also names "spec", whose base
+    Standard Specifications text can still answer it."""
+    check = _make_check(
+        check_key="nearby_projects", source_files=["sp", "spec"],
+        instruction="Look in: Special Provisions 105.06; Standard Specifications 105.06.",
+    )
+    original = EvaluationSchema(
+        considered_items=[], breaching_items=[],
+        evidence="105.06 base form, no adjacent work named", source="spec 105.06",
+    )
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def sp_search_fn(query, top_k=8):
+        return "[cite:sp-0] unrelated clause text", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision"),
+        }, True  # anchor_missing
+
+    spec_calls = []
+
+    def spec_search_fn(query):
+        spec_calls.append(query)
+        return "[cite:specs-0] 105.06 Cooperation with Others (base form).", {
+            "specs-0": EvidenceCandidate(kind="public", doc_type="spec", label="Standard Specifications"),
+        }
+
+    result, usage = _call_evaluate_one_check(
+        check, llm, judge, sp_search_fn=sp_search_fn, spec_search_fn=spec_search_fn,
+    )
+
+    # spec was actually queried -- the other source was reached, not skipped.
+    assert len(spec_calls) == 1
+    # the LLM (and judge) ran normally -- no terminal short-circuit.
+    assert len(llm.calls) == 1
+    assert usage["llm_call_count"] == 2  # original + judge
+    assert result.status == "Pass"
+    # the evidence the LLM actually saw carries a note about the missing SP
+    # anchor, softly worded (not claiming project-wide absence), plus the
+    # spec text that resolves the check.
+    sent_evidence = llm.calls[0][1].content
+    assert "not found in the Special Provision" in sent_evidence
+    assert "does not mean the clause is absent from the project" in sent_evidence
+    assert "105.06 Cooperation with Others (base form)" in sent_evidence
+
+
+def test_sp_anchor_missing_false_behaves_exactly_as_before():
+    """anchor_missing=False -- whether because no anchor was named or the
+    project predates section-aware chunking and pinning couldn't work at all
+    -- must not skip anything: evidence still goes to the LLM exactly as it
+    did before this task."""
+    check = _make_check(source_files=["sp", "schedule"])
+    original = EvaluationSchema(
+        considered_items=["B1010"], breaching_items=[],
+        evidence="Nothing relevant found", source="schedule",
+    )
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def sp_search_fn(query, top_k=8):
+        return "[cite:sp-0] some SP text", {
+            "sp-0": EvidenceCandidate(kind="private", doc_type="special_provision", label="Special Provision"),
+        }, False  # anchor_missing
+
+    result, usage = _call_evaluate_one_check(check, llm, judge, sp_search_fn=sp_search_fn)
+
+    assert result.status == "Pass"
+    assert usage["llm_call_count"] == 2  # original + judge
+    assert len(llm.calls) == 1
+
+
+def test_spec_search_fn_two_tuple_path_is_unaffected():
+    """spec/csm (and every other non-SP source) still return the plain
+    CitedSearch two-tuple -- this task's three-tuple change must stay
+    confined to the SP path, per this task's own scope note."""
+    check = _make_check(source_files=["spec"])
+    original = EvaluationSchema(evidence="Spec text found", source="spec 105.03")
+    llm = _FakeStructuredLLM([(original, {"input_tokens": 10, "output_tokens": 5, "input_token_details": {}})])
+    judge = _FakeStructuredLLM([
+        (GroundingJudgment(grounded=True, reason="fine"), {"input_tokens": 20, "output_tokens": 5, "input_token_details": {}}),
+    ])
+
+    def spec_search_fn(query):
+        return "[cite:specs-0] Standard Spec text.", {
+            "specs-0": EvidenceCandidate(kind="public", doc_type="spec", label="Standard Specifications"),
+        }
+
+    result, usage = _call_evaluate_one_check(check, llm, judge, spec_search_fn=spec_search_fn)
+
+    assert result.status == "Pass"
+    assert usage["llm_call_count"] == 2  # original + judge
 
 
 if __name__ == "__main__":

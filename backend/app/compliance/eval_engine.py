@@ -36,6 +36,23 @@ activity graph coverage, ``app.compliance.edq``), ``"schedule_logic"``
 (CSM Section 3.0 negative float / lag / open ends / mandatory constraints,
 ``app.compliance.schedule_logic``), and ``"date_rule"`` (milestone weekday
 tests and holiday-aware business-day gaps, ``app.compliance.date_rule``).
+
+Special Provision search closures (``sp_search_fn``) return a three-tuple
+``(text, candidates, anchor_missing)`` rather than ``CitedSearch``'s plain
+two-tuple -- carried as the third element of that call's own return value
+(the chosen transport; see ``app.compliance.check_retrieval.RetrievalResult
+.anchor_missing`` and ``app.api.review``'s SP closures for where it's
+computed) rather than on a separate retrieval-log record. ``anchor_missing``
+True means the project has section metadata, the check named a section/table
+anchor, and it matched nothing in the Special Provision. When "sp" is the
+check's sole evidence source, ``_evaluate_one_check`` short-circuits on that
+signal: no LLM call, an immediate "Missing" verdict naming the absent anchor.
+When other sources are also named, it instead appends a note identifying the
+missing anchor to the SP evidence and evaluates normally through all sources
+-- the anchor being absent from the Special Provision doesn't mean the clause
+is absent from the project when e.g. "spec" can still answer it. False is the
+default/no-anchor/no-metadata case and behaves exactly as before (evidence
+goes to the LLM as usual).
 """
 
 from __future__ import annotations
@@ -52,6 +69,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import Runnable
 from langchain_neo4j import Neo4jGraph
 
+from app.compliance.anchors import extract_anchors
 from app.compliance.catalog import CheckDef
 from app.compliance.cost import CostGapResult
 from app.compliance.date_rule import DateRuleResult
@@ -86,6 +104,27 @@ class EvidenceCandidate:
 # instead of a plain string, so the tag(s) the LLM copies into
 # EvaluationSchema.cited_chunk_ids can be resolved back to real metadata.
 CitedSearch = Callable[[str], Tuple[str, Dict[str, EvidenceCandidate]]]
+
+# The Special Provision search closures additionally report whether the
+# instruction named a section/table anchor this project's chunks genuinely
+# lack (see check_retrieval.RetrievalResult.anchor_missing) -- a three-tuple,
+# and its own alias distinct from CitedSearch. Every other source (spec,
+# scheduling-manual, key-map, estimate) has no anchors and keeps the
+# two-tuple CitedSearch shape unchanged.
+SpCitedSearch = Callable[..., Tuple[str, Dict[str, EvidenceCandidate], bool]]
+
+# ``anchor_missing`` True means the project has section metadata, the check
+# named a section/table anchor, and it matched nothing in the Special
+# Provision specifically. ``_evaluate_one_check`` only short-circuits to a
+# terminal "Missing" verdict (no LLM call) when "sp" is the check's SOLE
+# evidence source -- every Special-Provision-scoped check in the catalog also
+# names at least one other source (schedule/narrative/spec/csm/...), and that
+# source may still answer the check correctly (e.g. a base Standard
+# Specifications section a Special Provision need not amend at all). In the
+# multi-source case, a note naming the missing anchor is appended to the SP
+# evidence block instead, and evaluation proceeds normally through the LLM,
+# _derive_status, and the grounding judge exactly as if anchor_missing were
+# False.
 
 _MAX_FACT_ROWS = 40
 
@@ -663,7 +702,7 @@ def _evaluate_one_check(
     structured_judge_llm: Runnable,
     schedule_facts: str,
     narrative_result: Tuple[str, Dict[str, EvidenceCandidate]],
-    sp_search_fn: Optional[CitedSearch],
+    sp_search_fn: Optional[SpCitedSearch],
     spec_search_fn: Optional[CitedSearch],
     csm_search_fn: Optional[CitedSearch],
     keymap_facts: Optional[str],
@@ -738,7 +777,49 @@ def _evaluate_one_check(
         evidence_parts.append(narrative_text)
         citation_lookup.update(narrative_candidates)
     if "sp" in sources:
-        sp_text, sp_candidates = sp_search_fn(check.instruction, top_k=check.sp_top_k)
+        sp_text, sp_candidates, anchor_missing = sp_search_fn(check.instruction, top_k=check.sp_top_k)
+        if anchor_missing:
+            anchors = extract_anchors(check.instruction)
+            named = ", ".join((*anchors.sections, *anchors.tables))
+            if set(sources) == {"sp"}:
+                # The project HAS section metadata, the check's own named
+                # anchor still matched nothing, and Special Provision search
+                # is this check's ONLY evidence source -- there is nothing
+                # else left to consult. No point spending an LLM call asking
+                # the model about text it was never given: construct
+                # ReviewCheckResult(status="Missing") directly, naming the
+                # anchor for the reviewer. This does NOT go through
+                # _derive_status -- there is no EvaluationSchema here (no LLM
+                # call was made for this check), so there is nothing for
+                # _derive_status to inspect. Direct construction is the same
+                # idiom the missing_sources short-circuit above already uses
+                # for the same reason.
+                return ReviewCheckResult(
+                    id=check.check_key, category=check.category, name=check.name,
+                    status="Missing",
+                    evidence=(
+                        f"{named} was not found in the Special Provision. "
+                        "Special Provision search is this check's only "
+                        "evidence source, so there is nothing else to "
+                        "consult."
+                    ),
+                    source="special provision",
+                ), usage_totals
+            # Other sources remain (spec/csm/schedule/etc.) that might still
+            # answer this check -- e.g. a Special Provision need not amend a
+            # Standard Specifications section at all, in which case "spec" is
+            # the source that actually resolves it. Don't short-circuit:
+            # append a note to the SP evidence block so the model (and a
+            # human reader) sees that the named anchor specifically was not
+            # found in the Special Provision, and let the normal verdict path
+            # (LLM + insufficient_evidence + grounding judge) decide the
+            # outcome from all sources together.
+            sp_text = (
+                f"{sp_text}\n\n[Special Provision note: {named} was not "
+                "found in the Special Provision. This does not mean the "
+                "clause is absent from the project -- check the other "
+                "evidence sources below before concluding it is missing.]"
+            )
         evidence_parts.append(sp_text)
         citation_lookup.update(sp_candidates)
     if "keymap" in sources:
@@ -933,7 +1014,7 @@ def evaluate_checks(
     checks: List[CheckDef],
     graph: Neo4jGraph,
     llm: BaseChatModel,
-    sp_search_fn: Optional[CitedSearch] = None,
+    sp_search_fn: Optional[SpCitedSearch] = None,
     spec_search_fn: Optional[CitedSearch] = None,
     csm_search_fn: Optional[CitedSearch] = None,
     keymap_facts: Optional[str] = None,
