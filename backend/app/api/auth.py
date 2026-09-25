@@ -10,6 +10,7 @@ POST /api/auth/change-password – Authenticated password change for logged-in u
 from __future__ import annotations
 
 import hashlib
+import logging
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -18,6 +19,8 @@ from fastapi import APIRouter, Header, HTTPException
 from pydantic import BaseModel
 
 from app.config import config
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["auth"])
 
@@ -49,6 +52,10 @@ def _find_user_id_by_email(email: str) -> str | None:
             timeout=10.0,
         )
         if resp.status_code != 200:
+            logger.warning(
+                "Supabase admin user lookup returned %d — treating as not found",
+                resp.status_code,
+            )
             return None
         users = resp.json().get("users", [])
         match = next(
@@ -56,7 +63,8 @@ def _find_user_id_by_email(email: str) -> str | None:
             None,
         )
         return str(match["id"]) if match else None
-    except Exception:
+    except Exception as exc:
+        logger.warning("Supabase admin user lookup failed: %s", exc)
         return None
 
 
@@ -69,8 +77,18 @@ def _update_user_password(user_id: str, password: str) -> bool:
             json={"password": password},
             timeout=10.0,
         )
-        return resp.status_code == 200
-    except Exception:
+        if resp.status_code != 200:
+            logger.error(
+                "Supabase admin password update for user_id=%s returned %d",
+                user_id, resp.status_code,
+            )
+            return False
+        return True
+    except Exception as exc:
+        logger.error(
+            "Supabase admin password update for user_id=%s failed: %s",
+            user_id, exc, exc_info=True,
+        )
         return False
 
 

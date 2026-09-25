@@ -1,8 +1,11 @@
+import logging
 from typing import Optional
 
 from langchain_neo4j import Neo4jGraph
 
 from .config import config
+
+logger = logging.getLogger(__name__)
 
 
 class Neo4jClient:
@@ -40,20 +43,25 @@ class Neo4jClient:
                 # ever handing it to a query.
                 driver_config={"liveness_check_timeout": 60},
             )
-            print("OK Neo4j client initialized")
+            logger.info("Neo4j client initialized")
 
         return cls._instance
 
     @classmethod
     def test_connection(cls) -> bool:
-        """Test database connection."""
+        """Test Neo4j connection.
+
+        Dev-time probe only: the running server never calls this (its sole
+        caller is this module's own __main__ block). A Neo4j failure during a
+        real request surfaces through the caller that raised, not from here.
+        """
         try:
             graph = cls.get_graph()
             graph.query("RETURN 1 AS ok")
-            print("OK Neo4j connection successful")
+            logger.info("Neo4j connection successful")
             return True
         except Exception as e:
-            print(f"FAIL Neo4j connection failed: {str(e)}")
+            logger.error("Neo4j connection failed: %s", e, exc_info=True)
             return False
 
 

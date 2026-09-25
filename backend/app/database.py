@@ -6,9 +6,13 @@ _BACKEND = Path(__file__).resolve().parent.parent
 if str(_BACKEND) not in sys.path:
     sys.path.insert(0, str(_BACKEND))'''
 
+import logging
+
 from supabase import create_client, Client
 from typing import Optional
 from .config import config
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -30,20 +34,27 @@ class Database:
                 config.SUPABASE_URL,
                 config.SUPABASE_SERVICE_ROLE_KEY,
             )
-            print("OK Supabase client initialized")
+            logger.info("Supabase client initialized")
 
         return cls._instance
 
     @classmethod
     def test_connection(cls) -> bool:
-        """Test database connection."""
+        """Test database connection.
+
+        Dev-time probe only: the running server never calls this (its sole
+        caller is this module's own __main__ block). A Supabase failure during
+        a real request surfaces through the caller that raised, not from here
+        -- see app.ingestion.chunk_store for a runtime call site that does
+        log with attribution.
+        """
         try:
             client = cls.get_client()
             client.table("chunks").select("id").limit(1).execute()
-            print("OK Database connection successful")
+            logger.info("Supabase connection successful")
             return True
         except Exception as e:
-            print(f"FAIL Database connection failed: {str(e)}")
+            logger.error("Supabase connection failed: %s", e, exc_info=True)
             return False
 
 

@@ -62,7 +62,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -78,7 +78,8 @@ from app.compliance.geo import RegionResult
 from app.compliance.schedule_logic import ScheduleLogicResult
 from app.config import config
 from app.models import EvaluationSchema, GroundingJudgment, ReviewCheckResult, ReviewCitation
-from app.observability import get_langfuse_client, get_langfuse_handler, new_trace_id
+from app.llm_logging import build_callbacks
+from app.observability import get_langfuse_client, new_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -711,7 +712,7 @@ def _evaluate_one_check(
     deterministic: "_DeterministicContext",
     project_id: str,
     user_id: Optional[str],
-    langfuse_handler,
+    callbacks: List[Any],
 ) -> Tuple[ReviewCheckResult, Dict[str, int]]:
     """Evaluate a single check and return its result plus the token usage of
     all the LLM calls this check made (original answer, plus the grounding
@@ -761,6 +762,10 @@ def _evaluate_one_check(
     if "csm" in sources and csm_search_fn is None:
         missing_sources.append("Construction Scheduling Manual")
     if missing_sources:
+        logger.warning(
+            "Check %s reported Missing without an LLM call: %s",
+            check.check_key, ", ".join(missing_sources),
+        )
         return ReviewCheckResult(
             id=check.check_key, category=check.category, name=check.name,
             status="Missing", evidence=f"Not available for this review: {', '.join(missing_sources)}.",
@@ -840,7 +845,7 @@ def _evaluate_one_check(
 
     user_msg = f"{evidence}\n\nCHECK: {check.name}\n{check.instruction}"
     invoke_config = {
-        "callbacks": [langfuse_handler] if langfuse_handler else [],
+        "callbacks": callbacks,
         "run_name": f"evaluate-check:{check.check_key}",
         "metadata": {
             "langfuse_session_id": project_id,
@@ -1096,7 +1101,7 @@ def evaluate_checks(
     # module docstring for why a deterministic trace id (rather than
     # ThreadPoolExecutor-crossing context propagation) is what makes this
     # work across worker threads. Fails soft: if Langfuse is unavailable,
-    # review_span/langfuse_handler stay None and checks just don't trace.
+    # review_span stays None and checks just don't trace (the logging callback still runs).
     langfuse_client = get_langfuse_client()
     trace_id = new_trace_id(seed=project_id)
     review_span_cm = (
@@ -1115,9 +1120,7 @@ def evaluate_checks(
 
     results_by_index: Dict[int, ReviewCheckResult] = {}
     with review_span_cm as review_span:
-        langfuse_handler = get_langfuse_handler(
-            trace_id=trace_id, parent_span_id=getattr(review_span, "id", None),
-        )
+        review_span_id = getattr(review_span, "id", None)
         with ThreadPoolExecutor(max_workers=config.REVIEW_CHECK_CONCURRENCY) as executor:
             future_to_index = {
                 executor.submit(
@@ -1125,7 +1128,16 @@ def evaluate_checks(
                     schedule_facts, narrative_result,
                     sp_search_fn, spec_search_fn, csm_search_fn, keymap_facts, estimate_facts,
                     utility_plan_search_fn,
-                    deterministic_ctx, project_id, user_id, langfuse_handler,
+                    deterministic_ctx, project_id, user_id,
+                    # Built per check, not once per review: the handler's
+                    # operation label is fixed at construction, so a single
+                    # shared list logs the same label against all 57 checks
+                    # and names none of them. Same trace_id/parent_span_id,
+                    # so Langfuse still nests every check under one span.
+                    build_callbacks(
+                        trace_id=trace_id, parent_span_id=review_span_id,
+                        operation=f"evaluate-check:{check.check_key}",
+                    ),
                 ): i
                 for i, check in enumerate(checks)
             }

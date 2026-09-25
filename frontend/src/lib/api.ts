@@ -1,6 +1,9 @@
 import type { QueryResponse } from './types'
 
-export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
+// Strip trailing slash: a URL like ".../" + "/api/query" produces "...//api/query",
+// which Vercel 308-redirects to the single-slash path — and browsers refuse to
+// follow a redirect on a CORS preflight, failing the request outright.
+export const API_BASE = (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000').replace(/\/+$/, '')
 
 /** Bearer-auth header, or {} when no token is available. */
 export function authHeaders(accessToken?: string): HeadersInit {

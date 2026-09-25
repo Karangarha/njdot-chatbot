@@ -10,11 +10,15 @@ page scroll is driven by the ``#page=N`` URL fragment on the client.
 
 from __future__ import annotations
 
+import logging
+
 import httpx
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.config import config
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["pdf"])
 
@@ -37,11 +41,19 @@ async def serve_pdf(doc_name: str, page: int | None = None) -> StreamingResponse
     filename = _DOC_TO_FILENAME.get(doc_name, f"{doc_name}.pdf")
     url = _storage_url(filename)
 
+    # Constructed outside the try, and closed by hand on every exit path: the
+    # StreamingResponse below outlives this function, so the client cannot be
+    # an ``async with`` -- but one left open when send() raises leaks its
+    # connection pool on every request for as long as Storage is down.
+    client = httpx.AsyncClient(timeout=30.0)
     try:
-        client = httpx.AsyncClient(timeout=30.0)
         request = client.build_request("GET", url)
         upstream = await client.send(request, stream=True)
     except httpx.RequestError as exc:
+        await client.aclose()
+        logger.error(
+            "Storage unreachable for doc=%r file=%r: %s", doc_name, filename, exc, exc_info=True,
+        )
         raise HTTPException(status_code=502, detail=f"PDF storage unreachable: {exc}") from exc
 
     if upstream.status_code != 200:
@@ -51,10 +63,18 @@ async def serve_pdf(doc_name: str, page: int | None = None) -> StreamingResponse
         await client.aclose()
         try:
             is_not_found = upstream.status_code in (400, 404) and b"not_found" in body
-        except Exception:
+        except Exception as exc:
+            logger.warning(
+                "Could not classify Storage response %d for doc=%r: %s",
+                upstream.status_code, doc_name, exc,
+            )
             is_not_found = False
         if is_not_found:
+            logger.warning("PDF not found in Storage: doc=%r file=%r", doc_name, filename)
             raise HTTPException(status_code=404, detail=f"PDF not found: {doc_name!r}")
+        logger.error(
+            "Storage returned %d for doc=%r file=%r", upstream.status_code, doc_name, filename,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"PDF storage returned {upstream.status_code}",

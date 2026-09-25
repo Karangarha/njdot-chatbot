@@ -32,7 +32,8 @@ from app.ingestion.estimate_extractor import (
     pdf_page_count,
     render_page_png,
 )
-from app.observability import get_langfuse_handler, new_trace_id
+from app.llm_logging import build_callbacks
+from app.observability import new_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -132,9 +133,11 @@ def locate_edq_section_pages(
 
     try:
         structured_llm = llm.with_structured_output(_EdqSectionLocateResult)
-        handler = get_langfuse_handler(trace_id=new_trace_id(seed=project_id)) if project_id else None
         invoke_config = {
-            "callbacks": [handler] if handler else [],
+            "callbacks": build_callbacks(
+                trace_id=new_trace_id(seed=project_id) if project_id else None,
+                operation="locate-edq-section",
+            ),
             "run_name": "locate-edq-section",
             "metadata": {
                 "langfuse_session_id": project_id,
@@ -172,9 +175,11 @@ def _extract_page(
 
     try:
         structured_llm = llm.with_structured_output(_EdqPageExtraction)
-        handler = get_langfuse_handler(trace_id=new_trace_id(seed=project_id)) if project_id else None
         invoke_config = {
-            "callbacks": [handler] if handler else [],
+            "callbacks": build_callbacks(
+                trace_id=new_trace_id(seed=project_id) if project_id else None,
+                operation="extract-edq-page",
+            ),
             "run_name": "extract-edq-page",
             "metadata": {
                 "langfuse_session_id": project_id,

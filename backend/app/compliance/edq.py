@@ -34,7 +34,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.tools import Tool
 from pydantic import BaseModel, Field
 
-from app.observability import get_langfuse_handler, new_trace_id
+from app.llm_logging import build_callbacks
+from app.observability import new_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -193,9 +194,11 @@ def match_edq_items_to_activities(
 
     try:
         structured_llm = llm.with_structured_output(_EdqMatchResult)
-        handler = get_langfuse_handler(trace_id=new_trace_id(seed=project_id)) if project_id else None
         invoke_config = {
-            "callbacks": [handler] if handler else [],
+            "callbacks": build_callbacks(
+                trace_id=new_trace_id(seed=project_id) if project_id else None,
+                operation="match-edq-items",
+            ),
             "run_name": "match-edq-items",
             "metadata": {
                 "langfuse_session_id": project_id,

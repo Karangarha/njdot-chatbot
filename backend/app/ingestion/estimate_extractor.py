@@ -27,7 +27,8 @@ import fitz  # PyMuPDF
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from app.observability import get_langfuse_handler, new_trace_id
+from app.llm_logging import build_callbacks
+from app.observability import new_trace_id
 
 logger = logging.getLogger(__name__)
 
@@ -205,9 +206,11 @@ def extract_estimate(
 
     try:
         structured_llm = llm.with_structured_output(EstimateExtraction)
-        handler = get_langfuse_handler(trace_id=new_trace_id(seed=project_id)) if project_id else None
         invoke_config = {
-            "callbacks": [handler] if handler else [],
+            "callbacks": build_callbacks(
+                trace_id=new_trace_id(seed=project_id) if project_id else None,
+                operation="extract-estimate",
+            ),
             "run_name": "extract-estimate",
             "metadata": {
                 "langfuse_session_id": project_id,

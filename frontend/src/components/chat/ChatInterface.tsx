@@ -3,7 +3,7 @@
 import { KeyboardEvent, useEffect, useRef, useState } from 'react'
 import Image from 'next/image'
 import { useRouter } from 'next/navigation'
-import { askQuestion } from '@/lib/api'
+import { API_BASE, askQuestion } from '@/lib/api'
 import { createClient } from '@/lib/supabase/client'
 import type { BDCAlertItem, CitationItem, Conversation, ReviewProject } from '@/lib/types'
 import DocumentReview from '@/components/review/DocumentReview'
@@ -29,8 +29,6 @@ interface ChatInterfaceProps {
 }
 
 // ── Constants ──────────────────────────────────────────────────────────────────
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000'
 
 const SUGGESTED_QUESTIONS = [
   {

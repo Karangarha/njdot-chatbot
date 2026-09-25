@@ -60,7 +60,7 @@ from app.ingestion.session_chunker   import (
     chunk_special_provision,
 )
 from app.neo4j_client import get_neo4j
-from app.observability import get_langfuse_handler
+from app.llm_logging import build_callbacks
 from app.ingestion.utility_plan_extractor import extract_utility_plan, render_utility_plan_facts
 from app.retrieval_langchain.estimate_retriever import build_estimate_tool
 from app.retrieval_langchain.keymap_retriever import build_keymap_tool
@@ -824,14 +824,14 @@ async def session_query(req: QueryRequest) -> dict:
     fallback = ChatAnthropic(model=_ANTHROPIC_MODEL, anthropic_api_key=config.ANTHROPIC_API_KEY)
     llm = primary.with_fallbacks([fallback])
 
-    langfuse_handler = get_langfuse_handler()
+    _run_name = "chat-agent-response" if has_graph else "chat-sp-response"
     invoke_config = {
-        "callbacks": [langfuse_handler] if langfuse_handler else [],
+        "callbacks": build_callbacks(operation=_run_name),
         # Verb-first, low-cardinality name (no session_id/question text) so
         # traces group meaningfully in the Langfuse UI instead of each
         # question minting a distinct name — see langfuse/skills'
         # instrumentation best practices on naming conventions.
-        "run_name": "chat-agent-response" if has_graph else "chat-sp-response",
+        "run_name": _run_name,
         "metadata": {
             "langfuse_session_id": req.session_id,
             "langfuse_tags": ["chat_agent" if has_graph else "chat_sp_only"],
