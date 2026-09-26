@@ -13,6 +13,8 @@ A RAG (Retrieval-Augmented Generation) chatbot for querying New Jersey Departmen
 - An OpenAI API key (for embeddings, and as the default chat LLM)
 - An Anthropic API key (used as the LLM fallback for review/session chat)
 
+Database schema changes ship as Supabase migrations. See [`supabase/README.md`](supabase/README.md).
+
 ---
 
 ## Backend Setup & Running

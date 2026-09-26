@@ -1,0 +1,65 @@
+# Applies supabase/migrations/* to production Supabase (NJ-Dot 2.0) on push
+# to main; pull requests get a dry run listing what would be applied.
+# Design: docs/superpowers/specs/2026-09-26-automated-supabase-migrations-design.md
+#
+# SHIPS DISABLED. The job is skipped until the repository variable
+# SUPABASE_MIGRATIONS_ENABLED is "true". Do the one-time production
+# baseline in supabase/README.md FIRST: without it, the first run would
+# re-apply every migration to production (which has no history table).
+#
+# Repository secret (Settings -> Secrets and variables -> Actions):
+#   SUPABASE_DB_URL  NJ-Dot 2.0's Session pooler connection string, password
+#                    filled in and percent-encoded (dashboard -> Connect).
+#                    Session pooler, not Direct: GitHub runners are IPv4-only.
+# No access token or `supabase link`: db push connects straight to Postgres,
+# so no Management API permissions or org roles are involved.
+
+name: Supabase migrations
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'supabase/migrations/**'
+      - '.github/workflows/supabase-migrations.yml'
+  pull_request:
+    paths:
+      - 'supabase/migrations/**'
+      - '.github/workflows/supabase-migrations.yml'
+  workflow_dispatch: {}
+
+# Production applies run one at a time; a second push waits instead of
+# racing. Only main shares this group: GitHub keeps a single PENDING run
+# per group, so a PR dry-run in the same group would cancel a queued apply.
+concurrency:
+  group: ${{ github.ref == 'refs/heads/main' && 'supabase-migrations-production' || format('supabase-migrations-{0}', github.ref) }}
+  cancel-in-progress: false
+
+jobs:
+  migrate:
+    if: vars.SUPABASE_MIGRATIONS_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: 2.109.0
+
+      # The secret is scoped to the two steps that need it, so third-party
+      # actions above never see it.
+
+      # Pull requests and manual runs from other branches only preview.
+      - name: Preview pending migrations
+        if: github.ref != 'refs/heads/main'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: supabase db push --dry-run --db-url "$SUPABASE_DB_URL"
+
+      # Each migration file is atomic: a failure rolls that file back and
+      # records nothing, so fix it with a new commit and push again.
+      - name: Apply pending migrations
+        if: github.ref == 'refs/heads/main'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: supabase db push --yes --db-url "$SUPABASE_DB_URL"
