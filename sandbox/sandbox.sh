@@ -111,6 +111,15 @@ cmd_db_apply() {
     psql_docker < "$REPO/backend/migrations/002_conversations_updated_at.sql"
   else ok "conversations / messages present"; fi
 
+  # Numbered migrations from 011 up are idempotent — apply them every time.
+  for f in "$REPO"/backend/migrations/[0-9][0-9][0-9]_*.sql; do
+    [[ -e "$f" ]] || continue
+    n=$(basename "$f" | cut -d_ -f1)
+    (( 10#$n >= 11 )) || continue
+    say "migration $(basename "$f")"
+    psql_docker < "$f"
+  done
+
   say "sandbox/supabase/schema.sql (tables with no DDL in the repo, buckets, RLS)"
   psql_docker < "$HERE/supabase/schema.sql"
 
