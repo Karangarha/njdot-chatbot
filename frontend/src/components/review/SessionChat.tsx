@@ -208,7 +208,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
     fetch(`${apiBase}/api/session/messages/${sessionId}`, { headers: authHeaders(authTokenRef.current) })
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then(data => {
-        const loaded: Message[] = (data.messages ?? []).map((m: any) => ({
+        const loaded: Message[] = (data.messages ?? []).map((m: { role: Message['role']; content: string; sources?: Source[] }) => ({
           role:    m.role,
           content: m.content,
           sources: m.sources ?? [],

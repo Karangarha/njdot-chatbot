@@ -5,59 +5,13 @@ import { API_BASE } from '@/lib/api'
 import PDFViewerModal from '@/components/PDFViewerModal'
 import { createClient } from '@/lib/supabase/client'
 import jsPDF from 'jspdf'
-import autoTable from 'jspdf-autotable'
+import autoTable, { type CellHookData } from 'jspdf-autotable'
 import SessionChat from './SessionChat'
 import ChecklistManager from './ChecklistManager'
 import { getEffectiveChecks, toCheckSpecs } from '@/lib/checklist'
-import type { ComplianceCheck, ReviewProject } from '@/lib/types'
+import type { CheckItem, ComplianceCheck, ReviewCitationItem, ReviewProject, ReviewResult } from '@/lib/types'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
-
-interface ReviewCitationItem {
-  kind:        'public' | 'private'
-  doc_type:    string
-  label:       string
-  page_pdf?:   number | null
-  section_id?: string | null
-  verified:    boolean
-}
-
-interface CheckItem {
-  id: string
-  category: string
-  name: string
-  reasoning?: string
-  status: 'pass' | 'warning' | 'fail'
-  finding: string
-  evidence: string
-  citations?: ReviewCitationItem[]
-}
-
-interface ReviewResult {
-  project_id: string
-  project_name: string
-  project_duration_days: number
-  model_used: string
-  summary: {
-    passed: number
-    warnings: number
-    failed: number
-    manual_review: number
-  }
-  checks: CheckItem[]
-  manual_review_items: string[]
-  schedule_file_path?: string | null
-  narrative_pdf_path?: string | null
-  special_provision_pdf_path?: string | null
-  key_map_pdf_path?: string | null
-  // Full key map extraction (utilities, coordinates, sheet index, misc) +
-  // deterministic north/south-of-I-195 result — persisted for later use.
-  key_map?: { extraction: any; region: any } | null
-  estimate_pdf_path?: string | null
-  // Engineer's Estimate extraction + the deterministic Substantial-to-Final
-  // gap computation — persisted for later use.
-  estimate?: { extraction: any; cost_gap: any } | null
-}
 
 interface DocumentReviewProps {
   userId?: string
@@ -187,10 +141,9 @@ function UploadZone({
   )
 }
 
-function CitationPill({ citation, sessionId, authToken, onOpen }: {
+function CitationPill({ citation, sessionId, onOpen }: {
   citation: ReviewCitationItem
   sessionId: string | null
-  authToken?: string
   onOpen: (citation: ReviewCitationItem) => void
 }) {
   const clickable = citation.verified && citation.page_pdf != null && !!sessionId
@@ -274,7 +227,7 @@ function CheckCard({ check, sessionId, authToken }: {
         {check.citations && check.citations.length > 0 ? (
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             {check.citations.map((citation, i) => (
-              <CitationPill key={i} citation={citation} sessionId={sessionId} authToken={authToken} onOpen={setPdfCitation} />
+              <CitationPill key={i} citation={citation} sessionId={sessionId} onOpen={setPdfCitation} />
             ))}
           </div>
         ) : (
@@ -469,7 +422,7 @@ export default function DocumentReview({
       styles: { fontSize: 8, cellPadding: 3 },
       headStyles: { fillColor: [27, 58, 107] },
       columnStyles: { 0: { cellWidth: 25 }, 1: { cellWidth: 30 }, 2: { cellWidth: 35 }, 3: { cellWidth: 15 }, 4: { cellWidth: 45 }, 5: { cellWidth: 35 } },
-      didParseCell: (data: any) => {
+      didParseCell: (data: CellHookData) => {
         if (data.section === 'body' && data.column.index === 3) {
           if (data.cell.raw === 'PASS')    data.cell.styles.textColor = [21, 128, 61]
           if (data.cell.raw === 'WARNING') data.cell.styles.textColor = [180, 83, 9]

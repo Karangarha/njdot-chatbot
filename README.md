@@ -9,9 +9,11 @@ A RAG (Retrieval-Augmented Generation) chatbot for querying New Jersey Departmen
 - Python 3.11+
 - Node.js 18+
 - A Supabase project with the `pgvector` extension enabled (spec/BDC RAG, conversations, review projects, session chunks)
-- A Neo4j instance — local Neo4j Desktop or Aura (schedule compliance review + session GraphRAG Q&A)
+- A Neo4j instance — local Neo4j Desktop or Aura (schedule compliance review + session GraphRAG Q&A). It **must have the APOC plugin**: `langchain-neo4j` calls `apoc.meta.data()`, and without it every review fails with "An unexpected error occurred". Aura includes APOC; in Neo4j Desktop install the APOC plugin; in Docker set `NEO4J_PLUGINS='["apoc"]'`.
 - An OpenAI API key (for embeddings, and as the default chat LLM)
 - An Anthropic API key (used as the LLM fallback for review/session chat)
+
+For a production-shaped local copy of both apps with an E2E suite (Azure App Service image, Vercel-style build, mock LLM), see [`sandbox/README.md`](sandbox/README.md).
 
 ---
 
