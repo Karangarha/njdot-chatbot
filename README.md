@@ -15,6 +15,8 @@ A RAG (Retrieval-Augmented Generation) chatbot for querying New Jersey Departmen
 
 For a production-shaped local copy of both apps with an E2E suite (Azure App Service image, Vercel-style build, mock LLM), see [`sandbox/README.md`](sandbox/README.md).
 
+Database schema changes ship as Supabase migrations. See [`supabase/README.md`](supabase/README.md).
+
 ---
 
 ## Backend Setup & Running
