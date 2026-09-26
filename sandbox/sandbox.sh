@@ -106,16 +106,16 @@ cmd_db_apply() {
   else ok "chunks / session_chunks / search functions present"; fi
 
   if ! has "to_regclass('public.conversations') is not null"; then
-    say "conversations missing → migrations 001 + 002"
-    psql_docker < "$REPO/backend/migrations/001_conversations.sql"
-    psql_docker < "$REPO/backend/migrations/002_conversations_updated_at.sql"
+    say "conversations missing → migrations 20260101000001 + 20260101000002"
+    psql_docker < "$REPO/supabase/migrations/20260101000001_conversations.sql"
+    psql_docker < "$REPO/supabase/migrations/20260101000002_conversations_updated_at.sql"
   else ok "conversations / messages present"; fi
 
-  # Numbered migrations from 011 up are idempotent — apply them every time.
-  for f in "$REPO"/backend/migrations/[0-9][0-9][0-9]_*.sql; do
+  # Migrations from 20260101000011 on are idempotent — apply them every time.
+  for f in "$REPO"/supabase/migrations/[0-9]*_*.sql; do
     [[ -e "$f" ]] || continue
-    n=$(basename "$f" | cut -d_ -f1)
-    (( 10#$n >= 11 )) || continue
+    v=$(basename "$f" | cut -d_ -f1)
+    (( 10#$v >= 20260101000011 )) || continue
     say "migration $(basename "$f")"
     psql_docker < "$f"
   done

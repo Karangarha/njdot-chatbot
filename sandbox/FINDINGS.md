@@ -15,7 +15,7 @@ this commit) and the raw report is [`reports/2026-09-25-REPORT.md`](reports/2026
 |---|---|---|
 | 1 | Azure Startup Command | ✅ Deploy notes fixed. **Human:** set `python -m uvicorn app.main:app --host 0.0.0.0 --port 8000` in the portal. |
 | 2 | Session Q&A endpoints had no auth | ✅ Sign-in required everywhere, plus an ownership check (`app/project_access.py`). |
-| 3 | Deleting a chat didn't delete it | ✅ Migration 011: UPDATE/DELETE policies, and restores `messages` ON DELETE CASCADE. **Human:** run 011 on live Supabase. |
+| 3 | Deleting a chat didn't delete it | ✅ Migration `supabase/migrations/20260101000011_…`: UPDATE/DELETE policies, and restores `messages` ON DELETE CASCADE. **Human:** applied by the migrations pipeline once enabled (see `supabase/README.md`). |
 | 4 | Changing password logged you out | ✅ The page uses `updateUser`, and the admin endpoint is removed. |
 | 5 | Password reset account takeover | ⏸ **Deferred by the owner.** Still open; fix it before public launch. |
 | 6 | `middleware.ts` deprecated | ✅ Renamed to `proxy.ts`. |
