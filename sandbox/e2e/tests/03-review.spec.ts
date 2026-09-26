@@ -2,6 +2,7 @@ import fs from "node:fs";
 import type { Page } from "@playwright/test";
 import { test, expect, login } from "./support/fixtures";
 import { fixture } from "./support/env";
+import { accessToken, bearer, expireSession } from "./support/session-cookie";
 
 // Route 49 project files supplied for upload testing (sandbox/e2e/fixtures).
 const FILES = {
@@ -153,10 +154,16 @@ test.describe("Document Review — full run with the Route 49 files", () => {
     });
 
     let projectId = "";
+    let tokenAtReviewStart = "";
+    const sessionUpload = page.waitForRequest((r) => /\/api\/session\/upload$/.test(r.url()) && r.method() === "POST", { timeout: 13 * 60_000 });
     await test.step("Run Review: storage uploads, POST /api/review, SSE until ready", async () => {
       const reviewPost = page.waitForResponse((r) => /\/api\/review$/.test(r.url()) && r.request().method() === "POST", { timeout: 120_000 });
       await page.getByRole("button", { name: "Run Review" }).click();
       const res = await reviewPost;
+      // A long review can outlive the access token (1h). Expire it now, so
+      // the session upload that runs when the review ends must refresh it.
+      tokenAtReviewStart = await accessToken(page.context());
+      await expireSession(page.context());
       const body = await res.json();
       expect(res.status(), JSON.stringify(body)).toBe(200);
       expect(body.status).toBe("processing");
@@ -181,6 +188,11 @@ test.describe("Document Review — full run with the Route 49 files", () => {
 
     await test.step("project saved to review_projects and session indexing started", async () => {
       expect((await monitor.call(/\/api\/session\/upload$/, "POST")).status).toBe(200);
+      const sent = bearer(await sessionUpload);
+      await expect.poll(() => accessToken(page.context()), { timeout: 45_000, message: "the app never refreshed the expired session" })
+        .not.toBe(tokenAtReviewStart);
+      expect(sent, "session upload must send the refreshed token, not the one captured when the review started")
+        .toBe(await accessToken(page.context()));
       expect((await monitor.call(/\/rest\/v1\/review_projects/, "POST")).status).toBe(201);
       expect((await monitor.call(/\/rest\/v1\/review_projects/, "PATCH")).status).toBeLessThan(300);
     });
@@ -229,11 +241,20 @@ test.describe("Document Review — full run with the Route 49 files", () => {
 
       const box = page.getByPlaceholder("Ask about the narrative, special provisions, or schedule…");
       await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
+      // An open page outlives the access token: the question must go out
+      // with a freshly refreshed token, not the one fetched when Q&A opened.
+      const tokenBeforeQuestion = await accessToken(page.context());
+      await expireSession(page.context());
       await box.fill("Which activities are on the critical path?");
+      const asked = page.waitForRequest((r) => r.url().endsWith("/api/session/query"), { timeout: 180_000 });
       const answered = page.waitForResponse((r) => r.url().endsWith("/api/session/query"), { timeout: 180_000 });
       await box.press("Enter");
       const res = await answered;
       expect(res.status(), await res.text()).toBe(200);
+      const sentQ = bearer(await asked);
+      await expect.poll(() => accessToken(page.context()), { timeout: 45_000, message: "the app never refreshed the expired session" })
+        .not.toBe(tokenBeforeQuestion);
+      expect(sentQ, "Q&A must send the refreshed token, not a stale one").toBe(await accessToken(page.context()));
       const body = await res.json();
       expect(typeof body.answer).toBe("string");
       await expect(page.getByText("Which activities are on the critical path?")).toBeVisible();

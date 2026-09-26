@@ -558,7 +558,15 @@ export default function DocumentReview({
         // — see _process_session_reuse in backend/app/api/session.py.
         const sessionForm = new FormData()
         sessionForm.append('project_id', data.project_id)
-        const sessionRes = await fetch(`${API_BASE}/api/session/upload`, { method: 'POST', headers, body: sessionForm })
+        // Fresh token, not runReview()'s start-of-review `headers`: a long
+        // review can outlive the ~1h access token, and a 401 here would
+        // silently leave the project without Document Q&A.
+        const { data: { session: current } } = await sb.auth.getSession()
+        const sessionRes = await fetch(`${API_BASE}/api/session/upload`, {
+          method: 'POST',
+          headers: current?.access_token ? { Authorization: `Bearer ${current.access_token}` } : {},
+          body: sessionForm,
+        })
 
         // ── Save review result to DB ────────────────────────────────────────
         // The backend already uploaded the original files to Storage (when
