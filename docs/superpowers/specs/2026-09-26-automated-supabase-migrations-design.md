@@ -38,6 +38,12 @@ Success means:
    - Preview branches also bill per hour.
    - Revisit once Task 7's baseline migration makes the migrations able to build a fresh database. Switching then means deleting the workflow and connecting the repo in the dashboard, since both use the same folder and the same history table.
 
+4. **Amended 2026-09-26: connect with a connection string, not `supabase link`.**
+   - `link` needs a personal access token, and a scoped token is capped by its owner's organization role. The real token first failed on `project_admin_read`, then on `api_gateway_keys_read`, and then because the owning account's role couldn't read API keys.
+   - The workflow now runs `supabase db push [--dry-run] --db-url "$SUPABASE_DB_URL"`, using the Session pooler string, because GitHub runners are IPv4-only.
+   - This replaces the three secrets in Section 2 with the single secret `SUPABASE_DB_URL`, scoped to the two push steps.
+   - The baseline and checks in `supabase/README.md` use `--db-url` too.
+
 ## Verified CLI behavior (CLI 2.109.0, against a throwaway Postgres container)
 
 | Question | Result |

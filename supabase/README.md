@@ -16,8 +16,8 @@ applies new files on push to `main`; pull requests get a dry run.
 4. Guard statements where cheap: `if not exists`, guarded `create policy`.
 5. Never edit a migration once it is on `main`; add a new one. `db push`
    refuses to run if production's history and these files disagree.
-6. Preview before merging: `supabase db push --dry-run --linked`, or read
-   the dry-run output on the pull request.
+6. Preview before merging: `supabase db push --dry-run --db-url "$SUPABASE_DB_URL"`,
+   or read the dry-run output on the pull request.
 
 ## Turning the pipeline on (one time)
 
@@ -26,23 +26,35 @@ variable `SUPABASE_MIGRATIONS_ENABLED` is `true`. Before production had
 this pipeline, migrations 001, 002, 009 and 010 were applied by hand,
 and 011 was not (checked 2026-09-26).
 
-1. Add these repository secrets (Settings → Secrets and variables → Actions):
-   - `SUPABASE_ACCESS_TOKEN`
-   - `SUPABASE_DB_PASSWORD`
-   - `SUPABASE_PROJECT_ID` = `rhtbqqprloedsvvdvxak`
-2. Link locally, from the repo root:
-   `supabase link --project-ref rhtbqqprloedsvvdvxak`
-3. Baseline. This marks the migrations production already has, without
+The workflow connects straight to Postgres with one connection string. It
+uses no access token and no `supabase link`, so Supabase account roles and
+token scopes don't matter.
+
+1. Copy NJ-Dot 2.0's **Session pooler** connection string (dashboard →
+   Connect). Use the session pooler, not Direct connection: GitHub's runners
+   are IPv4-only. Fill in the database password. If the password contains
+   characters like `@ : / ? #`, percent-encode them.
+2. Add it as the repository secret `SUPABASE_DB_URL` (Settings → Secrets and
+   variables → Actions).
+3. In your terminal, put the same string in a variable. It's used by the
+   next steps and never saved:
+
+   ```bash
+   read -rs SUPABASE_DB_URL && export SUPABASE_DB_URL
+   ```
+
+4. Baseline. This marks the migrations production already has, without
    running them, and creates the history table:
 
    ```bash
-   supabase migration repair --status applied 20260101000001 20260101000002 20260101000009 20260101000010 --linked
+   supabase migration repair --status applied 20260101000001 20260101000002 20260101000009 20260101000010 --db-url "$SUPABASE_DB_URL"
    ```
 
-4. Check that `supabase db push --dry-run --linked` lists **only**
-   `20260101000011_conversations_update_delete_policies.sql`.
-5. Set the repository variable `SUPABASE_MIGRATIONS_ENABLED` = `true`
+5. Check that `supabase db push --dry-run --db-url "$SUPABASE_DB_URL"` lists
+   **only** `20260101000011_conversations_update_delete_policies.sql`.
+6. Set the repository variable `SUPABASE_MIGRATIONS_ENABLED` = `true`
    (Settings → Secrets and variables → Actions → Variables).
-6. Run the workflow from the Actions tab on `main`, or merge the next
-   migration. It applies 011. Confirm with `supabase migration list --linked`,
-   which should show all five versions on both sides.
+7. Run the workflow from the Actions tab on `main`, or merge the next
+   migration. It applies 011. Confirm with
+   `supabase migration list --db-url "$SUPABASE_DB_URL"`, which should show
+   all five versions on both sides.

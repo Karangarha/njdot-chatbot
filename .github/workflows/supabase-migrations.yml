@@ -7,10 +7,12 @@
 # baseline in supabase/README.md FIRST: without it, the first run would
 # re-apply every migration to production (which has no history table).
 #
-# Repository secrets (Settings -> Secrets and variables -> Actions):
-#   SUPABASE_ACCESS_TOKEN  personal access token (supabase.com/dashboard/account/tokens)
-#   SUPABASE_DB_PASSWORD   NJ-Dot 2.0 database password
-#   SUPABASE_PROJECT_ID    rhtbqqprloedsvvdvxak
+# Repository secret (Settings -> Secrets and variables -> Actions):
+#   SUPABASE_DB_URL  NJ-Dot 2.0's Session pooler connection string, password
+#                    filled in and percent-encoded (dashboard -> Connect).
+#                    Session pooler, not Direct: GitHub runners are IPv4-only.
+# No access token or `supabase link`: db push connects straight to Postgres,
+# so no Management API permissions or org roles are involved.
 
 name: Supabase migrations
 
@@ -37,10 +39,6 @@ jobs:
   migrate:
     if: vars.SUPABASE_MIGRATIONS_ENABLED == 'true'
     runs-on: ubuntu-latest
-    env:
-      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
-      SUPABASE_DB_PASSWORD: ${{ secrets.SUPABASE_DB_PASSWORD }}
-      SUPABASE_PROJECT_ID: ${{ secrets.SUPABASE_PROJECT_ID }}
     steps:
       - uses: actions/checkout@v6
 
@@ -48,15 +46,20 @@ jobs:
         with:
           version: 2.109.0
 
-      - run: supabase link --project-ref "$SUPABASE_PROJECT_ID"
+      # The secret is scoped to the two steps that need it, so third-party
+      # actions above never see it.
 
       # Pull requests and manual runs from other branches only preview.
       - name: Preview pending migrations
         if: github.ref != 'refs/heads/main'
-        run: supabase db push --dry-run
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: supabase db push --dry-run --db-url "$SUPABASE_DB_URL"
 
       # Each migration file is atomic: a failure rolls that file back and
       # records nothing, so fix it with a new commit and push again.
       - name: Apply pending migrations
         if: github.ref == 'refs/heads/main'
-        run: supabase db push --yes
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: supabase db push --yes --db-url "$SUPABASE_DB_URL"
