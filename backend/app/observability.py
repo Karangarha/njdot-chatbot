@@ -18,14 +18,32 @@ project_id) up front, and every worker's ``CallbackHandler`` is built with
 that same ``trace_id`` (see ``get_langfuse_handler``) — Langfuse merges them
 into one trace server-side without needing any actual object/context to
 cross the thread boundary.
+
+Unset keys -> every function returns None without touching the SDK.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+_tracing_off_logged = False
+
+
+def _langfuse_configured() -> bool:
+    """True only when both keys are set. Unset keys mean tracing is
+    intentionally off -- skip Langfuse entirely rather than let its SDK
+    warn about missing credentials on every LLM call."""
+    global _tracing_off_logged
+    if os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY"):
+        return True
+    if not _tracing_off_logged:
+        _tracing_off_logged = True
+        logger.info("Langfuse keys not set; LangChain tracing is off")
+    return False
 
 
 def get_langfuse_client():
@@ -36,6 +54,8 @@ def get_langfuse_client():
     every module here imports ``app.config`` before anything else). Returns
     ``None`` if the SDK can't be imported/constructed at all.
     """
+    if not _langfuse_configured():
+        return None
     try:
         from langfuse import get_client
         return get_client()
@@ -51,6 +71,8 @@ def new_trace_id(seed: str) -> Optional[str]:
     the same trace without sharing any Python object. Returns ``None`` if
     Langfuse isn't available.
     """
+    if not _langfuse_configured():
+        return None
     client = get_langfuse_client()
     if client is None:
         return None
@@ -68,6 +90,8 @@ def get_langfuse_handler(trace_id: Optional[str] = None, parent_span_id: Optiona
     each becoming its own top-level trace. Fails soft: returns ``None`` on
     any construction error, so callers simply omit the callback.
     """
+    if not _langfuse_configured():
+        return None
     try:
         from langfuse.langchain import CallbackHandler
         trace_context = None
