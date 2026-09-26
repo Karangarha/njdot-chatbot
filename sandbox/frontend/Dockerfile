@@ -39,6 +39,6 @@ EXPOSE 3000
 # localhost-forward.mjs makes http://localhost:<supabase port> inside this
 # container reach the Supabase on your machine, so the one inlined
 # NEXT_PUBLIC_SUPABASE_URL works for both the browser and the Next.js server
-# (middleware.ts and app/chat/page.tsx call Supabase server-side). On Vercel
+# (proxy.ts and app/chat/page.tsx call Supabase server-side). On Vercel
 # the URL is public, so this shim has no production counterpart.
 CMD ["sh", "-c", "node /sandbox/localhost-forward.mjs & exec npx next start -p 3000 -H 0.0.0.0"]
