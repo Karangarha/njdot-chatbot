@@ -171,10 +171,14 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
   useEffect(() => { authTokenRef.current = authToken }, [authToken])
 
   // ── SSE: stream ingestion progress ────────────────────────────────────────
+  // /api/session/status requires a signed-in caller. EventSource can't send
+  // headers, so the token rides as ?token= (same as /api/review/{id}/status).
+  // Wait for the token: DocumentReview fetches it asynchronously after
+  // sessionId is set, and opening without it is a guaranteed 401.
   useEffect(() => {
-    if (!sessionId) return
+    if (!sessionId || !authToken) return
 
-    const url = `${apiBase}/api/session/status/${sessionId}`
+    const url = `${apiBase}/api/session/status/${sessionId}?token=${encodeURIComponent(authToken)}`
     const es  = new EventSource(url)
 
     es.onmessage = (e) => {
@@ -190,7 +194,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
     es.onerror = () => es.close()
 
     return () => es.close()
-  }, [sessionId, apiBase])
+  }, [sessionId, apiBase, authToken])
 
   // ── Load message history when session becomes ready ────────────────────────
   // Reads authTokenRef (not the authToken prop) so a later token refresh
