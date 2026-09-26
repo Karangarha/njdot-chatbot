@@ -9,18 +9,21 @@ Runnable two ways:
 
 from __future__ import annotations
 
-import os
 import sys
 from datetime import date
 from pathlib import Path
+from unittest.mock import patch
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-os.environ.setdefault("OPENAI_API_KEY", "sk-test-dummy")  # module builds an OpenAI client at import
+from app.config import config  # noqa: E402
 
-from scripts.ingest_bdc import _iso  # noqa: E402
+# scripts/ingest_bdc.py builds an OpenAI client at import time; app.config
+# may already be loaded with an empty key (no .env in the App Service image).
+with patch.object(config, "OPENAI_API_KEY", config.OPENAI_API_KEY or "sk-test-dummy"):
+    from scripts.ingest_bdc import _iso  # noqa: E402
 
 
 def test_missing_date_is_none_not_string():

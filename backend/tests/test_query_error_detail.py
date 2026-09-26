@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import sys
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi import HTTPException
 
@@ -21,8 +21,16 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from app.api import query as query_module  # noqa: E402
+from app.config import config  # noqa: E402
+from app.database import Database  # noqa: E402
 from app.models import QueryRequest  # noqa: E402
+
+# app/api/query.py builds its Supabase and OpenAI clients at import time.
+# Stub both for the import only, so this runs without live credentials
+# (the App Service image has none) and caches no fake client.
+with patch.object(Database, "get_client", return_value=MagicMock()), \
+     patch.object(config, "OPENAI_API_KEY", config.OPENAI_API_KEY or "sk-test-dummy"):
+    from app.api import query as query_module  # noqa: E402
 
 SECRET = "Error code: 500 - {'upstream': 'secret body'}"
 GENERIC = "The assistant could not answer right now. Please try again."
