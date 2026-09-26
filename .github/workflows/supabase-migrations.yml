@@ -26,9 +26,11 @@ on:
       - '.github/workflows/supabase-migrations.yml'
   workflow_dispatch: {}
 
-# One migration run at a time; a second push waits instead of racing.
+# Production applies run one at a time; a second push waits instead of
+# racing. Only main shares this group: GitHub keeps a single PENDING run
+# per group, so a PR dry-run in the same group would cancel a queued apply.
 concurrency:
-  group: supabase-migrations-production
+  group: ${{ github.ref == 'refs/heads/main' && 'supabase-migrations-production' || format('supabase-migrations-{0}', github.ref) }}
   cancel-in-progress: false
 
 jobs:
