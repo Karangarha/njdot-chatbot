@@ -16,7 +16,7 @@ test.describe("backend: platform + contract", () => {
     const paths = Object.keys(spec.paths);
     for (const p of [
       "/api/query", "/api/pdf/{doc_name}", "/api/auth/request-reset", "/api/auth/reset-password",
-      "/api/auth/change-password", "/api/conversations", "/api/review", "/api/review/{project_id}/status",
+      "/api/conversations", "/api/review", "/api/review/{project_id}/status",
       "/api/review/{project_id}/rerun", "/api/review/{project_id}/pdf/{doc_type}", "/api/session/upload",
       "/api/session/status/{session_id}", "/api/session/query", "/api/session/messages/{session_id}",
     ]) expect(paths, p).toContain(p);
@@ -74,11 +74,6 @@ test.describe("backend: auth on protected routes", () => {
     const forged = `${b64({ alg: "none", typ: "JWT" })}.${b64({ sub: randomUUID(), aud: "authenticated", exp: 9999999999 })}.`;
     const res = await request.get(api("/api/conversations"), { headers: { Authorization: `Bearer ${forged}` } });
     expect(res.status(), "forged token accepted — set SUPABASE_JWT_SECRET / check JWKS reachability").toBe(401);
-  });
-
-  test("change-password needs a token", async ({ request }) => {
-    const res = await request.post(api("/api/auth/change-password"), { data: { new_password: "whatever123" } });
-    expect(res.status()).toBe(401);
   });
 
   test("review PDF + rerun reject missing tokens", async ({ request }) => {

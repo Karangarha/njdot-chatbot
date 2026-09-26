@@ -144,13 +144,9 @@ test.describe("password flows", () => {
     await page.locator("#confirm").fill(next);
     await page.getByRole("button", { name: "Update Password" }).click();
     await expect(page.getByText("Password updated!")).toBeVisible();
-    const call = await monitor.call("/api/auth/change-password", "POST");
+    const call = await monitor.call(/\/auth\/v1\/user$/, "PUT");
     expect(call.status).toBe(200);
     updateAccount("pw", { password: next });
-    // The page promises "Redirecting you back…" to /chat. The backend changes
-    // the password through the Supabase admin API, which revokes the user's
-    // sessions, so middleware.ts sees no session and sends them to /login.
-    monitor.allow(/auth\/v1\/user -> 403/);
     await page.waitForURL(/\/(chat|login)/, { timeout: 10_000 });
     expect(
       new URL(page.url()).pathname,

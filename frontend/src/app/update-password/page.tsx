@@ -5,7 +5,6 @@ import Image from 'next/image'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { createClient } from '@/lib/supabase/client'
-import { changePassword } from '@/lib/api'
 
 type Stage = 'checking' | 'ready' | 'success'
 
@@ -17,7 +16,6 @@ const inputCls =
 
 export default function UpdatePasswordPage() {
   const [stage, setStage]         = useState<Stage>('checking')
-  const [accessToken, setAccessToken] = useState('')
   const [password, setPassword]   = useState('')
   const [confirm, setConfirm]     = useState('')
   const [error, setError]         = useState<string | null>(null)
@@ -29,7 +27,6 @@ export default function UpdatePasswordPage() {
     supabase.auth.getSession().then(({ data }) => {
       const token = data.session?.access_token
       if (token) {
-        setAccessToken(token)
         setStage('ready')
       } else {
         // Not authenticated — send to forgot-password
@@ -53,7 +50,10 @@ export default function UpdatePasswordPage() {
 
     setIsLoading(true)
     try {
-      await changePassword(password, accessToken)
+      // updateUser keeps the current session. The old backend route used the
+      // admin API, which revokes every session and bounced the user to /login.
+      const { error: updateError } = await createClient().auth.updateUser({ password })
+      if (updateError) throw updateError
       setStage('success')
       setTimeout(() => router.push('/chat'), 2000)
     } catch (err) {
