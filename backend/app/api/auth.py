@@ -4,7 +4,6 @@ Never sends email or exposes Supabase service credentials to the client.
 
 POST /api/auth/request-reset   – Step 1: verify email server-side, return short-lived token.
 POST /api/auth/reset-password  – Step 2: validate token, update password via admin API.
-POST /api/auth/change-password – Authenticated password change for logged-in users.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import httpx
 import jwt
-from fastapi import APIRouter, Header, HTTPException
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from app.config import config
@@ -103,9 +102,6 @@ class ResetPasswordBody(BaseModel):
     new_password: str
 
 
-class ChangePasswordBody(BaseModel):
-    new_password: str
-
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
@@ -160,29 +156,5 @@ def reset_password(body: ResetPasswordBody):
 
     if not _update_user_password(user_id, body.new_password):
         raise HTTPException(400, _GENERIC_ERROR)
-
-    return {"ok": True}
-
-
-@router.post("/api/auth/change-password")
-def change_password(
-    body: ChangePasswordBody,
-    authorization: str | None = Header(default=None),
-):
-    """
-    Authenticated password change for already-logged-in users.
-
-    Requires a valid Supabase JWT in ``Authorization: Bearer <token>``.
-    The service role key is never sent to the client.
-    """
-    from app.auth import user_id_from_token
-
-    if len(body.new_password) < _MIN_PW_LEN:
-        raise HTTPException(400, f"Password must be at least {_MIN_PW_LEN} characters.")
-
-    user_id = user_id_from_token(authorization)
-
-    if not _update_user_password(user_id, body.new_password):
-        raise HTTPException(400, "Password update failed. Please try again.")
 
     return {"ok": True}

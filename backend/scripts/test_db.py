@@ -5,7 +5,7 @@ from supabase import create_client, Client
 # Load environment variables
 load_dotenv()
 
-def test_connection():
+def check_connection():
     """Test basic Supabase connection"""
     print("🔍 Testing Supabase connection...")
 
@@ -60,4 +60,4 @@ def test_connection():
         return False
 
 if __name__ == "__main__":
-    test_connection()
+    check_connection()

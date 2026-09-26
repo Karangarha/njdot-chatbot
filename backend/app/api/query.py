@@ -17,8 +17,9 @@ Error policy
 * HTTP 400 – ``query`` field is missing, empty, or blank
   (enforced by the Pydantic ``QueryRequest`` validator before reaching here)
 * HTTP 500 – any unexpected exception raised inside the pipeline;
-  the ``detail`` string includes the exception type and message so the
-  caller can log it without inspecting server logs.
+  ``detail`` is a fixed generic message (never the exception text, which
+  can carry upstream provider bodies). The exception and its traceback
+  are logged server-side.
 """
 
 from __future__ import annotations
@@ -270,7 +271,7 @@ async def query_endpoint(request: QueryRequest) -> QueryResponse:
         logger.exception("Pipeline error for query=%r collection=%r", query, collection)
         raise HTTPException(
             status_code=500,
-            detail=f"Pipeline error [{type(exc).__name__}]: {exc}",
+            detail="The assistant could not answer right now. Please try again.",
         ) from exc
 
     # ── Build response ─────────────────────────────────────────────────────
@@ -380,7 +381,7 @@ async def debug_endpoint(request: QueryRequest) -> DebugResponse:
         logger.exception("Debug pipeline error for query=%r collection=%r", query, collection)
         raise HTTPException(
             status_code=500,
-            detail=f"Debug pipeline error [{type(exc).__name__}]: {exc}",
+            detail="The assistant could not answer right now. Please try again.",
         ) from exc
 
     elapsed_ms = int((time.time() - t_start) * 1000)

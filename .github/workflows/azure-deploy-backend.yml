@@ -17,7 +17,10 @@
 #      -> Actions -> New repository secret).
 #   2. Azure Portal -> NJDOT -> Environment variables -> General settings ->
 #      Startup Command:
-#        uvicorn app.main:app --host 0.0.0.0 --port 8000
+#        python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
+#      NOT the bare "uvicorn ...": Oryx only puts the antenv virtualenv on
+#      PYTHONPATH, never its bin/ on PATH, and the runtime image has no
+#      global uvicorn, so the bare command exits "uvicorn: not found".
 #   3. Azure Portal -> NJDOT -> Environment variables -> App settings -> add
 #      every variable backend/app/config.py reads: SUPABASE_URL,
 #      SUPABASE_SERVICE_ROLE_KEY, OPENAI_API_KEY, ANTHROPIC_API_KEY,

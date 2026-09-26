@@ -1,5 +1,5 @@
 /**
- * Supabase auth middleware for Next.js App Router.
+ * Supabase auth proxy (Next 16's renamed "middleware" convention) for the App Router.
  *
  * Responsibilities:
  *  1. Refresh the Supabase session on every request so cookies stay valid.
@@ -15,7 +15,7 @@ const AUTH_PATHS = ['/login', '/signup', '/forgot-password']
 // Paths that should always be accessible regardless of auth state
 const ALWAYS_PUBLIC = ['/update-password']
 
-export async function middleware(request: NextRequest) {
+export async function proxy(request: NextRequest) {
   let supabaseResponse = NextResponse.next({ request })
 
   const supabase = createServerClient(
@@ -39,7 +39,7 @@ export async function middleware(request: NextRequest) {
     },
   )
 
-  // IMPORTANT: always use getUser() — getSession() is not safe in middleware.
+  // IMPORTANT: always use getUser() — getSession() is not safe in the proxy.
   const {
     data: { user },
   } = await supabase.auth.getUser()

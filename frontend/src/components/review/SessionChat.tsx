@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import MarkdownAnswer from '@/components/MarkdownAnswer'
 import PDFViewerModal from '@/components/PDFViewerModal'
 import { authHeaders } from '@/lib/api'
+import { createClient } from '@/lib/supabase/client'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -155,6 +156,14 @@ function MessageBubble({ msg, onOpenPdf }: { msg: Message; onOpenPdf: (s: Source
   )
 }
 
+// Fetched per request, never cached: getSession() refreshes an expired access
+// token, so Q&A on a page left open past the ~1h token lifetime keeps working
+// instead of 401-ing on every request until a reload.
+async function freshToken(): Promise<string | undefined> {
+  const { data: { session } } = await createClient().auth.getSession()
+  return session?.access_token
+}
+
 // ── Main component ─────────────────────────────────────────────────────────────
 
 export default function SessionChat({ sessionId, apiBase, authToken }: SessionChatProps) {
@@ -167,44 +176,50 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
   const [pdfSource,        setPdfSource]        = useState<Source | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const inputRef  = useRef<HTMLTextAreaElement>(null)
-  const authTokenRef = useRef(authToken)
-  useEffect(() => { authTokenRef.current = authToken }, [authToken])
 
   // ── SSE: stream ingestion progress ────────────────────────────────────────
+  // /api/session/status requires a signed-in caller. EventSource can't send
+  // headers, so the token rides as ?token= (same as /api/review/{id}/status).
+  // Opening without a token is a guaranteed 401, so wait for one.
   useEffect(() => {
     if (!sessionId) return
+    let es: EventSource | null = null
+    let cancelled = false
 
-    const url = `${apiBase}/api/session/status/${sessionId}`
-    const es  = new EventSource(url)
+    freshToken().then(token => {
+      if (cancelled || !token) return
+      const url = `${apiBase}/api/session/status/${sessionId}?token=${encodeURIComponent(token)}`
+      const stream = new EventSource(url)
+      es = stream
 
-    es.onmessage = (e) => {
-      try {
-        const data = JSON.parse(e.data) as ProgressEvent
-        setProgress(data)
-        if (data.status === 'ready' || data.status === 'error') {
-          es.close()
-        }
-      } catch { /* ignore parse errors */ }
-    }
+      stream.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data) as ProgressEvent
+          setProgress(data)
+          if (data.status === 'ready' || data.status === 'error') {
+            stream.close()
+          }
+        } catch { /* ignore parse errors */ }
+      }
 
-    es.onerror = () => es.close()
+      stream.onerror = () => stream.close()
+    })
 
-    return () => es.close()
+    return () => { cancelled = true; es?.close() }
   }, [sessionId, apiBase])
 
   // ── Load message history when session becomes ready ────────────────────────
-  // Reads authTokenRef (not the authToken prop) so a later token refresh
-  // doesn't re-trigger this effect and clobber messages sent since the
-  // initial load -- this should run once per session, not on every token
-  // change.
+  // Runs once per session (not on token changes), so it can't clobber
+  // messages sent since the initial load.
   useEffect(() => {
     if (!sessionId || progress?.status !== 'ready') return
 
     setHistoryLoading(true)
-    fetch(`${apiBase}/api/session/messages/${sessionId}`, { headers: authHeaders(authTokenRef.current) })
+    freshToken()
+      .then(token => fetch(`${apiBase}/api/session/messages/${sessionId}`, { headers: authHeaders(token) }))
       .then(r => r.ok ? r.json() : Promise.reject(r.status))
       .then(data => {
-        const loaded: Message[] = (data.messages ?? []).map((m: any) => ({
+        const loaded: Message[] = (data.messages ?? []).map((m: { role: Message['role']; content: string; sources?: Source[] }) => ({
           role:    m.role,
           content: m.content,
           sources: m.sources ?? [],
@@ -231,7 +246,7 @@ export default function SessionChat({ sessionId, apiBase, authToken }: SessionCh
     setError(null)
 
     try {
-      const headers: HeadersInit = { 'Content-Type': 'application/json', ...authHeaders(authToken) }
+      const headers: HeadersInit = { 'Content-Type': 'application/json', ...authHeaders(await freshToken()) }
 
       const res = await fetch(`${apiBase}/api/session/query`, {
         method:  'POST',

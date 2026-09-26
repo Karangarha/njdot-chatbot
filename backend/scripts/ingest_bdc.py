@@ -84,6 +84,11 @@ def _parse_date(raw: str) -> date:
     raise ValueError(f"Cannot parse date: {raw!r}")
 
 
+def _iso(d: date | None) -> str | None:
+    """ISO date string, or None (-> SQL NULL) when the BDC header had none."""
+    return d.isoformat() if d else None
+
+
 def _extract_change_type(instruction: str) -> str:
     upper = instruction.upper()
     if "DELETED" in upper or "DELETE" in upper:
@@ -263,8 +268,8 @@ def ingest_bdc(pdf_path: Path, db: Any, collection: str, dry_run: bool) -> int:
             "metadata": {
                 "doc":                 header["bdc_id"],
                 "bdc_id":              header["bdc_id"],
-                "bdc_date":            str(header["bdc_date"]),
-                "effective_date":      str(header["effective_date"]),
+                "bdc_date":            _iso(header["bdc_date"]),
+                "effective_date":      _iso(header["effective_date"]),
                 "implementation_code": header["implementation_code"],
                 "section_id":          block["section_id"],
                 "section_title":       block["section_title"],
@@ -280,8 +285,8 @@ def ingest_bdc(pdf_path: Path, db: Any, collection: str, dry_run: bool) -> int:
         db.table("bdc_section_map").insert({
             "bdc_chunk_id":        chunk_id,
             "bdc_id":              header["bdc_id"],
-            "bdc_date":            str(header["bdc_date"]),
-            "effective_date":      str(header["effective_date"]),
+            "bdc_date":            _iso(header["bdc_date"]),
+            "effective_date":      _iso(header["effective_date"]),
             "implementation_code": header["implementation_code"],
             "subject":             header["subject"],
             "section_id":          block["section_id"],

@@ -834,7 +834,6 @@ function SpecAssistantView({
                 <CitationCard
                   key={`${cit.chunk_id}-${i}`}
                   citation={cit}
-                  index={i}
                   onViewPdf={() => onViewPdf(cit)}
                 />
               ))}
@@ -933,8 +932,8 @@ function BDCAlertBadge({
 // ── CITATION CARD ──────────────────────────────────────────────────────────────
 
 function CitationCard({
-  citation, index, onViewPdf,
-}: { citation: CitationItem; index: number; onViewPdf: () => void }) {
+  citation, onViewPdf,
+}: { citation: CitationItem; onViewPdf: () => void }) {
   return (
     <div className="rounded-xl border border-[#E8E8E8] bg-white p-3.5 shadow-sm">
       <div className="mb-1 flex items-start justify-between gap-2">

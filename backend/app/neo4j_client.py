@@ -41,7 +41,14 @@ class Neo4jClient:
                 # A short liveness check makes the driver ping (and silently
                 # replace) a connection that's been idle this long, before
                 # ever handing it to a query.
-                driver_config={"liveness_check_timeout": 60},
+                driver_config={
+                    "liveness_check_timeout": 60,
+                    # 01N51/01N52 ("relationship type / property does not
+                    # exist") fire on every review for graph features a
+                    # project has no data for yet -- expected, not
+                    # actionable. Other notification classes still log.
+                    "notifications_disabled_classifications": ["UNRECOGNIZED"],
+                },
             )
             logger.info("Neo4j client initialized")
 

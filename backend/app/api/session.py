@@ -40,7 +40,7 @@ import tempfile
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
 
-from fastapi import APIRouter, BackgroundTasks, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, File, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from langchain.agents import create_agent
 from langchain_anthropic import ChatAnthropic
@@ -60,6 +60,7 @@ from app.ingestion.session_chunker   import (
     chunk_special_provision,
 )
 from app.neo4j_client import get_neo4j
+from app.project_access import require_project_access
 from app.llm_logging import build_callbacks
 from app.ingestion.utility_plan_extractor import extract_utility_plan, render_utility_plan_facts
 from app.retrieval_langchain.estimate_retriever import build_estimate_tool
@@ -415,6 +416,7 @@ async def upload_session(
                      "special_provision_pdf/xer_file are ignored; utility_plan_pdfs "
                      "(test) is still processed if given.",
     ),
+    authorization:         Optional[str] = Header(default=None),
 ) -> dict:
     """
     Accept project documents and start background ingestion.
@@ -427,7 +429,10 @@ async def upload_session(
     ``/api/review`` (SP/KeyMap/Estimate chunks + extractions in Supabase,
     schedule/narrative in Neo4j). ``utility_plan_pdfs`` (test) is not part of
     that flow yet, so they're still read and ingested here if provided.
+
+    Requires a signed-in caller; see app.project_access.
     """
+    require_project_access(project_id or "", authorization)
     utility_plan_bytes_list = [await f.read() for f in (utility_plan_pdfs or [])]
 
     if project_id:
@@ -461,7 +466,7 @@ async def upload_session(
 # ── SSE status endpoint ────────────────────────────────────────────────────────
 
 @router.get("/status/{session_id}", summary="Stream ingestion progress via SSE")
-async def session_status(session_id: str) -> StreamingResponse:
+async def session_status(session_id: str, token: Optional[str] = None) -> StreamingResponse:
     """
     Server-Sent Events stream. Each event is a JSON progress object:
       {status, message, step?, total?, chunk_count?}
@@ -471,7 +476,11 @@ async def session_status(session_id: str) -> StreamingResponse:
     restart or page reload), we fall back to Supabase (SP chunks) and Neo4j
     (schedule/narrative graph) to check whether content exists — so restored
     sessions transition to "ready" immediately.
+
+    Requires a signed-in caller; see app.project_access. EventSource can't
+    send headers, so the token arrives as ?token= (same as review_status).
     """
+    require_project_access(session_id, f"Bearer {token}" if token else None)
     if session_id not in _progress:
         try:
             db  = get_db()
@@ -771,13 +780,16 @@ class QueryRequest(BaseModel):
 
 
 @router.post("/query", summary="Ask a question across session documents + scheduling manual")
-async def session_query(req: QueryRequest) -> dict:
+async def session_query(req: QueryRequest, authorization: Optional[str] = Header(default=None)) -> dict:
     """
     Answer a question using the permanent scheduling-manual collection
     (pre-fetched context) plus, when this session has graph/SP content, a
     tool-calling agent with access to the Neo4j knowledge graph and Special
     Provision retrieval. Session must be in "ready" status before querying.
+
+    Requires a signed-in caller; see app.project_access.
     """
+    require_project_access(req.session_id, authorization)
     progress = _progress.get(req.session_id, {})
     if progress.get("status") != "ready":
         raise HTTPException(
@@ -917,11 +929,14 @@ async def session_query(req: QueryRequest) -> dict:
 # ── Message history endpoint ───────────────────────────────────────────────────
 
 @router.get("/messages/{session_id}", summary="Load chat history for a session")
-async def get_session_messages(session_id: str) -> dict:
+async def get_session_messages(session_id: str, authorization: Optional[str] = Header(default=None)) -> dict:
     """
     Return all non-expired messages for the session, ordered by creation time.
     Used by the frontend to restore chat history after a page reload.
+
+    Requires a signed-in caller; see app.project_access.
     """
+    require_project_access(session_id, authorization)
     db = get_db()
     rows = (
         db.table("session_messages")
