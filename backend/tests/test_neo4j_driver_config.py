@@ -1,7 +1,8 @@
 """backend/tests/test_neo4j_driver_config.py
 
-The Neo4j singleton must (a) keep liveness_check_timeout -- it fixed a
-production SessionExpired after idle -- and (b) disable the UNRECOGNIZED
+The Neo4j singleton must (a) retire pooled connections before Azure's
+~4 min outbound idle timeout silently drops them -- a dropped socket hung a
+production review for the full 60s acquisition timeout -- and (b) disable the UNRECOGNIZED
 notification class that floods the log on every review (sandbox noise).
 
 Runnable two ways:
@@ -32,8 +33,8 @@ def _driver_config():
     return graph_cls.call_args.kwargs["driver_config"]
 
 
-def test_driver_config_keeps_liveness_check():
-    assert _driver_config()["liveness_check_timeout"] == 60
+def test_driver_config_retires_connections_before_azure_idle_drop():
+    assert _driver_config()["max_connection_lifetime"] < 240
 
 
 def test_driver_config_disables_unrecognized_notifications():

@@ -42,7 +42,9 @@ import json
 import logging
 import os
 import tempfile
+import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -987,38 +989,21 @@ def _run_review_pipeline(
         # closure and Supabase persistence — also persisted so a later
         # re-run can reuse them via retrieve_sp_chunks instead of recreating
         # them here.
-        sp_search_fn = None
-        if sp_bytes:
-            _set_review_progress(project_id, status="running", message="Processing special provision…")
+        def _process_sp():
             sp_chunks = _bytes_to_sp_chunks(sp_bytes)
-            if sp_chunks:
-                sp_vectors = embeddings.embed_documents([c["content"] for c in sp_chunks])
-                merged_sp = [{**c, "embedding": v} for c, v in zip(sp_chunks, sp_vectors)]
-                insert_session_chunks(db, project_id, merged_sp)
-                sp_search_fn = _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
-
-        keymap_extraction: Optional[KeyMapExtraction] = None
-        if keymap_bytes:
-            _set_review_progress(project_id, status="running", message="Extracting key map…")
-            keymap_extraction = _extract_and_store_keymap(
-                db, embeddings, llm, keymap_bytes, project_id, user_id,
-            )
-
-        estimate_extraction: Optional[EstimateExtraction] = None
-        if estimate_bytes:
-            _set_review_progress(project_id, status="running", message="Extracting engineer's estimate…")
-            estimate_extraction = _extract_and_store_estimate(
-                db, embeddings, llm, estimate_bytes, project_id, user_id,
-            )
+            if not sp_chunks:
+                return None
+            sp_vectors = embeddings.embed_documents([c["content"] for c in sp_chunks])
+            merged_sp = [{**c, "embedding": v} for c, v in zip(sp_chunks, sp_vectors)]
+            insert_session_chunks(db, project_id, merged_sp)
+            return _build_sp_search_fn(sp_chunks, sp_vectors, embeddings)
 
         # Utility Agreement Plan sheets (one per utility -- gas, water/sewer,
         # electric, telecom, ...). Mirrors the SP block: vision-extract each,
         # embed once, share between the immediate search closure and Supabase
         # persistence. Optional cross-reference evidence -- see eval_engine's
         # missing_sources handling for why an absent one never blocks a check.
-        utility_plan_search_fn = None
-        if utility_plan_bytes_list:
-            _set_review_progress(project_id, status="running", message="Processing utility plans…")
+        def _process_utility_plans():
             utility_plan_chunks = []
             for b in utility_plan_bytes_list:
                 extraction = extract_utility_plan(b, llm, project_id=project_id, user_id=user_id)
@@ -1027,14 +1012,44 @@ def _run_review_pipeline(
                         "content": render_utility_plan_facts(extraction),
                         "metadata": {"doc_type": "utility_plan", "utility_owner": extraction.utility_owner},
                     })
-            if utility_plan_chunks:
-                utility_plan_vectors = embeddings.embed_documents(
-                    [c["content"] for c in utility_plan_chunks])
-                merged_utility_plans = [
-                    {**c, "embedding": v} for c, v in zip(utility_plan_chunks, utility_plan_vectors)]
-                insert_session_chunks(db, project_id, merged_utility_plans)
-                utility_plan_search_fn = _build_utility_plan_search_fn(
-                    utility_plan_chunks, utility_plan_vectors, embeddings)
+            if not utility_plan_chunks:
+                return None
+            utility_plan_vectors = embeddings.embed_documents(
+                [c["content"] for c in utility_plan_chunks])
+            merged_utility_plans = [
+                {**c, "embedding": v} for c, v in zip(utility_plan_chunks, utility_plan_vectors)]
+            insert_session_chunks(db, project_id, merged_utility_plans)
+            return _build_utility_plan_search_fn(
+                utility_plan_chunks, utility_plan_vectors, embeddings)
+
+        # These steps don't depend on each other: the SP is CPU-bound
+        # pdfplumber parsing (~1 min per 170 pages even locally), the rest
+        # are LLM/vision calls. Run side by side so this stage takes as long
+        # as its slowest step, not the sum (was ~6.5 min in prod). EDQ
+        # seeding is the only one touching Neo4j, and the schedule it reads
+        # is already seeded above.
+        _set_review_progress(project_id, status="running", message="Processing documents…")
+        docs_start = time.monotonic()
+        with ThreadPoolExecutor(max_workers=5) as pool:
+            sp_f = pool.submit(_process_sp) if sp_bytes else None
+            keymap_f = pool.submit(
+                _extract_and_store_keymap, db, embeddings, llm, keymap_bytes, project_id, user_id,
+            ) if keymap_bytes else None
+            estimate_f = pool.submit(
+                _extract_and_store_estimate, db, embeddings, llm, estimate_bytes, project_id, user_id,
+            ) if estimate_bytes else None
+            utility_f = pool.submit(_process_utility_plans) if utility_plan_bytes_list else None
+            edq_f = pool.submit(
+                _seed_edq_items_if_needed, graph, llm, embeddings, estimate_bytes, project_id, user_id,
+            )
+        # .result() re-raises a step's exception, failing the review exactly
+        # as the old sequential code did.
+        sp_search_fn = sp_f.result() if sp_f else None
+        keymap_extraction: Optional[KeyMapExtraction] = keymap_f.result() if keymap_f else None
+        estimate_extraction: Optional[EstimateExtraction] = estimate_f.result() if estimate_f else None
+        utility_plan_search_fn = utility_f.result() if utility_f else None
+        edq_f.result()
+        logger.info("Document processing finished in %.1fs", time.monotonic() - docs_start)
 
         project_name = (project or {}).get("project_name") or "Unknown"
         duration_days = 0
@@ -1077,7 +1092,8 @@ def _run_review_pipeline(
             )
 
     _set_review_progress(project_id, status="running", message="Preparing compliance checklist…")
-    _seed_edq_items_if_needed(graph, llm, embeddings, estimate_bytes, project_id, user_id)
+    if not reseed:  # the reseed path already seeded EDQ items alongside the other documents
+        _seed_edq_items_if_needed(graph, llm, embeddings, estimate_bytes, project_id, user_id)
 
     # Geo and the cost gap are recomputed on every run (both are pure
     # in-process computations) so polyline/parser/threshold fixes apply to

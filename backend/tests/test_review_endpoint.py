@@ -823,6 +823,7 @@ def test_run_review_pipeline_fresh_review_reports_unconditional_stage_messages()
         assert messages == [
             "Seeding schedule graph…",
             "Seeding narrative graph…",
+            "Processing documents…",
             "Preparing compliance checklist…",
             "Running compliance checks (0/57)…",
         ]
@@ -850,10 +851,7 @@ def test_run_review_pipeline_fresh_review_reports_conditional_stage_messages():
         assert messages == [
             "Seeding schedule graph…",
             "Seeding narrative graph…",
-            "Processing special provision…",
-            "Extracting key map…",
-            "Extracting engineer's estimate…",
-            "Processing utility plans…",
+            "Processing documents…",
             "Preparing compliance checklist…",
             "Running compliance checks (0/57)…",
         ]
