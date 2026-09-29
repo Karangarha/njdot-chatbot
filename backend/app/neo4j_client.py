@@ -29,20 +29,16 @@ class Neo4jClient:
                 password=config.NEO4J_PASSWORD,
                 database=config.NEO4J_DATABASE,
                 enhanced_schema=True,
-                # This client is a process-wide singleton (see below), so its
-                # driver's connection pool can sit idle for minutes between
-                # requests. The neo4j driver's liveness_check_timeout defaults
-                # to None (never verify a pooled connection before reuse), so
-                # a connection silently killed by an intermediate NAT/idle
-                # timeout (Azure's outbound NAT, Aura's own reaping, etc.)
-                # looks fine in the pool until a query actually tries to use
-                # it, raising SessionExpired/ServiceUnavailable -- reproduced
-                # in production after a ~4min idle gap between two reviews.
-                # A short liveness check makes the driver ping (and silently
-                # replace) a connection that's been idle this long, before
-                # ever handing it to a query.
+                # Connections are opened on demand and closed once they're
+                # 3 min old, so none outlives Azure's ~4 min outbound idle
+                # timeout. That timeout drops sockets silently (no RST), so a
+                # liveness ping on a dropped socket just hangs -- in prod it
+                # burned the whole 60s acquisition timeout and failed a review
+                # after a ~6 min PDF-extraction gap. Nothing project-specific
+                # lives on a connection: all data is keyed by projectId, so a
+                # fresh connection sees exactly what the old one did.
                 driver_config={
-                    "liveness_check_timeout": 60,
+                    "max_connection_lifetime": 180,
                     # 01N51/01N52 ("relationship type / property does not
                     # exist") fire on every review for graph features a
                     # project has no data for yet -- expected, not
