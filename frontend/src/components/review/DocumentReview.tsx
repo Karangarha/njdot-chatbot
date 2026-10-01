@@ -67,14 +67,13 @@ function groupSequential(checks: CheckItem[]): { header: string | null; items: C
 // ── Sub-components ─────────────────────────────────────────────────────────────
 
 function UploadZone({
-  label, file, inputRef, accept, acceptValidationText, optional, onSelect, onRemove,
+  label, file, inputRef, accept, acceptValidationText, onSelect, onRemove,
 }: {
   label: string
   file: File | null
   inputRef: React.RefObject<HTMLInputElement | null>
   accept: string
   acceptValidationText: string
-  optional?: boolean
   onSelect: (f: File) => void
   onRemove: () => void
 }) {
@@ -96,9 +95,7 @@ function UploadZone({
     <div className="flex-1 min-w-0">
       <p className="mb-1.5 text-xs font-semibold text-gray-700">
         {label}{' '}
-        {optional
-          ? <span className="text-gray-400 font-normal">(optional)</span>
-          : <span className="text-[#CC2529]">*</span>}
+        <span className="text-[#CC2529]">*</span>
       </p>
       {file ? (
         <div className="flex items-center gap-3 rounded-xl border border-[#1B3A6B]/25 bg-[#EEF2FF] px-4 py-3.5">
@@ -218,12 +215,6 @@ function CheckCard({ check, sessionId, authToken }: {
         <span className={`text-[10px] font-bold uppercase tracking-wider ${styles.labelColor}`}>{styles.label}</span>
         <p className="mt-0.5 text-sm font-semibold text-gray-800">{check.name}</p>
         <p className="mt-1 text-xs text-gray-600 leading-relaxed">{check.finding}</p>
-        {check.reasoning && (
-          <div className="mt-1.5 rounded bg-gray-50 p-2 text-[11px] text-gray-500 italic border border-gray-100">
-            <strong>Reasoning:</strong> {check.reasoning}
-          </div>
-        )}
-        {check.evidence && <p className="mt-1.5 text-[11px] text-gray-400 leading-relaxed italic">{check.evidence}</p>}
         {check.citations && check.citations.length > 0 ? (
           <div className="mt-1.5 flex flex-wrap gap-1.5">
             {check.citations.map((citation, i) => (
@@ -310,7 +301,6 @@ export default function DocumentReview({
   const [spFile,        setSpFile]        = useState<File | null>(null)
   const [keyMapFile,    setKeyMapFile]    = useState<File | null>(null)
   const [estimateFile,  setEstimateFile]  = useState<File | null>(null)
-  const [utilityPlanFiles, setUtilityPlanFiles] = useState<File[]>([])
   const [isLoading,     setIsLoading]     = useState(false)
   const [loadingMessage, setLoadingMessage] = useState('Starting review…')
   const [error,         setError]         = useState<string | null>(null)
@@ -332,7 +322,6 @@ export default function DocumentReview({
   const spRef             = useRef<HTMLInputElement>(null)
   const keyMapRef         = useRef<HTMLInputElement>(null)
   const estimateRef       = useRef<HTMLInputElement>(null)
-  const utilityPlanAddRef = useRef<HTMLInputElement>(null)
   const currentProjectRef = useRef<string | null>(null)
   // Synchronous re-entrancy guards — refs update instantly (unlike state),
   // so they catch a fast double-click that fires both `click` events before
@@ -396,7 +385,8 @@ export default function DocumentReview({
     })
   }, [sessionId])
 
-  const canSubmit = scheduleFile !== null && narrativeFile !== null && !isLoading
+  const canSubmit = scheduleFile !== null && narrativeFile !== null && spFile !== null &&
+    keyMapFile !== null && estimateFile !== null && !isLoading
 
   const toggleSection = (name: string) => setExpanded(prev => ({ ...prev, [name]: !prev[name] }))
 
@@ -416,14 +406,14 @@ export default function DocumentReview({
     doc.text(`Failed: ${summary.failed}`, 14, 70)
     autoTable(doc, {
       startY: 78,
-      head: [['Category', 'Check', 'Reasoning', 'Status', 'Finding', 'Evidence']],
-      body: checks.map(c => [c.category, c.name, c.reasoning || '', c.status.toUpperCase(), c.finding, c.evidence]),
+      head: [['Category', 'Check', 'Status', 'Finding']],
+      body: checks.map(c => [c.category, c.name, c.status.toUpperCase(), c.finding]),
       theme: 'grid',
       styles: { fontSize: 8, cellPadding: 3 },
       headStyles: { fillColor: [27, 58, 107] },
-      columnStyles: { 0: { cellWidth: 25 }, 1: { cellWidth: 30 }, 2: { cellWidth: 35 }, 3: { cellWidth: 15 }, 4: { cellWidth: 45 }, 5: { cellWidth: 35 } },
+      columnStyles: { 0: { cellWidth: 30 }, 1: { cellWidth: 40 }, 2: { cellWidth: 20 }, 3: { cellWidth: 92 } },
       didParseCell: (data: CellHookData) => {
-        if (data.section === 'body' && data.column.index === 3) {
+        if (data.section === 'body' && data.column.index === 2) {
           if (data.cell.raw === 'PASS')    data.cell.styles.textColor = [21, 128, 61]
           if (data.cell.raw === 'WARNING') data.cell.styles.textColor = [180, 83, 9]
           if (data.cell.raw === 'FAIL')    data.cell.styles.textColor = [185, 28, 28]
@@ -434,7 +424,7 @@ export default function DocumentReview({
   }
 
   const runReview = async () => {
-    if (!scheduleFile || !narrativeFile) return
+    if (!scheduleFile || !narrativeFile || !spFile || !keyMapFile || !estimateFile) return
     if (submittingRef.current) return   // guards a fast double-click race
     submittingRef.current = true
 
@@ -484,13 +474,6 @@ export default function DocumentReview({
         if (spFile) reviewForm.append('special_provision_pdf_path', await uploadOne(spFile, 'special_provision.pdf'))
         if (keyMapFile) reviewForm.append('key_map_pdf_path', await uploadOne(keyMapFile, 'key_map.pdf'))
         if (estimateFile) reviewForm.append('estimate_pdf_path', await uploadOne(estimateFile, 'estimate.pdf'))
-        if (utilityPlanFiles.length > 0) {
-          const utilityPaths: string[] = []
-          for (let i = 0; i < utilityPlanFiles.length; i++) {
-            utilityPaths.push(await uploadOne(utilityPlanFiles[i], `utility_plan_${i}.pdf`))
-          }
-          reviewForm.append('utility_plan_pdf_paths', JSON.stringify(utilityPaths))
-        }
       } else {
         // Signed out: no stable per-user Storage path to upload to, so fall
         // back to sending the raw files through the API as before -- still
@@ -500,7 +483,6 @@ export default function DocumentReview({
         if (spFile) reviewForm.append('special_provision_pdf', spFile)
         if (keyMapFile) reviewForm.append('key_map_pdf', keyMapFile)
         if (estimateFile) reviewForm.append('estimate_pdf', estimateFile)
-        utilityPlanFiles.forEach(f => reviewForm.append('utility_plan_pdfs', f))
       }
       if (specs.length > 0) reviewForm.append('checks', JSON.stringify(specs))
 
@@ -906,8 +888,8 @@ export default function DocumentReview({
           </button>
         </div>
         <p className="mb-8 text-sm text-gray-500">
-          Upload the CPM schedule (.xer), designer narrative, and optionally a Special Provision
-          PDF, key map sheet, and DBE Goal Memo to run an automated NJDOT compliance review and
+          Upload the CPM schedule (.xer), designer narrative, Special Provision PDF, key map
+          sheet, and DBE Goal Memo to run an automated NJDOT compliance review and
           enable document Q&A.
         </p>
 
@@ -926,13 +908,13 @@ export default function DocumentReview({
           <div className="flex flex-col gap-4 sm:flex-row sm:flex-wrap">
             <UploadZone label="Special Provision PDF" file={spFile} inputRef={spRef}
               accept="application/pdf" acceptValidationText="PDF only · ~200 pages"
-              optional onSelect={setSpFile} onRemove={() => setSpFile(null)} />
+              onSelect={setSpFile} onRemove={() => setSpFile(null)} />
             <UploadZone label="Key Map Sheet PDF" file={keyMapFile} inputRef={keyMapRef}
               accept="application/pdf" acceptValidationText="PDF only · 1-3 sheets"
-              optional onSelect={setKeyMapFile} onRemove={() => setKeyMapFile(null)} />
+              onSelect={setKeyMapFile} onRemove={() => setKeyMapFile(null)} />
             <UploadZone label="DBE Goal Memo / Estimate PDF" file={estimateFile} inputRef={estimateRef}
               accept="application/pdf" acceptValidationText="PDF only · first page"
-              optional onSelect={setEstimateFile} onRemove={() => setEstimateFile(null)} />
+              onSelect={setEstimateFile} onRemove={() => setEstimateFile(null)} />
           </div>
           {spFile && (
             <p className="mt-1.5 text-[11px] text-gray-400">
@@ -949,53 +931,6 @@ export default function DocumentReview({
             <p className="mt-1.5 text-[11px] text-gray-400">
               First page only — the Engineer&apos;s Estimate drives the 60/90-day
               Substantial-to-Final completion gap rule.
-            </p>
-          )}
-        </div>
-
-        {/* Row 3: Utility Agreement Plans — one per utility */}
-        <div className="mb-6">
-          <p className="mb-1.5 text-xs font-semibold text-gray-700">
-            Utility Agreement Plans{' '}
-            <span className="text-gray-400 font-normal">(optional — add one per utility: gas, water/sewer, electric, telecom, etc.)</span>
-          </p>
-          <div className="space-y-2">
-            {utilityPlanFiles.map((f, i) => (
-              <div key={i} className="flex items-center gap-3 rounded-xl border border-[#1B3A6B]/25 bg-[#EEF2FF] px-4 py-2.5">
-                <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-[#1B3A6B]/10">
-                  <svg className="h-4 w-4 text-[#1B3A6B]" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round"
-                      d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m2.25 0H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-                  </svg>
-                </div>
-                <span className="min-w-0 flex-1 truncate text-xs font-medium text-[#1B3A6B]">{f.name}</span>
-                <button onClick={() => setUtilityPlanFiles(prev => prev.filter((_, idx) => idx !== i))}
-                  aria-label="Remove file"
-                  className="shrink-0 rounded-full p-1 text-gray-400 hover:bg-[#1B3A6B]/10 hover:text-[#1B3A6B] transition-colors">
-                  <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
-              </div>
-            ))}
-            <button type="button" onClick={() => utilityPlanAddRef.current?.click()}
-              className="flex items-center gap-1.5 rounded-lg border border-dashed border-[#1B3A6B]/30 px-3 py-2 text-xs font-semibold text-[#1B3A6B] hover:bg-[#1B3A6B]/5 transition-colors">
-              <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M12 4v16m8-8H4" />
-              </svg>
-              Add utility plan
-            </button>
-          </div>
-          <input ref={utilityPlanAddRef} type="file" accept="application/pdf" className="hidden"
-            onChange={e => {
-              const f = e.target.files?.[0]
-              if (f) setUtilityPlanFiles(prev => [...prev, f])
-              e.target.value = ''
-            }} />
-          {utilityPlanFiles.length > 0 && (
-            <p className="mt-1.5 text-[11px] text-gray-400">
-              Cross-referenced by the utility-related checks (alignment, service interruptions,
-              work hours) and indexed for Document Q&A.
             </p>
           )}
         </div>

@@ -20,6 +20,7 @@ export default function SignupForm() {
   const [confirmPassword, setConfirmPassword] = useState('')
   const [error, setError]                     = useState<string | null>(null)
   const [isLoading, setIsLoading]             = useState(false)
+  const [checkEmail, setCheckEmail]           = useState(false)
   const router = useRouter()
 
   const handleSubmit = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -39,12 +40,12 @@ export default function SignupForm() {
 
     const supabase = createClient()
 
-    // Sign up the user
-    const { error: signUpError } = await supabase.auth.signUp({
+    const { data, error: signUpError } = await supabase.auth.signUp({
       email,
       password,
       options: {
         data: { first_name: firstName, last_name: lastName },
+        emailRedirectTo: `${window.location.origin}/auth/callback`,
       },
     })
 
@@ -54,17 +55,38 @@ export default function SignupForm() {
       return
     }
 
-    // Immediately sign in so they land in the app without email confirmation
-    const { error: signInError } = await supabase.auth.signInWithPassword({ email, password })
-
-    if (signInError) {
-      // Account was created but auto-login failed — send them to login
-      router.push('/login')
+    // With "Confirm email" on, an already-registered address "succeeds" with no identities.
+    if (data.user?.identities?.length === 0) {
+      setError('An account with this email already exists. Try signing in.')
+      setIsLoading(false)
       return
     }
 
-    router.push('/chat')
-    router.refresh()
+    // Session is present only when confirmation is off (e.g. local dev).
+    if (data.session) {
+      router.push('/chat')
+      router.refresh()
+      return
+    }
+
+    setCheckEmail(true)
+    setIsLoading(false)
+  }
+
+  if (checkEmail) {
+    return (
+      <div className="w-full sm:max-w-[480px]">
+        <div className="rounded-2xl bg-white shadow-xl ring-1 ring-black/5 px-5 py-8 text-center sm:p-[44px]">
+          <h1 className="mb-2 text-xl font-bold text-[#1B3A6B]">Check your email</h1>
+          <p className="mb-6 text-sm text-gray-500">
+            We sent a confirmation link to <strong>{email}</strong>. Open it to finish creating your account.
+          </p>
+          <Link href="/login" className="text-xs font-semibold text-[#1B3A6B] hover:underline">
+            Back to sign in
+          </Link>
+        </div>
+      </div>
+    )
   }
 
   return (
