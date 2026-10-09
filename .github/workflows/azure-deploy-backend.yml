@@ -37,7 +37,6 @@
 name: Deploy backend to Azure Web App
 
 env:
-  AZURE_WEBAPP_NAME: NJDOT
   PYTHON_VERSION: '3.13'
 
 on:
@@ -101,9 +100,35 @@ jobs:
           name: backend-app
           path: .
 
+      - name: Resolve Web App name from publish profile
+        id: resolve-webapp-name
+        shell: python
+        env:
+          AZURE_WEBAPP_PUBLISH_PROFILE: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+        run: |
+          import os
+          import xml.etree.ElementTree as ET
+
+          publish_profile = os.environ.get("AZURE_WEBAPP_PUBLISH_PROFILE", "").strip()
+          if not publish_profile:
+              raise SystemExit("AZURE_WEBAPP_PUBLISH_PROFILE is empty or missing.")
+
+          root = ET.fromstring(publish_profile)
+          app_name = None
+          for profile in root.findall(".//publishProfile"):
+              app_name = profile.attrib.get("msdeploySite")
+              if app_name:
+                  break
+
+          if not app_name:
+              raise SystemExit("Could not read msdeploySite from AZURE_WEBAPP_PUBLISH_PROFILE.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as github_output:
+              github_output.write(f"app-name={app_name}\n")
+
       - name: Deploy to Azure Web App
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v3
         with:
-          app-name: ${{ env.AZURE_WEBAPP_NAME }}
+          app-name: ${{ steps.resolve-webapp-name.outputs.app-name }}
           publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
